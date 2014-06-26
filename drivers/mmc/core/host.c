@@ -85,9 +85,8 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 	init_waitqueue_head(&host->wq);
 	INIT_DELAYED_WORK(&host->detect, mmc_rescan);
 	INIT_DELAYED_WORK_DEFERRABLE(&host->disable, mmc_host_deeper_disable);
-#ifdef CONFIG_PM
 	host->pm_notify.notifier_call = mmc_pm_notify;
-#endif
+
 
 	/*
 	 * By default, hosts do not support SGIO or large requests.
@@ -163,6 +162,7 @@ void mmc_remove_host(struct mmc_host *host)
 	device_del(&host->class_dev);
 
 	led_trigger_unregister_simple(host->led);
+
 }
 
 EXPORT_SYMBOL(mmc_remove_host);

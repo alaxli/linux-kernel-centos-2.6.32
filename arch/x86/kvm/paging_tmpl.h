@@ -197,6 +197,12 @@ walk:
 				is_long_mode(vcpu))) {
 			int lvl = walker->level;
 
+			/* check if the kernel is fetching from user page */
+			if ((pte_access & PT_USER_MASK) &&
+			    (read_cr4() & X86_CR4_SMEP))
+				if (fetch_fault && !user_fault)
+					goto access_error;
+
 			walker->gfn = gpte_to_gfn_lvl(pte, lvl);
 			walker->gfn += (addr & PT_LVL_OFFSET_MASK(lvl))
 					>> PAGE_SHIFT;
@@ -244,7 +250,7 @@ err:
 		walker->error_code |= PFERR_WRITE_MASK;
 	if (user_fault)
 		walker->error_code |= PFERR_USER_MASK;
-	if (fetch_fault)
+	if (fetch_fault && (is_nx(vcpu) || (read_cr4() & X86_CR4_SMEP)))
 		walker->error_code |= PFERR_FETCH_MASK;
 	if (rsvd_fault)
 		walker->error_code |= PFERR_RSVD_MASK;
@@ -318,32 +324,8 @@ static u64 *FNAME(fetch)(struct kvm_vcpu *vcpu, gva_t addr,
 			break;
 		}
 
-		if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep)) {
-			struct kvm_mmu_page *child;
-			unsigned direct_access;
-
-			if (level != gw->level)
-				continue;
-
-			/*
-			 * For the direct sp, if the guest pte's dirty bit
-			 * changed form clean to dirty, it will corrupt the
-			 * sp's access: allow writable in the read-only sp,
-			 * so we should update the spte at this point to get
-			 * a new sp with the correct access.
-			 */
-			direct_access = gw->pt_access & gw->pte_access;
-			if (!is_dirty_gpte(gw->ptes[gw->level - 1]))
-				direct_access &= ~ACC_WRITE_MASK;
-
-			child = page_header(*sptep & PT64_BASE_ADDR_MASK);
-			if (child->role.access == direct_access)
-				continue;
-
-			mmu_page_remove_parent_pte(child, sptep);
-			__set_spte(sptep, shadow_trap_nonpresent_pte);
-			kvm_flush_remote_tlbs(vcpu->kvm);
-		}
+		if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep))
+			continue;
 
 		if (is_large_pte(*sptep)) {
 			rmap_remove(vcpu->kvm, sptep);
@@ -439,21 +421,18 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr,
 		return 0;
 	}
 
+	mmu_seq = vcpu->kvm->mmu_notifier_seq;
+	smp_rmb();
 	if (walker.level >= PT_DIRECTORY_LEVEL) {
 		level = min(walker.level, mapping_level(vcpu, walker.gfn));
 		walker.gfn = walker.gfn & ~(KVM_PAGES_PER_HPAGE(level) - 1);
 	}
 
-	mmu_seq = vcpu->kvm->mmu_notifier_seq;
-	smp_rmb();
 	pfn = gfn_to_pfn(vcpu->kvm, walker.gfn);
 
 	/* mmio */
-	if (is_error_pfn(pfn)) {
-		pgprintk("gfn %lx is mmio\n", walker.gfn);
-		kvm_release_pfn_clean(pfn);
-		return 1;
-	}
+	if (is_error_pfn(pfn))
+		return kvm_handle_bad_page(vcpu->kvm, walker.gfn, pfn);
 
 	spin_lock(&vcpu->kvm->mmu_lock);
 	if (mmu_notifier_retry(vcpu, mmu_seq))

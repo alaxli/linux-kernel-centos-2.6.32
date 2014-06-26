@@ -1609,7 +1609,7 @@ int reiserfs_encode_fh(struct dentry *dentry, __u32 * data, int *lenp,
 ** to properly mark inodes for datasync and such, but only actually
 ** does something when called for a synchronous update.
 */
-int reiserfs_write_inode(struct inode *inode, int do_sync)
+int reiserfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct reiserfs_transaction_handle th;
 	int jbegin_count = 1;
@@ -1621,7 +1621,7 @@ int reiserfs_write_inode(struct inode *inode, int do_sync)
 	 ** inode needs to reach disk for safety, and they can safely be
 	 ** ignored because the altered inode has already been logged.
 	 */
-	if (do_sync && !(current->flags & PF_MEMALLOC)) {
+	if (wbc->sync_mode == WB_SYNC_ALL && !(current->flags & PF_MEMALLOC)) {
 		reiserfs_write_lock(inode->i_sb);
 		if (!journal_begin(&th, inode->i_sb, jbegin_count)) {
 			reiserfs_update_sd(&th, inode);
@@ -2531,12 +2531,6 @@ static int reiserfs_writepage(struct page *page, struct writeback_control *wbc)
 	return reiserfs_write_full_page(page, wbc);
 }
 
-static void reiserfs_truncate_failed_write(struct inode *inode)
-{
-	truncate_inode_pages(inode->i_mapping, inode->i_size);
-	reiserfs_truncate_file(inode, 0);
-}
-
 static int reiserfs_write_begin(struct file *file,
 				struct address_space *mapping,
 				loff_t pos, unsigned len, unsigned flags,
@@ -2603,8 +2597,6 @@ static int reiserfs_write_begin(struct file *file,
 	if (ret) {
 		unlock_page(page);
 		page_cache_release(page);
-		/* Truncate allocated blocks */
-		reiserfs_truncate_failed_write(inode);
 	}
 	return ret;
 }
@@ -2697,7 +2689,8 @@ static int reiserfs_write_end(struct file *file, struct address_space *mapping,
 	 ** transaction tracking stuff when the size changes.  So, we have
 	 ** to do the i_size updates here.
 	 */
-	if (pos + copied > inode->i_size) {
+	pos += copied;
+	if (pos > inode->i_size) {
 		struct reiserfs_transaction_handle myth;
 		reiserfs_write_lock(inode->i_sb);
 		/* If the file have grown beyond the border where it
@@ -2715,7 +2708,7 @@ static int reiserfs_write_end(struct file *file, struct address_space *mapping,
 			goto journal_error;
 		}
 		reiserfs_update_inode_transaction(inode);
-		inode->i_size = pos + copied;
+		inode->i_size = pos;
 		/*
 		 * this will just nest into our transaction.  It's important
 		 * to use mark_inode_dirty so the inode gets pushed around on the
@@ -2742,10 +2735,6 @@ static int reiserfs_write_end(struct file *file, struct address_space *mapping,
       out:
 	unlock_page(page);
 	page_cache_release(page);
-
-	if (pos + len > inode->i_size)
-		reiserfs_truncate_failed_write(inode);
-
 	return ret == 0 ? copied : ret;
 
       journal_error:

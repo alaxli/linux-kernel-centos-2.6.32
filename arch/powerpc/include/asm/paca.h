@@ -56,7 +56,7 @@ struct paca_struct {
 	struct lppaca *lppaca_ptr;	/* Pointer to LpPaca for PLIC */
 #endif /* CONFIG_PPC_BOOK3S */
 	/*
-	 * MAGIC: the spinlock functions in arch/powerpc/lib/locks.c
+	 * MAGIC: the spinlock functions in arch/powerpc/lib/locks.c 
 	 * load lock_token and paca_index with a single lwz
 	 * instruction.  They must travel together and be properly
 	 * aligned.
@@ -76,9 +76,10 @@ struct paca_struct {
 	s16 hw_cpu_id;			/* Physical processor number */
 	u8 cpu_start;			/* At startup, processor spins until */
 					/* this becomes non-zero. */
-	u8 kexec_state;         /* set when kexec down has irqs off */
 #ifdef CONFIG_PPC_STD_MMU_64
 	struct slb_shadow *slb_shadow_ptr;
+	struct dtl_entry *dispatch_log;
+	struct dtl_entry *dispatch_log_end;
 
 	/*
 	 * Now, starting in cacheline 2, the exception save areas
@@ -123,13 +124,23 @@ struct paca_struct {
 	u8 soft_enabled;		/* irq soft-enable flag */
 	u8 hard_enabled;		/* set if irqs are enabled in MSR */
 	u8 io_sync;			/* writel() needs spin_unlock sync */
+#ifndef __GENKSYMS__
+	u8 irq_work_pending;		/* IRQ_WORK interrupt while soft-disable */
+#else
 	u8 perf_event_pending;		/* PM interrupt while soft-disabled */
+#endif
 
 	/* Stuff for accurate time accounting */
 	u64 user_time;			/* accumulated usermode TB ticks */
 	u64 system_time;		/* accumulated system TB ticks */
-	u64 startpurr;			/* PURR/TB value snapshot */
+	u64 user_time_scaled;		/* accumulated usermode SPURR ticks */
+	u64 starttime;			/* TB value snapshot */
+	u64 starttime_user;		/* TB value on exit to usermode */
 	u64 startspurr;			/* SPURR value snapshot */
+	u64 utime_sspurr;		/* ->user_time when ->startspurr set */
+	u64 stolen_time;		/* TB ticks taken by hypervisor */
+	u64 dtl_ridx;			/* read index in dispatch log */
+	struct dtl_entry *dtl_curr;	/* pointer corresponding to dtl_ridx */
 };
 
 extern struct paca_struct paca[];

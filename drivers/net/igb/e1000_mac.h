@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel(R) Gigabit Ethernet Linux driver
-  Copyright(c) 2007-2009 Intel Corporation.
+  Copyright(c) 2007-2013 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -33,9 +33,9 @@
 #include "e1000_phy.h"
 #include "e1000_nvm.h"
 #include "e1000_defines.h"
+#include "e1000_i210.h"
 
-/*
- * Functions that should not be called directly from drivers but can be used
+/* Functions that should not be called directly from drivers but can be used
  * by other files in this 'shared code'
  */
 s32  igb_blink_led(struct e1000_hw *hw);
@@ -48,18 +48,19 @@ s32  igb_get_auto_rd_done(struct e1000_hw *hw);
 s32  igb_get_bus_info_pcie(struct e1000_hw *hw);
 s32  igb_get_hw_semaphore(struct e1000_hw *hw);
 s32  igb_get_speed_and_duplex_copper(struct e1000_hw *hw, u16 *speed,
-				       u16 *duplex);
+				     u16 *duplex);
 s32  igb_id_led_init(struct e1000_hw *hw);
 s32  igb_led_off(struct e1000_hw *hw);
 void igb_update_mc_addr_list(struct e1000_hw *hw,
-	                     u8 *mc_addr_list, u32 mc_addr_count);
+			     u8 *mc_addr_list, u32 mc_addr_count);
 s32  igb_setup_link(struct e1000_hw *hw);
 s32  igb_validate_mdi_setting(struct e1000_hw *hw);
 s32  igb_write_8bit_ctrl_reg(struct e1000_hw *hw, u32 reg,
-			       u32 offset, u8 data);
+			     u32 offset, u8 data);
 
 void igb_clear_hw_cntrs_base(struct e1000_hw *hw);
 void igb_clear_vfta(struct e1000_hw *hw);
+void igb_clear_vfta_i350(struct e1000_hw *hw);
 s32  igb_vfta_set(struct e1000_hw *hw, u32 vid, bool add);
 void igb_config_collision_dist(struct e1000_hw *hw);
 void igb_init_rx_addrs(struct e1000_hw *hw, u16 rar_count);
@@ -67,8 +68,6 @@ void igb_mta_set(struct e1000_hw *hw, u32 hash_value);
 void igb_put_hw_semaphore(struct e1000_hw *hw);
 void igb_rar_set(struct e1000_hw *hw, u8 *addr, u32 index);
 s32  igb_check_alt_mac_addr(struct e1000_hw *hw);
-void igb_reset_adaptive(struct e1000_hw *hw);
-void igb_update_adaptive(struct e1000_hw *hw);
 
 bool igb_enable_mng_pass_thru(struct e1000_hw *hw);
 
@@ -80,12 +79,12 @@ enum e1000_mng_mode {
 	e1000_mng_mode_host_if_only
 };
 
-#define E1000_FACTPS_MNGCG    0x20000000
+#define E1000_FACTPS_MNGCG	0x20000000
 
-#define E1000_FWSM_MODE_MASK  0xE
-#define E1000_FWSM_MODE_SHIFT 1
+#define E1000_FWSM_MODE_MASK	0xE
+#define E1000_FWSM_MODE_SHIFT	1
 
-#define E1000_MNG_DHCP_COOKIE_STATUS_VLAN    0x2
+#define E1000_MNG_DHCP_COOKIE_STATUS_VLAN	0x2
 
 extern void e1000_init_function_pointers_82575(struct e1000_hw *hw);
 

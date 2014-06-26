@@ -39,7 +39,6 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
-#include <linux/ipmi_smi.h>
 
 /* This files describes the interface for IPMI system management interface
    drivers to bind into the IPMI message handler. */
@@ -206,6 +205,11 @@ int ipmi_register_smi(struct ipmi_smi_handlers *handlers,
  * return an error if the interface is still in use by a user.
  */
 int ipmi_unregister_smi(ipmi_smi_t intf);
+
+/*
+ * Indicate to the IPMI driver that probing has been completed
+ */
+void ipmi_smi_probe_complete(void);
 
 /*
  * The lower layer reports received messages through this interface.

@@ -88,6 +88,23 @@ msecs_to_cputime(const unsigned int m)
 }
 
 /*
+ * Convert cputime to microseconds and back.
+ */
+static inline unsigned int
+cputime_to_usecs(const cputime_t cputime)
+{
+	return cputime_div(cputime, 4096);
+}
+
+static inline cputime_t
+usecs_to_cputime(const unsigned int m)
+{
+	return (cputime_t) m * 4096;
+}
+
+#define usecs_to_cputime64(m)		usecs_to_cputime(m)
+
+/*
  * Convert cputime to milliseconds and back.
  */
 static inline unsigned int

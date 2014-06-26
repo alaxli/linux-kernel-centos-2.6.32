@@ -30,7 +30,6 @@
 #include <xen/page.h>
 #include <xen/events.h>
 
-#include <xen/hvc-console.h>
 #include "xen-ops.h"
 #include "mmu.h"
 
@@ -179,20 +178,18 @@ static void __init xen_smp_prepare_boot_cpu(void)
 static void __init xen_smp_prepare_cpus(unsigned int max_cpus)
 {
 	unsigned cpu;
+	unsigned int i;
 
-	if (skip_ioapic_setup) {
-		char *m = (max_cpus == 0) ?
-			"The nosmp parameter is incompatible with Xen; " \
-			"use Xen dom0_max_vcpus=1 parameter" :
-			"The noapic parameter is incompatible with Xen";
-
-		xen_raw_printk(m);
-		panic(m);
-	}
 	xen_init_lock_cpu(0);
 
 	smp_store_cpu_info(0);
 	cpu_data(0).x86_max_cores = 1;
+
+	for_each_possible_cpu(i) {
+		zalloc_cpumask_var(&per_cpu(cpu_sibling_map, i), GFP_KERNEL);
+		zalloc_cpumask_var(&per_cpu(cpu_core_map, i), GFP_KERNEL);
+		zalloc_cpumask_var(&cpu_data(i).llc_shared_map, GFP_KERNEL);
+	}
 	set_cpu_sibling_map(0);
 
 	if (xen_smp_intr_init(0))

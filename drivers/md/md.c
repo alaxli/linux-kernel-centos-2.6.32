@@ -39,34 +39,50 @@
 #include <linux/buffer_head.h> /* for invalidate_bdev */
 #include <linux/poll.h>
 #include <linux/ctype.h>
+#include <linux/string.h>
 #include <linux/hdreg.h>
 #include <linux/proc_fs.h>
 #include <linux/random.h>
+#include <linux/module.h>
 #include <linux/reboot.h>
 #include <linux/file.h>
+#include <linux/compat.h>
 #include <linux/delay.h>
 #include <linux/raid/md_p.h>
 #include <linux/raid/md_u.h>
+#include <linux/slab.h>
 #include "md.h"
 #include "bitmap.h"
-
-#define DEBUG 0
-#define dprintk(x...) ((void)(DEBUG && printk(x)))
-
 
 #ifndef MODULE
 static void autostart_arrays(int part);
 #endif
 
+/* pers_list is a list of registered personalities protected
+ * by pers_lock.
+ * pers_lock does extra service to protect accesses to
+ * mddev->thread when the mutex cannot be held.
+ */
 static LIST_HEAD(pers_list);
 static DEFINE_SPINLOCK(pers_lock);
 
 static void md_print_devices(void);
 
 static DECLARE_WAIT_QUEUE_HEAD(resync_wait);
+static struct workqueue_struct *md_wq;
+static struct workqueue_struct *md_misc_wq;
+
+static int remove_and_add_spares(struct mddev *mddev,
+				 struct md_rdev *this);
 
 #define MD_BUG(x...) { printk("md: bug in file %s, line %d\n", __FILE__, __LINE__); md_print_devices(); }
 
+/*
+ * Default number of read corrections we'll attempt on an rdev
+ * before ejecting it from the array. We divide the read error
+ * count by 2 for every hour elapsed between read errors.
+ */
+#define MD_DEFAULT_MAX_CORRECTED_READ_ERRORS 20
 /*
  * Current RAID-1,4,5 parallel reconstruction 'guaranteed speed limit'
  * is 1000 KB/sec, so the extra system load does not show up that much.
@@ -82,13 +98,13 @@ static DECLARE_WAIT_QUEUE_HEAD(resync_wait);
 
 static int sysctl_speed_limit_min = 1000;
 static int sysctl_speed_limit_max = 200000;
-static inline int speed_min(mddev_t *mddev)
+static inline int speed_min(struct mddev *mddev)
 {
 	return mddev->sync_speed_min ?
 		mddev->sync_speed_min : sysctl_speed_limit_min;
 }
 
-static inline int speed_max(mddev_t *mddev)
+static inline int speed_max(struct mddev *mddev)
 {
 	return mddev->sync_speed_max ?
 		mddev->sync_speed_max : sysctl_speed_limit_max;
@@ -103,7 +119,7 @@ static ctl_table raid_table[] = {
 		.data		= &sysctl_speed_limit_min,
 		.maxlen		= sizeof(int),
 		.mode		= S_IRUGO|S_IWUSR,
-		.proc_handler	= &proc_dointvec,
+		.proc_handler	= proc_dointvec,
 	},
 	{
 		.ctl_name	= DEV_RAID_SPEED_LIMIT_MAX,
@@ -111,7 +127,7 @@ static ctl_table raid_table[] = {
 		.data		= &sysctl_speed_limit_max,
 		.maxlen		= sizeof(int),
 		.mode		= S_IRUGO|S_IWUSR,
-		.proc_handler	= &proc_dointvec,
+		.proc_handler	= proc_dointvec,
 	},
 	{ .ctl_name = 0 }
 };
@@ -142,6 +158,121 @@ static const struct block_device_operations md_fops;
 
 static int start_readonly;
 
+/* bio_clone_mddev
+ * like bio_clone, but with a local bio set
+ */
+
+static void mddev_bio_destructor(struct bio *bio)
+{
+	struct mddev *mddev, **mddevp;
+
+	mddevp = (void*)bio;
+	mddev = mddevp[-1];
+
+	bio_free(bio, mddev->bio_set);
+}
+
+struct bio *bio_alloc_mddev(gfp_t gfp_mask, int nr_iovecs,
+			    struct mddev *mddev)
+{
+	struct bio *b;
+	struct mddev **mddevp;
+
+	if (!mddev || !mddev->bio_set)
+		return bio_alloc(gfp_mask, nr_iovecs);
+
+	b = bio_alloc_bioset(gfp_mask, nr_iovecs,
+			     mddev->bio_set);
+	if (!b)
+		return NULL;
+	mddevp = (void*)b;
+	mddevp[-1] = mddev;
+	b->bi_destructor = mddev_bio_destructor;
+	return b;
+}
+EXPORT_SYMBOL_GPL(bio_alloc_mddev);
+
+struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
+			    struct mddev *mddev)
+{
+	struct bio *b;
+	struct mddev **mddevp;
+
+	if (!mddev || !mddev->bio_set)
+		return bio_clone(bio, gfp_mask);
+
+	b = bio_alloc_bioset(gfp_mask, bio->bi_max_vecs,
+			     mddev->bio_set);
+	if (!b)
+		return NULL;
+	mddevp = (void*)b;
+	mddevp[-1] = mddev;
+	b->bi_destructor = mddev_bio_destructor;
+	__bio_clone(b, bio);
+	if (bio_integrity(bio)) {
+		int ret;
+
+		ret = bio_integrity_clone(b, bio, gfp_mask, mddev->bio_set);
+
+		if (ret < 0) {
+			bio_put(b);
+			return NULL;
+		}
+	}
+
+	return b;
+}
+EXPORT_SYMBOL_GPL(bio_clone_mddev);
+
+void md_trim_bio(struct bio *bio, int offset, int size)
+{
+	/* 'bio' is a cloned bio which we need to trim to match
+	 * the given offset and size.
+	 * This requires adjusting bi_sector, bi_size, and bi_io_vec
+	 */
+	int i;
+	struct bio_vec *bvec;
+	int sofar = 0;
+
+	size <<= 9;
+	if (offset == 0 && size == bio->bi_size)
+		return;
+
+	bio->bi_sector += offset;
+	bio->bi_size = size;
+	offset <<= 9;
+	clear_bit(BIO_SEG_VALID, &bio->bi_flags);
+
+	while (bio->bi_idx < bio->bi_vcnt &&
+	       bio->bi_io_vec[bio->bi_idx].bv_len <= offset) {
+		/* remove this whole bio_vec */
+		offset -= bio->bi_io_vec[bio->bi_idx].bv_len;
+		bio->bi_idx++;
+	}
+	if (bio->bi_idx < bio->bi_vcnt) {
+		bio->bi_io_vec[bio->bi_idx].bv_offset += offset;
+		bio->bi_io_vec[bio->bi_idx].bv_len -= offset;
+	}
+	/* avoid any complications with bi_idx being non-zero*/
+	if (bio->bi_idx) {
+		memmove(bio->bi_io_vec, bio->bi_io_vec+bio->bi_idx,
+			(bio->bi_vcnt - bio->bi_idx) * sizeof(struct bio_vec));
+		bio->bi_vcnt -= bio->bi_idx;
+		bio->bi_idx = 0;
+	}
+	/* Make sure vcnt and last bv are not too big */
+	bio_for_each_segment(bvec, bio, i) {
+		if (sofar + bvec->bv_len > size)
+			bvec->bv_len = size - sofar;
+		if (bvec->bv_len == 0) {
+			bio->bi_vcnt = i;
+			break;
+		}
+		sofar += bvec->bv_len;
+	}
+}
+EXPORT_SYMBOL_GPL(md_trim_bio);
+
 /*
  * We have a system wide 'event count' that is incremented
  * on any 'interesting' event, and readers of /proc/mdstat
@@ -154,7 +285,7 @@ static int start_readonly;
  */
 static DECLARE_WAIT_QUEUE_HEAD(md_event_waiters);
 static atomic_t md_event_count;
-void md_new_event(mddev_t *mddev)
+void md_new_event(struct mddev *mddev)
 {
 	atomic_inc(&md_event_count);
 	wake_up(&md_event_waiters);
@@ -164,7 +295,7 @@ EXPORT_SYMBOL_GPL(md_new_event);
 /* Alternate version that can be called from interrupts
  * when calling sysfs_notify isn't needed.
  */
-static void md_new_event_inintr(mddev_t *mddev)
+static void md_new_event_inintr(struct mddev *mddev)
 {
 	atomic_inc(&md_event_count);
 	wake_up(&md_event_waiters);
@@ -185,19 +316,19 @@ static DEFINE_SPINLOCK(all_mddevs_lock);
  * Any code which breaks out of this loop while own
  * a reference to the current mddev and must mddev_put it.
  */
-#define for_each_mddev(mddev,tmp)					\
+#define for_each_mddev(_mddev,_tmp)					\
 									\
 	for (({ spin_lock(&all_mddevs_lock); 				\
-		tmp = all_mddevs.next;					\
-		mddev = NULL;});					\
-	     ({ if (tmp != &all_mddevs)					\
-			mddev_get(list_entry(tmp, mddev_t, all_mddevs));\
+		_tmp = all_mddevs.next;					\
+		_mddev = NULL;});					\
+	     ({ if (_tmp != &all_mddevs)				\
+			mddev_get(list_entry(_tmp, struct mddev, all_mddevs));\
 		spin_unlock(&all_mddevs_lock);				\
-		if (mddev) mddev_put(mddev);				\
-		mddev = list_entry(tmp, mddev_t, all_mddevs);		\
-		tmp != &all_mddevs;});					\
+		if (_mddev) mddev_put(_mddev);				\
+		_mddev = list_entry(_tmp, struct mddev, all_mddevs);	\
+		_tmp != &all_mddevs;});					\
 	     ({ spin_lock(&all_mddevs_lock);				\
-		tmp = tmp->next;})					\
+		_tmp = _tmp->next;})					\
 		)
 
 
@@ -210,12 +341,22 @@ static DEFINE_SPINLOCK(all_mddevs_lock);
  */
 static int md_make_request(struct request_queue *q, struct bio *bio)
 {
-	mddev_t *mddev = q->queuedata;
+	const int rw = bio_data_dir(bio);
+	struct mddev *mddev = q->queuedata;
 	int rv;
-	if (mddev == NULL || mddev->pers == NULL) {
+	int cpu;
+	unsigned int sectors;
+
+	if (mddev == NULL || mddev->pers == NULL
+	    || !mddev->ready) {
 		bio_io_error(bio);
 		return 0;
 	}
+	if (mddev->ro == 1 && unlikely(rw == WRITE)) {
+		bio_endio(bio, bio_sectors(bio) == 0 ? 0 : -EROFS);
+		return 0;
+	}
+	smp_rmb(); /* Ensure implications of  'active' are visible */
 	rcu_read_lock();
 	if (mddev->suspended) {
 		DEFINE_WAIT(__wait);
@@ -232,44 +373,193 @@ static int md_make_request(struct request_queue *q, struct bio *bio)
 	}
 	atomic_inc(&mddev->active_io);
 	rcu_read_unlock();
-	rv = mddev->pers->make_request(q, bio);
+
+	/*
+	 * save the sectors now since our bio can
+	 * go away inside make_request
+	 */
+	sectors = bio_sectors(bio);
+	rv = mddev->pers->make_request(mddev, bio);
+
+	cpu = part_stat_lock();
+	part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);
+	part_stat_add(cpu, &mddev->gendisk->part0, sectors[rw], sectors);
+	part_stat_unlock();
+
 	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended)
 		wake_up(&mddev->sb_wait);
 
 	return rv;
 }
 
-static void mddev_suspend(mddev_t *mddev)
+/* mddev_suspend makes sure no new requests are submitted
+ * to the device, and that any requests that have been submitted
+ * are completely handled.
+ * Once ->stop is called and completes, the module will be completely
+ * unused.
+ */
+void mddev_suspend(struct mddev *mddev)
 {
 	BUG_ON(mddev->suspended);
 	mddev->suspended = 1;
 	synchronize_rcu();
 	wait_event(mddev->sb_wait, atomic_read(&mddev->active_io) == 0);
 	mddev->pers->quiesce(mddev, 1);
-	md_unregister_thread(mddev->thread);
-	mddev->thread = NULL;
-	/* we now know that no code is executing in the personality module,
-	 * except possibly the tail end of a ->bi_end_io function, but that
-	 * is certain to complete before the module has a chance to get
-	 * unloaded
-	 */
-}
 
-static void mddev_resume(mddev_t *mddev)
+	del_timer_sync(&mddev->safemode_timer);
+}
+EXPORT_SYMBOL_GPL(mddev_suspend);
+
+void mddev_resume(struct mddev *mddev)
 {
 	mddev->suspended = 0;
 	wake_up(&mddev->sb_wait);
 	mddev->pers->quiesce(mddev, 0);
-}
 
-int mddev_congested(mddev_t *mddev, int bits)
+	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	md_wakeup_thread(mddev->thread);
+	md_wakeup_thread(mddev->sync_thread); /* possibly kick off a reshape */
+}
+EXPORT_SYMBOL_GPL(mddev_resume);
+
+int mddev_congested(struct mddev *mddev, int bits)
 {
 	return mddev->suspended;
 }
 EXPORT_SYMBOL(mddev_congested);
 
+/*
+ * Generic flush handling for md
+ */
 
-static inline mddev_t *mddev_get(mddev_t *mddev)
+static void md_end_flush(struct bio *bio, int err)
+{
+	struct md_rdev *rdev = bio->bi_private;
+	struct mddev *mddev = rdev->mddev;
+
+	rdev_dec_pending(rdev, mddev);
+
+	if (atomic_dec_and_test(&mddev->flush_pending)) {
+		/* The pre-request flush has finished */
+		queue_work(md_wq, &mddev->flush_work);
+	}
+	bio_put(bio);
+}
+
+static void md_submit_flush_data(struct work_struct *ws);
+
+static void submit_flushes(struct work_struct *ws)
+{
+	struct mddev *mddev = container_of(ws, struct mddev, flush_work);
+	struct md_rdev *rdev;
+
+	INIT_WORK(&mddev->flush_work, md_submit_flush_data);
+	atomic_set(&mddev->flush_pending, 1);
+	rcu_read_lock();
+	rdev_for_each_rcu(rdev, mddev)
+		if (rdev->raid_disk >= 0 &&
+		    !test_bit(Faulty, &rdev->flags)) {
+			/* Take two references, one is dropped
+			 * when request finishes, one after
+			 * we reclaim rcu_read_lock
+			 */
+			struct bio *bi;
+			atomic_inc(&rdev->nr_pending);
+			atomic_inc(&rdev->nr_pending);
+			rcu_read_unlock();
+			bi = bio_alloc_mddev(GFP_NOIO, 0, mddev);
+			bi->bi_end_io = md_end_flush;
+			bi->bi_private = rdev;
+			bi->bi_bdev = rdev->bdev;
+			atomic_inc(&mddev->flush_pending);
+			submit_bio(WRITE_FLUSH, bi);
+			rcu_read_lock();
+			rdev_dec_pending(rdev, mddev);
+		}
+	rcu_read_unlock();
+	if (atomic_dec_and_test(&mddev->flush_pending))
+		schedule_work(&mddev->flush_work);
+}
+
+static void md_submit_flush_data(struct work_struct *ws)
+{
+	struct mddev *mddev = container_of(ws, struct mddev, flush_work);
+	struct bio *bio = mddev->flush_bio;
+
+	if (bio->bi_size == 0)
+		/* an empty barrier - all done */
+		bio_endio(bio, 0);
+	else {
+		bio->bi_rw &= ~BIO_FLUSH;
+		if (mddev->pers->make_request(mddev, bio))
+			generic_make_request(bio);
+	}
+
+	mddev->flush_bio = NULL;
+	wake_up(&mddev->sb_wait);
+}
+
+void md_flush_request(struct mddev *mddev, struct bio *bio)
+{
+	spin_lock_irq(&mddev->write_lock);
+	wait_event_lock_irq(mddev->sb_wait,
+			    !mddev->flush_bio,
+			    mddev->write_lock, /*nothing*/);
+	mddev->flush_bio = bio;
+	spin_unlock_irq(&mddev->write_lock);
+
+	INIT_WORK(&mddev->flush_work, submit_flushes);
+	queue_work(md_wq, &mddev->flush_work);
+}
+EXPORT_SYMBOL(md_flush_request);
+
+/* Support for plugging.
+ * This mirrors the plugging support in request_queue, but does not
+ * require having a whole queue
+ */
+static void plugger_work(struct work_struct *work)
+{
+	struct plug_handle *plug =
+		container_of(work, struct plug_handle, unplug_work);
+	plug->unplug_fn(plug);
+}
+
+static void plugger_timeout(unsigned long data)
+{
+	struct plug_handle *plug = (void *)data;
+	kblockd_schedule_work(NULL, &plug->unplug_work);
+}
+void plugger_init(struct plug_handle *plug,
+		  void (*unplug_fn)(struct plug_handle *))
+{
+	plug->unplug_flag = 0;
+	plug->unplug_fn = unplug_fn;
+	init_timer(&plug->unplug_timer);
+	plug->unplug_timer.function = plugger_timeout;
+	plug->unplug_timer.data = (unsigned long)plug;
+	INIT_WORK(&plug->unplug_work, plugger_work);
+}
+EXPORT_SYMBOL_GPL(plugger_init);
+
+void plugger_set_plug(struct plug_handle *plug)
+{
+	if (!test_and_set_bit(PLUGGED_FLAG, &plug->unplug_flag))
+		mod_timer(&plug->unplug_timer, jiffies + msecs_to_jiffies(3)+1);
+}
+EXPORT_SYMBOL_GPL(plugger_set_plug);
+
+int plugger_remove_plug(struct plug_handle *plug)
+{
+	if (test_and_clear_bit(PLUGGED_FLAG, &plug->unplug_flag)) {
+		del_timer(&plug->unplug_timer);
+		return 1;
+	} else
+		return 0;
+}
+EXPORT_SYMBOL_GPL(plugger_remove_plug);
+
+
+static inline struct mddev *mddev_get(struct mddev *mddev)
 {
 	atomic_inc(&mddev->active);
 	return mddev;
@@ -277,33 +567,62 @@ static inline mddev_t *mddev_get(mddev_t *mddev)
 
 static void mddev_delayed_delete(struct work_struct *ws);
 
-static void mddev_put(mddev_t *mddev)
+static void mddev_put(struct mddev *mddev)
 {
+	struct bio_set *bs = NULL;
+
 	if (!atomic_dec_and_lock(&mddev->active, &all_mddevs_lock))
 		return;
 	if (!mddev->raid_disks && list_empty(&mddev->disks) &&
 	    mddev->ctime == 0 && !mddev->hold_active) {
 		/* Array is not configured at all, and not held active,
 		 * so destroy it */
-		list_del(&mddev->all_mddevs);
+		list_del_init(&mddev->all_mddevs);
+		bs = mddev->bio_set;
+		mddev->bio_set = NULL;
 		if (mddev->gendisk) {
-			/* we did a probe so need to clean up.
-			 * Call schedule_work inside the spinlock
-			 * so that flush_scheduled_work() after
-			 * mddev_find will succeed in waiting for the
-			 * work to be done.
+			/* We did a probe so need to clean up.  Call
+			 * queue_work inside the spinlock so that
+			 * flush_workqueue() after mddev_find will
+			 * succeed in waiting for the work to be done.
 			 */
 			INIT_WORK(&mddev->del_work, mddev_delayed_delete);
-			schedule_work(&mddev->del_work);
+			queue_work(md_misc_wq, &mddev->del_work);
 		} else
 			kfree(mddev);
 	}
 	spin_unlock(&all_mddevs_lock);
+	if (bs)
+		bioset_free(bs);
 }
 
-static mddev_t * mddev_find(dev_t unit)
+void mddev_init(struct mddev *mddev)
 {
-	mddev_t *mddev, *new = NULL;
+	mutex_init(&mddev->open_mutex);
+	mutex_init(&mddev->reconfig_mutex);
+	mutex_init(&mddev->bitmap_info.mutex);
+	INIT_LIST_HEAD(&mddev->disks);
+	INIT_LIST_HEAD(&mddev->all_mddevs);
+	init_timer(&mddev->safemode_timer);
+	atomic_set(&mddev->active, 1);
+	atomic_set(&mddev->openers, 0);
+	atomic_set(&mddev->active_io, 0);
+	spin_lock_init(&mddev->write_lock);
+	atomic_set(&mddev->flush_pending, 0);
+	init_waitqueue_head(&mddev->sb_wait);
+	init_waitqueue_head(&mddev->recovery_wait);
+	mddev->reshape_position = MaxSector;
+	mddev->reshape_backwards = 0;
+	mddev->last_sync_action = "none";
+	mddev->resync_min = 0;
+	mddev->resync_max = MaxSector;
+	mddev->level = LEVEL_NONE;
+}
+EXPORT_SYMBOL_GPL(mddev_init);
+
+static struct mddev * mddev_find(dev_t unit)
+{
+	struct mddev *mddev, *new = NULL;
 
 	if (unit && MAJOR(unit) != MD_MAJOR)
 		unit &= ~((1<<MdpMinorShift)-1);
@@ -370,73 +689,118 @@ static mddev_t * mddev_find(dev_t unit)
 	else
 		new->md_minor = MINOR(unit) >> MdpMinorShift;
 
-	mutex_init(&new->open_mutex);
-	mutex_init(&new->reconfig_mutex);
-	mutex_init(&new->bitmap_mutex);
-	INIT_LIST_HEAD(&new->disks);
-	INIT_LIST_HEAD(&new->all_mddevs);
-	init_timer(&new->safemode_timer);
-	atomic_set(&new->active, 1);
-	atomic_set(&new->openers, 0);
-	atomic_set(&new->active_io, 0);
-	spin_lock_init(&new->write_lock);
-	init_waitqueue_head(&new->sb_wait);
-	init_waitqueue_head(&new->recovery_wait);
-	new->reshape_position = MaxSector;
-	new->resync_min = 0;
-	new->resync_max = MaxSector;
-	new->level = LEVEL_NONE;
+	mddev_init(new);
 
 	goto retry;
 }
 
-static inline int mddev_lock(mddev_t * mddev)
+static inline int mddev_lock(struct mddev * mddev)
 {
 	return mutex_lock_interruptible(&mddev->reconfig_mutex);
 }
 
-static inline int mddev_is_locked(mddev_t *mddev)
+static inline int mddev_is_locked(struct mddev *mddev)
 {
 	return mutex_is_locked(&mddev->reconfig_mutex);
 }
 
-static inline int mddev_trylock(mddev_t * mddev)
+static inline int mddev_trylock(struct mddev * mddev)
 {
 	return mutex_trylock(&mddev->reconfig_mutex);
 }
 
-static inline void mddev_unlock(mddev_t * mddev)
-{
-	mutex_unlock(&mddev->reconfig_mutex);
+static struct attribute_group md_redundancy_group;
 
+static void mddev_unlock(struct mddev * mddev)
+{
+	if (mddev->to_remove) {
+		/* These cannot be removed under reconfig_mutex as
+		 * an access to the files will try to take reconfig_mutex
+		 * while holding the file unremovable, which leads to
+		 * a deadlock.
+		 * So hold set sysfs_active while the remove in happeing,
+		 * and anything else which might set ->to_remove or my
+		 * otherwise change the sysfs namespace will fail with
+		 * -EBUSY if sysfs_active is still set.
+		 * We set sysfs_active under reconfig_mutex and elsewhere
+		 * test it under the same mutex to ensure its correct value
+		 * is seen.
+		 */
+		struct attribute_group *to_remove = mddev->to_remove;
+		mddev->to_remove = NULL;
+		mddev->sysfs_active = 1;
+		mutex_unlock(&mddev->reconfig_mutex);
+
+		if (mddev->kobj.sd) {
+			if (to_remove != &md_redundancy_group)
+				sysfs_remove_group(&mddev->kobj, to_remove);
+			if (mddev->pers == NULL ||
+			    mddev->pers->sync_request == NULL) {
+				sysfs_remove_group(&mddev->kobj, &md_redundancy_group);
+				if (mddev->sysfs_action)
+					sysfs_put(mddev->sysfs_action);
+				mddev->sysfs_action = NULL;
+			}
+		}
+		mddev->sysfs_active = 0;
+	} else
+		mutex_unlock(&mddev->reconfig_mutex);
+
+	/* As we've dropped the mutex we need a spinlock to
+	 * make sure the thread doesn't disappear
+	 */
+	spin_lock(&pers_lock);
 	md_wakeup_thread(mddev->thread);
+	spin_unlock(&pers_lock);
 }
 
-static mdk_rdev_t * find_rdev_nr(mddev_t *mddev, int nr)
+static struct md_rdev * find_rdev_nr(struct mddev *mddev, int nr)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
-	list_for_each_entry(rdev, &mddev->disks, same_set)
+	rdev_for_each(rdev, mddev)
 		if (rdev->desc_nr == nr)
 			return rdev;
 
 	return NULL;
 }
 
-static mdk_rdev_t * find_rdev(mddev_t * mddev, dev_t dev)
+static struct md_rdev *find_rdev_nr_rcu(struct mddev *mddev, int nr)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
-	list_for_each_entry(rdev, &mddev->disks, same_set)
+	rdev_for_each_rcu(rdev, mddev)
+		if (rdev->desc_nr == nr)
+			return rdev;
+
+	return NULL;
+}
+
+static struct md_rdev *find_rdev(struct mddev *mddev, dev_t dev)
+{
+	struct md_rdev *rdev;
+
+	rdev_for_each(rdev, mddev)
 		if (rdev->bdev->bd_dev == dev)
 			return rdev;
 
 	return NULL;
 }
 
-static struct mdk_personality *find_pers(int level, char *clevel)
+static struct md_rdev *find_rdev_rcu(struct mddev *mddev, dev_t dev)
 {
-	struct mdk_personality *pers;
+	struct md_rdev *rdev;
+
+	rdev_for_each_rcu(rdev, mddev)
+		if (rdev->bdev->bd_dev == dev)
+			return rdev;
+
+	return NULL;
+}
+
+static struct md_personality *find_pers(int level, char *clevel)
+{
+	struct md_personality *pers;
 	list_for_each_entry(pers, &pers_list, list) {
 		if (level != LEVEL_NONE && pers->level == level)
 			return pers;
@@ -447,13 +811,13 @@ static struct mdk_personality *find_pers(int level, char *clevel)
 }
 
 /* return the offset of the super block in 512byte sectors */
-static inline sector_t calc_dev_sboffset(struct block_device *bdev)
+static inline sector_t calc_dev_sboffset(struct md_rdev *rdev)
 {
-	sector_t num_sectors = bdev->bd_inode->i_size / 512;
+	sector_t num_sectors = i_size_read(rdev->bdev->bd_inode) / 512;
 	return MD_NEW_SIZE_SECTORS(num_sectors);
 }
 
-static int alloc_disk_sb(mdk_rdev_t * rdev)
+static int alloc_disk_sb(struct md_rdev * rdev)
 {
 	if (rdev->sb_page)
 		MD_BUG();
@@ -467,7 +831,7 @@ static int alloc_disk_sb(mdk_rdev_t * rdev)
 	return 0;
 }
 
-static void free_disk_sb(mdk_rdev_t * rdev)
+void md_rdev_clear(struct md_rdev *rdev)
 {
 	if (rdev->sb_page) {
 		put_page(rdev->sb_page);
@@ -476,13 +840,19 @@ static void free_disk_sb(mdk_rdev_t * rdev)
 		rdev->sb_start = 0;
 		rdev->sectors = 0;
 	}
+	if (rdev->bb_page) {
+		put_page(rdev->bb_page);
+		rdev->bb_page = NULL;
+	}
+	kfree(rdev->badblocks.page);
+	rdev->badblocks.page = NULL;
 }
-
+EXPORT_SYMBOL_GPL(md_rdev_clear);
 
 static void super_written(struct bio *bio, int error)
 {
-	mdk_rdev_t *rdev = bio->bi_private;
-	mddev_t *mddev = rdev->mddev;
+	struct md_rdev *rdev = bio->bi_private;
+	struct mddev *mddev = rdev->mddev;
 
 	if (error || !test_bit(BIO_UPTODATE, &bio->bi_flags)) {
 		printk("md: super_written gets error=%d, uptodate=%d\n",
@@ -496,32 +866,7 @@ static void super_written(struct bio *bio, int error)
 	bio_put(bio);
 }
 
-static void super_written_barrier(struct bio *bio, int error)
-{
-	struct bio *bio2 = bio->bi_private;
-	mdk_rdev_t *rdev = bio2->bi_private;
-	mddev_t *mddev = rdev->mddev;
-
-	if (!test_bit(BIO_UPTODATE, &bio->bi_flags) &&
-	    error == -EOPNOTSUPP) {
-		unsigned long flags;
-		/* barriers don't appear to be supported :-( */
-		set_bit(BarriersNotsupp, &rdev->flags);
-		mddev->barriers_work = 0;
-		spin_lock_irqsave(&mddev->write_lock, flags);
-		bio2->bi_next = mddev->biolist;
-		mddev->biolist = bio2;
-		spin_unlock_irqrestore(&mddev->write_lock, flags);
-		wake_up(&mddev->sb_wait);
-		bio_put(bio);
-	} else {
-		bio_put(bio2);
-		bio->bi_private = rdev;
-		super_written(bio, error);
-	}
-}
-
-void md_super_write(mddev_t *mddev, mdk_rdev_t *rdev,
+void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
 		   sector_t sector, int size, struct page *page)
 {
 	/* write first size bytes of page to sector of rdev
@@ -529,51 +874,27 @@ void md_super_write(mddev_t *mddev, mdk_rdev_t *rdev,
 	 * and decrement it on completion, waking up sb_wait
 	 * if zero is reached.
 	 * If an error occurred, call md_error
-	 *
-	 * As we might need to resubmit the request if BIO_RW_BARRIER
-	 * causes ENOTSUPP, we allocate a spare bio...
 	 */
-	struct bio *bio = bio_alloc(GFP_NOIO, 1);
-	int rw = (1<<BIO_RW) | (1<<BIO_RW_SYNCIO) | (1<<BIO_RW_UNPLUG);
+	struct bio *bio = bio_alloc_mddev(GFP_NOIO, 1, mddev);
 
-	bio->bi_bdev = rdev->bdev;
+	bio->bi_bdev = rdev->meta_bdev ? rdev->meta_bdev : rdev->bdev;
 	bio->bi_sector = sector;
 	bio_add_page(bio, page, size, 0);
 	bio->bi_private = rdev;
 	bio->bi_end_io = super_written;
-	bio->bi_rw = rw;
 
 	atomic_inc(&mddev->pending_writes);
-	if (!test_bit(BarriersNotsupp, &rdev->flags)) {
-		struct bio *rbio;
-		rw |= (1<<BIO_RW_BARRIER);
-		rbio = bio_clone(bio, GFP_NOIO);
-		rbio->bi_private = bio;
-		rbio->bi_end_io = super_written_barrier;
-		submit_bio(rw, rbio);
-	} else
-		submit_bio(rw, bio);
+	submit_bio((WRITE_FLUSH_FUA & ~(1 << BIO_RW_NOIDLE)), bio);
 }
 
-void md_super_wait(mddev_t *mddev)
+void md_super_wait(struct mddev *mddev)
 {
-	/* wait for all superblock writes that were scheduled to complete.
-	 * if any had to be retried (due to BARRIER problems), retry them
-	 */
+	/* wait for all superblock writes that were scheduled to complete */
 	DEFINE_WAIT(wq);
 	for(;;) {
 		prepare_to_wait(&mddev->sb_wait, &wq, TASK_UNINTERRUPTIBLE);
 		if (atomic_read(&mddev->pending_writes)==0)
 			break;
-		while (mddev->biolist) {
-			struct bio *bio;
-			spin_lock_irq(&mddev->write_lock);
-			bio = mddev->biolist;
-			mddev->biolist = bio->bi_next ;
-			bio->bi_next = NULL;
-			spin_unlock_irq(&mddev->write_lock);
-			submit_bio(bio->bi_rw, bio);
-		}
 		schedule();
 	}
 	finish_wait(&mddev->sb_wait, &wq);
@@ -584,17 +905,25 @@ static void bi_complete(struct bio *bio, int error)
 	complete((struct completion*)bio->bi_private);
 }
 
-int sync_page_io(struct block_device *bdev, sector_t sector, int size,
-		   struct page *page, int rw)
+int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
+		 struct page *page, int rw, bool metadata_op)
 {
-	struct bio *bio = bio_alloc(GFP_NOIO, 1);
+	struct bio *bio = bio_alloc_mddev(GFP_NOIO, 1, rdev->mddev);
 	struct completion event;
 	int ret;
 
 	rw |= (1 << BIO_RW_SYNCIO) | (1 << BIO_RW_UNPLUG);
 
-	bio->bi_bdev = bdev;
-	bio->bi_sector = sector;
+	bio->bi_bdev = (metadata_op && rdev->meta_bdev) ?
+		rdev->meta_bdev : rdev->bdev;
+	if (metadata_op)
+		bio->bi_sector = sector + rdev->sb_start;
+	else if (rdev->mddev->reshape_position != MaxSector &&
+		 (rdev->mddev->reshape_backwards ==
+		  (sector >= rdev->mddev->reshape_position)))
+		bio->bi_sector = sector + rdev->new_data_offset;
+	else
+		bio->bi_sector = sector + rdev->data_offset;
 	bio_add_page(bio, page, size, 0);
 	init_completion(&event);
 	bio->bi_private = &event;
@@ -608,7 +937,7 @@ int sync_page_io(struct block_device *bdev, sector_t sector, int size,
 }
 EXPORT_SYMBOL_GPL(sync_page_io);
 
-static int read_disk_sb(mdk_rdev_t * rdev, int size)
+static int read_disk_sb(struct md_rdev * rdev, int size)
 {
 	char b[BDEVNAME_SIZE];
 	if (!rdev->sb_page) {
@@ -619,7 +948,7 @@ static int read_disk_sb(mdk_rdev_t * rdev, int size)
 		return 0;
 
 
-	if (!sync_page_io(rdev->bdev, rdev->sb_start, size, rdev->sb_page, READ))
+	if (!sync_page_io(rdev, 0, size, rdev->sb_page, READ, true))
 		goto fail;
 	rdev->sb_loaded = 1;
 	return 0;
@@ -715,7 +1044,7 @@ static unsigned int calc_sb_csum(mdp_super_t * sb)
  * We rely on user-space to write the initial superblock, and support
  * reading and updating of superblocks.
  * Interface methods are:
- *   int load_super(mdk_rdev_t *dev, mdk_rdev_t *refdev, int minor_version)
+ *   int load_super(struct md_rdev *dev, struct md_rdev *refdev, int minor_version)
  *      loads and validates a superblock on dev.
  *      if refdev != NULL, compare superblocks on both devices
  *    Return:
@@ -725,13 +1054,13 @@ static unsigned int calc_sb_csum(mdp_super_t * sb)
  *     -EINVAL superblock incompatible or invalid
  *     -othererror e.g. -EIO
  *
- *   int validate_super(mddev_t *mddev, mdk_rdev_t *dev)
+ *   int validate_super(struct mddev *mddev, struct md_rdev *dev)
  *      Verify that dev is acceptable into mddev.
  *       The first time, mddev->raid_disks will be 0, and data from
  *       dev should be merged in.  Subsequent calls check that dev
  *       is new enough.  Return 0 or -EINVAL
  *
- *   void sync_super(mddev_t *mddev, mdk_rdev_t *dev)
+ *   void sync_super(struct mddev *mddev, struct md_rdev *dev)
  *     Update the superblock for rdev with data in mddev
  *     This does not write to disc.
  *
@@ -740,12 +1069,17 @@ static unsigned int calc_sb_csum(mdp_super_t * sb)
 struct super_type  {
 	char		    *name;
 	struct module	    *owner;
-	int		    (*load_super)(mdk_rdev_t *rdev, mdk_rdev_t *refdev,
+	int		    (*load_super)(struct md_rdev *rdev,
+					  struct md_rdev *refdev,
 					  int minor_version);
-	int		    (*validate_super)(mddev_t *mddev, mdk_rdev_t *rdev);
-	void		    (*sync_super)(mddev_t *mddev, mdk_rdev_t *rdev);
-	unsigned long long  (*rdev_size_change)(mdk_rdev_t *rdev,
+	int		    (*validate_super)(struct mddev *mddev,
+					      struct md_rdev *rdev);
+	void		    (*sync_super)(struct mddev *mddev,
+					  struct md_rdev *rdev);
+	unsigned long long  (*rdev_size_change)(struct md_rdev *rdev,
 						sector_t num_sectors);
+	int		    (*allow_new_offset)(struct md_rdev *rdev,
+						unsigned long long new_offset);
 };
 
 /*
@@ -756,9 +1090,9 @@ struct super_type  {
  * has a bitmap. Otherwise, it returns 0.
  *
  */
-int md_check_no_bitmap(mddev_t *mddev)
+int md_check_no_bitmap(struct mddev *mddev)
 {
-	if (!mddev->bitmap_file && !mddev->bitmap_offset)
+	if (!mddev->bitmap_info.file && !mddev->bitmap_info.offset)
 		return 0;
 	printk(KERN_ERR "%s: bitmaps are not supported for %s\n",
 		mdname(mddev), mddev->pers->name);
@@ -769,7 +1103,7 @@ EXPORT_SYMBOL(md_check_no_bitmap);
 /*
  * load_super for 0.90.0 
  */
-static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
+static int super_90_load(struct md_rdev *rdev, struct md_rdev *refdev, int minor_version)
 {
 	char b[BDEVNAME_SIZE], b2[BDEVNAME_SIZE];
 	mdp_super_t *sb;
@@ -781,7 +1115,7 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 	 *
 	 * It also happens to be a multiple of 4Kb.
 	 */
-	rdev->sb_start = calc_dev_sboffset(rdev->bdev);
+	rdev->sb_start = calc_dev_sboffset(rdev);
 
 	ret = read_disk_sb(rdev, MD_SB_BYTES);
 	if (ret) return ret;
@@ -789,7 +1123,7 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 	ret = -EINVAL;
 
 	bdevname(rdev->bdev, b);
-	sb = (mdp_super_t*)page_address(rdev->sb_page);
+	sb = page_address(rdev->sb_page);
 
 	if (sb->md_magic != MD_SB_MAGIC) {
 		printk(KERN_ERR "md: invalid raid superblock magic on %s\n",
@@ -817,7 +1151,9 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 
 	rdev->preferred_minor = sb->md_minor;
 	rdev->data_offset = 0;
+	rdev->new_data_offset = 0;
 	rdev->sb_size = MD_SB_BYTES;
+	rdev->badblocks.shift = -1;
 
 	if (sb->level == LEVEL_MULTIPATH)
 		rdev->desc_nr = -1;
@@ -828,7 +1164,7 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 		ret = 1;
 	} else {
 		__u64 ev1, ev2;
-		mdp_super_t *refsb = (mdp_super_t*)page_address(refdev->sb_page);
+		mdp_super_t *refsb = page_address(refdev->sb_page);
 		if (!uuid_equal(refsb, sb)) {
 			printk(KERN_WARNING "md: %s has different UUID to %s\n",
 				b, bdevname(refdev->bdev,b2));
@@ -848,8 +1184,11 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 			ret = 0;
 	}
 	rdev->sectors = rdev->sb_start;
-	/* Limit to 4TB as metadata cannot record more than that */
-	if (rdev->sectors >= (2ULL << 32))
+	/* Limit to 4TB as metadata cannot record more than that.
+	 * (not needed for Linear and RAID0 as metadata doesn't
+	 * record this size)
+	 */
+	if (rdev->sectors >= (2ULL << 32) && sb->level >= 1)
 		rdev->sectors = (2ULL << 32) - 2;
 
 	if (rdev->sectors < ((sector_t)sb->size) * 2 && sb->level >= 1)
@@ -863,17 +1202,16 @@ static int super_90_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version
 /*
  * validate_super for 0.90.0
  */
-static int super_90_validate(mddev_t *mddev, mdk_rdev_t *rdev)
+static int super_90_validate(struct mddev *mddev, struct md_rdev *rdev)
 {
 	mdp_disk_t *desc;
-	mdp_super_t *sb = (mdp_super_t *)page_address(rdev->sb_page);
+	mdp_super_t *sb = page_address(rdev->sb_page);
 	__u64 ev1 = md_event(sb);
 
 	rdev->raid_disk = -1;
 	clear_bit(Faulty, &rdev->flags);
 	clear_bit(In_sync, &rdev->flags);
 	clear_bit(WriteMostly, &rdev->flags);
-	clear_bit(BarriersNotsupp, &rdev->flags);
 
 	if (mddev->raid_disks == 0) {
 		mddev->major_version = 0;
@@ -889,8 +1227,12 @@ static int super_90_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 		mddev->raid_disks = sb->raid_disks;
 		mddev->dev_sectors = ((sector_t)sb->size) * 2;
 		mddev->events = ev1;
-		mddev->bitmap_offset = 0;
-		mddev->default_bitmap_offset = MD_SB_BYTES >> 9;
+		mddev->bitmap_info.offset = 0;
+		mddev->bitmap_info.space = 0;
+		/* bitmap can use 60 K after the 4K superblocks */
+		mddev->bitmap_info.default_offset = MD_SB_BYTES >> 9;
+		mddev->bitmap_info.default_space = 64*2 - (MD_SB_BYTES >> 9);
+		mddev->reshape_backwards = 0;
 
 		if (mddev->minor_version >= 91) {
 			mddev->reshape_position = sb->reshape_position;
@@ -898,6 +1240,8 @@ static int super_90_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 			mddev->new_level = sb->new_level;
 			mddev->new_layout = sb->new_layout;
 			mddev->new_chunk_sectors = sb->new_chunk >> 9;
+			if (mddev->delta_disks < 0)
+				mddev->reshape_backwards = 1;
 		} else {
 			mddev->reshape_position = MaxSector;
 			mddev->delta_disks = 0;
@@ -924,14 +1268,21 @@ static int super_90_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 		mddev->max_disks = MD_SB_DISKS;
 
 		if (sb->state & (1<<MD_SB_BITMAP_PRESENT) &&
-		    mddev->bitmap_file == NULL)
-			mddev->bitmap_offset = mddev->default_bitmap_offset;
+		    mddev->bitmap_info.file == NULL) {
+			mddev->bitmap_info.offset =
+				mddev->bitmap_info.default_offset;
+			mddev->bitmap_info.space =
+				mddev->bitmap_info.space;
+		}
 
 	} else if (mddev->pers == NULL) {
-		/* Insist on good event counter while assembling */
+		/* Insist on good event counter while assembling, except
+		 * for spares (which don't need an event count) */
 		++ev1;
-		if (ev1 < mddev->events) 
-			return -EINVAL;
+		if (sb->disks[rdev->desc_nr].state & (
+			    (1<<MD_DISK_SYNC) | (1 << MD_DISK_ACTIVE)))
+			if (ev1 < mddev->events) 
+				return -EINVAL;
 	} else if (mddev->bitmap) {
 		/* if adding to array with a bitmap, then we can accept an
 		 * older device ... but not too old.
@@ -972,10 +1323,10 @@ static int super_90_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 /*
  * sync_super for 0.90.0
  */
-static void super_90_sync(mddev_t *mddev, mdk_rdev_t *rdev)
+static void super_90_sync(struct mddev *mddev, struct md_rdev *rdev)
 {
 	mdp_super_t *sb;
-	mdk_rdev_t *rdev2;
+	struct md_rdev *rdev2;
 	int next_spare = mddev->raid_disks;
 
 
@@ -994,7 +1345,7 @@ static void super_90_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 
 	rdev->sb_size = MD_SB_BYTES;
 
-	sb = (mdp_super_t*)page_address(rdev->sb_page);
+	sb = page_address(rdev->sb_page);
 
 	memset(sb, 0, sizeof(*sb));
 
@@ -1042,11 +1393,11 @@ static void super_90_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 	sb->layout = mddev->layout;
 	sb->chunk_size = mddev->chunk_sectors << 9;
 
-	if (mddev->bitmap && mddev->bitmap_file == NULL)
+	if (mddev->bitmap && mddev->bitmap_info.file == NULL)
 		sb->state |= (1<<MD_SB_BITMAP_PRESENT);
 
 	sb->disks[0].state = (1<<MD_DISK_REMOVED);
-	list_for_each_entry(rdev2, &mddev->disks, same_set) {
+	rdev_for_each(rdev2, mddev) {
 		mdp_disk_t *d;
 		int desc_nr;
 		int is_active = test_bit(In_sync, &rdev2->flags);
@@ -1116,19 +1467,19 @@ static void super_90_sync(mddev_t *mddev, mdk_rdev_t *rdev)
  * rdev_size_change for 0.90.0
  */
 static unsigned long long
-super_90_rdev_size_change(mdk_rdev_t *rdev, sector_t num_sectors)
+super_90_rdev_size_change(struct md_rdev *rdev, sector_t num_sectors)
 {
 	if (num_sectors && num_sectors < rdev->mddev->dev_sectors)
 		return 0; /* component must fit device */
-	if (rdev->mddev->bitmap_offset)
+	if (rdev->mddev->bitmap_info.offset)
 		return 0; /* can't move bitmap */
-	rdev->sb_start = calc_dev_sboffset(rdev->bdev);
+	rdev->sb_start = calc_dev_sboffset(rdev);
 	if (!num_sectors || num_sectors > rdev->sb_start)
 		num_sectors = rdev->sb_start;
 	/* Limit to 4TB as metadata cannot record more than that.
 	 * 4TB == 2^32 KB, or 2*2^32 sectors.
 	 */
-	if (num_sectors >= (2ULL << 32))
+	if (num_sectors >= (2ULL << 32) && rdev->mddev->level >= 1)
 		num_sectors = (2ULL << 32) - 2;
 	md_super_write(rdev->mddev, rdev, rdev->sb_start, rdev->sb_size,
 		       rdev->sb_page);
@@ -1136,6 +1487,12 @@ super_90_rdev_size_change(mdk_rdev_t *rdev, sector_t num_sectors)
 	return num_sectors;
 }
 
+static int
+super_90_allow_new_offset(struct md_rdev *rdev, unsigned long long new_offset)
+{
+	/* non-zero offset changes not possible with v0.90 */
+	return new_offset == 0;
+}
 
 /*
  * version 1 superblock
@@ -1148,12 +1505,11 @@ static __le32 calc_sb_1_csum(struct mdp_superblock_1 * sb)
 	unsigned long long newcsum;
 	int size = 256 + le32_to_cpu(sb->max_dev)*2;
 	__le32 *isuper = (__le32*)sb;
-	int i;
 
 	disk_csum = sb->sb_csum;
 	sb->sb_csum = 0;
 	newcsum = 0;
-	for (i=0; size>=4; size -= 4 )
+	for (; size >= 4; size -= 4)
 		newcsum += le32_to_cpu(*isuper++);
 
 	if (size == 2)
@@ -1164,11 +1520,14 @@ static __le32 calc_sb_1_csum(struct mdp_superblock_1 * sb)
 	return cpu_to_le32(csum);
 }
 
-static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
+static int md_set_badblocks(struct badblocks *bb, sector_t s, int sectors,
+			    int acknowledged);
+static int super_1_load(struct md_rdev *rdev, struct md_rdev *refdev, int minor_version)
 {
 	struct mdp_superblock_1 *sb;
 	int ret;
 	sector_t sb_start;
+	sector_t sectors;
 	char b[BDEVNAME_SIZE], b2[BDEVNAME_SIZE];
 	int bmask;
 
@@ -1182,7 +1541,7 @@ static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
 	 */
 	switch(minor_version) {
 	case 0:
-		sb_start = rdev->bdev->bd_inode->i_size >> 9;
+		sb_start = i_size_read(rdev->bdev->bd_inode) >> 9;
 		sb_start -= 8*2;
 		sb_start &= ~(sector_t)(4*2-1);
 		break;
@@ -1204,7 +1563,7 @@ static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
 	if (ret) return ret;
 
 
-	sb = (struct mdp_superblock_1*)page_address(rdev->sb_page);
+	sb = page_address(rdev->sb_page);
 
 	if (sb->magic != cpu_to_le32(MD_SB_MAGIC) ||
 	    sb->major_version != cpu_to_le32(1) ||
@@ -1223,9 +1582,18 @@ static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
 		       bdevname(rdev->bdev,b));
 		return -EINVAL;
 	}
+	if (sb->pad0 ||
+	    sb->pad3[0] ||
+	    memcmp(sb->pad3, sb->pad3+1, sizeof(sb->pad3) - sizeof(sb->pad3[1])))
+		/* Some padding is non-zero, might be a new feature */
+		return -EINVAL;
 
 	rdev->preferred_minor = 0xffff;
 	rdev->data_offset = le64_to_cpu(sb->data_offset);
+	rdev->new_data_offset = rdev->data_offset;
+	if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_RESHAPE_ACTIVE) &&
+	    (le32_to_cpu(sb->feature_map) & MD_FEATURE_NEW_OFFSET))
+		rdev->new_data_offset += (s32)le32_to_cpu(sb->new_offset);
 	atomic_set(&rdev->corrected_errors, le32_to_cpu(sb->cnt_corrected_read));
 
 	rdev->sb_size = le32_to_cpu(sb->max_dev) * 2 + 256;
@@ -1236,18 +1604,61 @@ static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
 	if (minor_version
 	    && rdev->data_offset < sb_start + (rdev->sb_size/512))
 		return -EINVAL;
+	if (minor_version
+	    && rdev->new_data_offset < sb_start + (rdev->sb_size/512))
+		return -EINVAL;
 
 	if (sb->level == cpu_to_le32(LEVEL_MULTIPATH))
 		rdev->desc_nr = -1;
 	else
 		rdev->desc_nr = le32_to_cpu(sb->dev_number);
 
+	if (!rdev->bb_page) {
+		rdev->bb_page = alloc_page(GFP_KERNEL);
+		if (!rdev->bb_page)
+			return -ENOMEM;
+	}
+	if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_BAD_BLOCKS) &&
+	    rdev->badblocks.count == 0) {
+		/* need to load the bad block list.
+		 * Currently we limit it to one page.
+		 */
+		s32 offset;
+		sector_t bb_sector;
+		u64 *bbp;
+		int i;
+		int sectors = le16_to_cpu(sb->bblog_size);
+		if (sectors > (PAGE_SIZE / 512))
+			return -EINVAL;
+		offset = le32_to_cpu(sb->bblog_offset);
+		if (offset == 0)
+			return -EINVAL;
+		bb_sector = (long long)offset;
+		if (!sync_page_io(rdev, bb_sector, sectors << 9,
+				  rdev->bb_page, READ, true))
+			return -EIO;
+		bbp = (u64 *)page_address(rdev->bb_page);
+		rdev->badblocks.shift = sb->bblog_shift;
+		for (i = 0 ; i < (sectors << (9-3)) ; i++, bbp++) {
+			u64 bb = le64_to_cpu(*bbp);
+			int count = bb & (0x3ff);
+			u64 sector = bb >> 10;
+			sector <<= sb->bblog_shift;
+			count <<= sb->bblog_shift;
+			if (bb + 1 == 0)
+				break;
+			if (md_set_badblocks(&rdev->badblocks,
+					     sector, count, 1) == 0)
+				return -EINVAL;
+		}
+	} else if (sb->bblog_offset != 0)
+		rdev->badblocks.shift = 0;
+
 	if (!refdev) {
 		ret = 1;
 	} else {
 		__u64 ev1, ev2;
-		struct mdp_superblock_1 *refsb = 
-			(struct mdp_superblock_1*)page_address(refdev->sb_page);
+		struct mdp_superblock_1 *refsb = page_address(refdev->sb_page);
 
 		if (memcmp(sb->set_uuid, refsb->set_uuid, 16) != 0 ||
 		    sb->level != refsb->level ||
@@ -1267,29 +1678,26 @@ static int super_1_load(mdk_rdev_t *rdev, mdk_rdev_t *refdev, int minor_version)
 		else
 			ret = 0;
 	}
-	if (minor_version)
-		rdev->sectors = (rdev->bdev->bd_inode->i_size >> 9) -
-			le64_to_cpu(sb->data_offset);
-	else
-		rdev->sectors = rdev->sb_start;
-	if (rdev->sectors < le64_to_cpu(sb->data_size))
+	if (minor_version) {
+		sectors = (i_size_read(rdev->bdev->bd_inode) >> 9);
+		sectors -= rdev->data_offset;
+	} else
+		sectors = rdev->sb_start;
+	if (sectors < le64_to_cpu(sb->data_size))
 		return -EINVAL;
 	rdev->sectors = le64_to_cpu(sb->data_size);
-	if (le64_to_cpu(sb->size) > rdev->sectors)
-		return -EINVAL;
 	return ret;
 }
 
-static int super_1_validate(mddev_t *mddev, mdk_rdev_t *rdev)
+static int super_1_validate(struct mddev *mddev, struct md_rdev *rdev)
 {
-	struct mdp_superblock_1 *sb = (struct mdp_superblock_1*)page_address(rdev->sb_page);
+	struct mdp_superblock_1 *sb = page_address(rdev->sb_page);
 	__u64 ev1 = le64_to_cpu(sb->events);
 
 	rdev->raid_disk = -1;
 	clear_bit(Faulty, &rdev->flags);
 	clear_bit(In_sync, &rdev->flags);
 	clear_bit(WriteMostly, &rdev->flags);
-	clear_bit(BarriersNotsupp, &rdev->flags);
 
 	if (mddev->raid_disks == 0) {
 		mddev->major_version = 1;
@@ -1304,17 +1712,38 @@ static int super_1_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 		mddev->raid_disks = le32_to_cpu(sb->raid_disks);
 		mddev->dev_sectors = le64_to_cpu(sb->size);
 		mddev->events = ev1;
-		mddev->bitmap_offset = 0;
-		mddev->default_bitmap_offset = 1024 >> 9;
-		
+		mddev->bitmap_info.offset = 0;
+		mddev->bitmap_info.space = 0;
+		/* Default location for bitmap is 1K after superblock
+		 * using 3K - total of 4K
+		 */
+		mddev->bitmap_info.default_offset = 1024 >> 9;
+		mddev->bitmap_info.default_space = (4096-1024) >> 9;
+		mddev->reshape_backwards = 0;
+
 		mddev->recovery_cp = le64_to_cpu(sb->resync_offset);
 		memcpy(mddev->uuid, sb->set_uuid, 16);
 
 		mddev->max_disks =  (4096-256)/2;
 
 		if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_BITMAP_OFFSET) &&
-		    mddev->bitmap_file == NULL )
-			mddev->bitmap_offset = (__s32)le32_to_cpu(sb->bitmap_offset);
+		    mddev->bitmap_info.file == NULL) {
+			mddev->bitmap_info.offset =
+				(__s32)le32_to_cpu(sb->bitmap_offset);
+			/* Metadata doesn't record how much space is available.
+			 * For 1.0, we assume we can use up to the superblock
+			 * if before, else to 4K beyond superblock.
+			 * For others, assume no change is possible.
+			 */
+			if (mddev->minor_version > 0)
+				mddev->bitmap_info.space = 0;
+			else if (mddev->bitmap_info.offset > 0)
+				mddev->bitmap_info.space =
+					8 - mddev->bitmap_info.offset;
+			else
+				mddev->bitmap_info.space =
+					-mddev->bitmap_info.offset;
+		}
 
 		if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_RESHAPE_ACTIVE)) {
 			mddev->reshape_position = le64_to_cpu(sb->reshape_position);
@@ -1322,6 +1751,11 @@ static int super_1_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 			mddev->new_level = le32_to_cpu(sb->new_level);
 			mddev->new_layout = le32_to_cpu(sb->new_layout);
 			mddev->new_chunk_sectors = le32_to_cpu(sb->new_chunk);
+			if (mddev->delta_disks < 0 ||
+			    (mddev->delta_disks == 0 &&
+			     (le32_to_cpu(sb->feature_map)
+			      & MD_FEATURE_RESHAPE_BACKWARDS)))
+				mddev->reshape_backwards = 1;
 		} else {
 			mddev->reshape_position = MaxSector;
 			mddev->delta_disks = 0;
@@ -1331,10 +1765,14 @@ static int super_1_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 		}
 
 	} else if (mddev->pers == NULL) {
-		/* Insist of good event counter while assembling */
+		/* Insist of good event counter while assembling, except for
+		 * spares (which don't need an event count) */
 		++ev1;
-		if (ev1 < mddev->events)
-			return -EINVAL;
+		if (rdev->desc_nr >= 0 &&
+		    rdev->desc_nr < le32_to_cpu(sb->max_dev) &&
+		    le16_to_cpu(sb->dev_roles[rdev->desc_nr]) < 0xfffe)
+			if (ev1 < mddev->events)
+				return -EINVAL;
 	} else if (mddev->bitmap) {
 		/* If adding to array with a bitmap, then we can accept an
 		 * older device, but not too old.
@@ -1371,26 +1809,26 @@ static int super_1_validate(mddev_t *mddev, mdk_rdev_t *rdev)
 		}
 		if (sb->devflags & WriteMostly1)
 			set_bit(WriteMostly, &rdev->flags);
+		if (le32_to_cpu(sb->feature_map) & MD_FEATURE_REPLACEMENT)
+			set_bit(Replacement, &rdev->flags);
 	} else /* MULTIPATH are always insync */
 		set_bit(In_sync, &rdev->flags);
 
 	return 0;
 }
 
-static void super_1_sync(mddev_t *mddev, mdk_rdev_t *rdev)
+static void super_1_sync(struct mddev *mddev, struct md_rdev *rdev)
 {
 	struct mdp_superblock_1 *sb;
-	mdk_rdev_t *rdev2;
+	struct md_rdev *rdev2;
 	int max_dev, i;
 	/* make rdev->sb match mddev and rdev data. */
 
-	sb = (struct mdp_superblock_1*)page_address(rdev->sb_page);
+	sb = page_address(rdev->sb_page);
 
 	sb->feature_map = 0;
 	sb->pad0 = 0;
 	sb->recovery_offset = cpu_to_le64(0);
-	memset(sb->pad1, 0, sizeof(sb->pad1));
-	memset(sb->pad2, 0, sizeof(sb->pad2));
 	memset(sb->pad3, 0, sizeof(sb->pad3));
 
 	sb->utime = cpu_to_le64((__u64)mddev->utime);
@@ -1408,20 +1846,28 @@ static void super_1_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 	sb->level = cpu_to_le32(mddev->level);
 	sb->layout = cpu_to_le32(mddev->layout);
 
-	if (mddev->bitmap && mddev->bitmap_file == NULL) {
-		sb->bitmap_offset = cpu_to_le32((__u32)mddev->bitmap_offset);
+	if (test_bit(WriteMostly, &rdev->flags))
+		sb->devflags |= WriteMostly1;
+	else
+		sb->devflags &= ~WriteMostly1;
+	sb->data_offset = cpu_to_le64(rdev->data_offset);
+	sb->data_size = cpu_to_le64(rdev->sectors);
+
+	if (mddev->bitmap && mddev->bitmap_info.file == NULL) {
+		sb->bitmap_offset = cpu_to_le32((__u32)mddev->bitmap_info.offset);
 		sb->feature_map = cpu_to_le32(MD_FEATURE_BITMAP_OFFSET);
 	}
 
 	if (rdev->raid_disk >= 0 &&
 	    !test_bit(In_sync, &rdev->flags)) {
-		if (rdev->recovery_offset > 0) {
-			sb->feature_map |=
-				cpu_to_le32(MD_FEATURE_RECOVERY_OFFSET);
-			sb->recovery_offset =
-				cpu_to_le64(rdev->recovery_offset);
-		}
+		sb->feature_map |=
+			cpu_to_le32(MD_FEATURE_RECOVERY_OFFSET);
+		sb->recovery_offset =
+			cpu_to_le64(rdev->recovery_offset);
 	}
+	if (test_bit(Replacement, &rdev->flags))
+		sb->feature_map |=
+			cpu_to_le32(MD_FEATURE_REPLACEMENT);
 
 	if (mddev->reshape_position != MaxSector) {
 		sb->feature_map |= cpu_to_le32(MD_FEATURE_RESHAPE_ACTIVE);
@@ -1430,10 +1876,54 @@ static void super_1_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 		sb->delta_disks = cpu_to_le32(mddev->delta_disks);
 		sb->new_level = cpu_to_le32(mddev->new_level);
 		sb->new_chunk = cpu_to_le32(mddev->new_chunk_sectors);
+		if (mddev->delta_disks == 0 &&
+		    mddev->reshape_backwards)
+			sb->feature_map
+				|= cpu_to_le32(MD_FEATURE_RESHAPE_BACKWARDS);
+		if (rdev->new_data_offset != rdev->data_offset) {
+			sb->feature_map
+				|= cpu_to_le32(MD_FEATURE_NEW_OFFSET);
+			sb->new_offset = cpu_to_le32((__u32)(rdev->new_data_offset
+							     - rdev->data_offset));
+		}
+	}
+
+	if (rdev->badblocks.count == 0)
+		/* Nothing to do for bad blocks*/ ;
+	else if (sb->bblog_offset == 0)
+		/* Cannot record bad blocks on this device */
+		md_error(mddev, rdev);
+	else {
+		struct badblocks *bb = &rdev->badblocks;
+		u64 *bbp = (u64 *)page_address(rdev->bb_page);
+		u64 *p = bb->page;
+		sb->feature_map |= cpu_to_le32(MD_FEATURE_BAD_BLOCKS);
+		if (bb->changed) {
+			unsigned seq;
+
+retry:
+			seq = read_seqbegin(&bb->lock);
+
+			memset(bbp, 0xff, PAGE_SIZE);
+
+			for (i = 0 ; i < bb->count ; i++) {
+				u64 internal_bb = p[i];
+				u64 store_bb = ((BB_OFFSET(internal_bb) << 10)
+						| BB_LEN(internal_bb));
+				bbp[i] = cpu_to_le64(store_bb);
+			}
+			bb->changed = 0;
+			if (read_seqretry(&bb->lock, seq))
+				goto retry;
+
+			bb->sector = (rdev->sb_start +
+				      (int)le32_to_cpu(sb->bblog_offset));
+			bb->size = le16_to_cpu(sb->bblog_size);
+		}
 	}
 
 	max_dev = 0;
-	list_for_each_entry(rdev2, &mddev->disks, same_set)
+	rdev_for_each(rdev2, mddev)
 		if (rdev2->desc_nr+1 > max_dev)
 			max_dev = rdev2->desc_nr+1;
 
@@ -1444,17 +1934,19 @@ static void super_1_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 		bmask = queue_logical_block_size(rdev->bdev->bd_disk->queue)-1;
 		if (rdev->sb_size & bmask)
 			rdev->sb_size = (rdev->sb_size | bmask) + 1;
-	}
+	} else
+		max_dev = le32_to_cpu(sb->max_dev);
+
 	for (i=0; i<max_dev;i++)
 		sb->dev_roles[i] = cpu_to_le16(0xfffe);
 	
-	list_for_each_entry(rdev2, &mddev->disks, same_set) {
+	rdev_for_each(rdev2, mddev) {
 		i = rdev2->desc_nr;
 		if (test_bit(Faulty, &rdev2->flags))
 			sb->dev_roles[i] = cpu_to_le16(0xfffe);
 		else if (test_bit(In_sync, &rdev2->flags))
 			sb->dev_roles[i] = cpu_to_le16(rdev2->raid_disk);
-		else if (rdev2->raid_disk >= 0 && rdev2->recovery_offset > 0)
+		else if (rdev2->raid_disk >= 0)
 			sb->dev_roles[i] = cpu_to_le16(rdev2->raid_disk);
 		else
 			sb->dev_roles[i] = cpu_to_le16(0xffff);
@@ -1464,32 +1956,34 @@ static void super_1_sync(mddev_t *mddev, mdk_rdev_t *rdev)
 }
 
 static unsigned long long
-super_1_rdev_size_change(mdk_rdev_t *rdev, sector_t num_sectors)
+super_1_rdev_size_change(struct md_rdev *rdev, sector_t num_sectors)
 {
 	struct mdp_superblock_1 *sb;
 	sector_t max_sectors;
 	if (num_sectors && num_sectors < rdev->mddev->dev_sectors)
 		return 0; /* component must fit device */
+	if (rdev->data_offset != rdev->new_data_offset)
+		return 0; /* too confusing */
 	if (rdev->sb_start < rdev->data_offset) {
 		/* minor versions 1 and 2; superblock before data */
-		max_sectors = rdev->bdev->bd_inode->i_size >> 9;
+		max_sectors = i_size_read(rdev->bdev->bd_inode) >> 9;
 		max_sectors -= rdev->data_offset;
 		if (!num_sectors || num_sectors > max_sectors)
 			num_sectors = max_sectors;
-	} else if (rdev->mddev->bitmap_offset) {
+	} else if (rdev->mddev->bitmap_info.offset) {
 		/* minor version 0 with bitmap we can't move */
 		return 0;
 	} else {
 		/* minor version 0; superblock after data */
 		sector_t sb_start;
-		sb_start = (rdev->bdev->bd_inode->i_size >> 9) - 8*2;
+		sb_start = (i_size_read(rdev->bdev->bd_inode) >> 9) - 8*2;
 		sb_start &= ~(sector_t)(4*2 - 1);
 		max_sectors = rdev->sectors + sb_start - rdev->sb_start;
 		if (!num_sectors || num_sectors > max_sectors)
 			num_sectors = max_sectors;
 		rdev->sb_start = sb_start;
 	}
-	sb = (struct mdp_superblock_1 *) page_address(rdev->sb_page);
+	sb = page_address(rdev->sb_page);
 	sb->data_size = cpu_to_le64(num_sectors);
 	sb->super_offset = rdev->sb_start;
 	sb->sb_csum = calc_sb_1_csum(sb);
@@ -1497,6 +1991,40 @@ super_1_rdev_size_change(mdk_rdev_t *rdev, sector_t num_sectors)
 		       rdev->sb_page);
 	md_super_wait(rdev->mddev);
 	return num_sectors;
+
+}
+
+static int
+super_1_allow_new_offset(struct md_rdev *rdev,
+			 unsigned long long new_offset)
+{
+	/* All necessary checks on new >= old have been done */
+	struct bitmap *bitmap;
+	if (new_offset >= rdev->data_offset)
+		return 1;
+
+	/* with 1.0 metadata, there is no metadata to tread on
+	 * so we can always move back */
+	if (rdev->mddev->minor_version == 0)
+		return 1;
+
+	/* otherwise we must be sure not to step on
+	 * any metadata, so stay:
+	 * 36K beyond start of superblock
+	 * beyond end of badblocks
+	 * beyond write-intent bitmap
+	 */
+	if (rdev->sb_start + (32+4)*2 > new_offset)
+		return 0;
+	bitmap = rdev->mddev->bitmap;
+	if (bitmap && !rdev->mddev->bitmap_info.file &&
+	    rdev->sb_start + rdev->mddev->bitmap_info.offset +
+	    bitmap->storage.file_pages * (PAGE_SIZE>>9) > new_offset)
+		return 0;
+	if (rdev->badblocks.sector + rdev->badblocks.size > new_offset)
+		return 0;
+
+	return 1;
 }
 
 static struct super_type super_types[] = {
@@ -1507,6 +2035,7 @@ static struct super_type super_types[] = {
 		.validate_super	    = super_90_validate,
 		.sync_super	    = super_90_sync,
 		.rdev_size_change   = super_90_rdev_size_change,
+		.allow_new_offset   = super_90_allow_new_offset,
 	},
 	[1] = {
 		.name	= "md-1",
@@ -1515,12 +2044,25 @@ static struct super_type super_types[] = {
 		.validate_super	    = super_1_validate,
 		.sync_super	    = super_1_sync,
 		.rdev_size_change   = super_1_rdev_size_change,
+		.allow_new_offset   = super_1_allow_new_offset,
 	},
 };
 
-static int match_mddev_units(mddev_t *mddev1, mddev_t *mddev2)
+static void sync_super(struct mddev *mddev, struct md_rdev *rdev)
 {
-	mdk_rdev_t *rdev, *rdev2;
+	if (mddev->sync_super) {
+		mddev->sync_super(mddev, rdev);
+		return;
+	}
+
+	BUG_ON(mddev->major_version >= ARRAY_SIZE(super_types));
+
+	super_types[mddev->major_version].sync_super(mddev, rdev);
+}
+
+static int match_mddev_units(struct mddev *mddev1, struct mddev *mddev2)
+{
+	struct md_rdev *rdev, *rdev2;
 
 	rcu_read_lock();
 	rdev_for_each_rcu(rdev, mddev1)
@@ -1543,26 +2085,20 @@ static LIST_HEAD(pending_raid_disks);
  * from the array. It only succeeds if all working and active component devices
  * are integrity capable with matching profiles.
  */
-int md_integrity_register(mddev_t *mddev)
+int md_integrity_register(struct mddev *mddev)
 {
-	mdk_rdev_t *rdev, *reference = NULL;
+	struct md_rdev *rdev, *reference = NULL;
 
 	if (list_empty(&mddev->disks))
 		return 0; /* nothing to do */
-	if (blk_get_integrity(mddev->gendisk))
-		return 0; /* already registered */
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	if (!mddev->gendisk || blk_get_integrity(mddev->gendisk))
+		return 0; /* shouldn't register, or already is */
+	rdev_for_each(rdev, mddev) {
 		/* skip spares and non-functional disks */
 		if (test_bit(Faulty, &rdev->flags))
 			continue;
 		if (rdev->raid_disk < 0)
 			continue;
-		/*
-		 * If at least one rdev is not integrity capable, we can not
-		 * enable data integrity for the md device.
-		 */
-		if (!bdev_get_integrity(rdev->bdev))
-			return -EINVAL;
 		if (!reference) {
 			/* Use the first rdev as the reference */
 			reference = rdev;
@@ -1573,6 +2109,8 @@ int md_integrity_register(mddev_t *mddev)
 				rdev->bdev->bd_disk) < 0)
 			return -EINVAL;
 	}
+	if (!reference || !bdev_get_integrity(reference->bdev))
+		return 0;
 	/*
 	 * All component devices are integrity capable and have matching
 	 * profiles, register the common profile for the md device.
@@ -1583,17 +2121,27 @@ int md_integrity_register(mddev_t *mddev)
 			mdname(mddev));
 		return -EINVAL;
 	}
-	printk(KERN_NOTICE "md: data integrity on %s enabled\n",
-		mdname(mddev));
+	printk(KERN_NOTICE "md: data integrity enabled on %s\n", mdname(mddev));
+	if (bioset_integrity_create(mddev->bio_set, BIO_POOL_SIZE)) {
+		printk(KERN_ERR "md: failed to create integrity pool for %s\n",
+		       mdname(mddev));
+		return -EINVAL;
+	}
 	return 0;
 }
 EXPORT_SYMBOL(md_integrity_register);
 
 /* Disable data integrity if non-capable/non-matching disk is being added */
-void md_integrity_add_rdev(mdk_rdev_t *rdev, mddev_t *mddev)
+void md_integrity_add_rdev(struct md_rdev *rdev, struct mddev *mddev)
 {
-	struct blk_integrity *bi_rdev = bdev_get_integrity(rdev->bdev);
-	struct blk_integrity *bi_mddev = blk_get_integrity(mddev->gendisk);
+	struct blk_integrity *bi_rdev;
+	struct blk_integrity *bi_mddev;
+
+	if (!mddev->gendisk)
+		return;
+
+	bi_rdev = bdev_get_integrity(rdev->bdev);
+	bi_mddev = blk_get_integrity(mddev->gendisk);
 
 	if (!bi_mddev) /* nothing to do */
 		return;
@@ -1607,7 +2155,7 @@ void md_integrity_add_rdev(mdk_rdev_t *rdev, mddev_t *mddev)
 }
 EXPORT_SYMBOL(md_integrity_add_rdev);
 
-static int bind_rdev_to_array(mdk_rdev_t * rdev, mddev_t * mddev)
+static int bind_rdev_to_array(struct md_rdev * rdev, struct mddev * mddev)
 {
 	char b[BDEVNAME_SIZE];
 	struct kobject *ko;
@@ -1667,17 +2215,15 @@ static int bind_rdev_to_array(mdk_rdev_t * rdev, mddev_t * mddev)
 		goto fail;
 
 	ko = &part_to_dev(rdev->bdev->bd_part)->kobj;
-	if ((err = sysfs_create_link(&rdev->kobj, ko, "block"))) {
-		kobject_del(&rdev->kobj);
-		goto fail;
-	}
-	rdev->sysfs_state = sysfs_get_dirent(rdev->kobj.sd, "state");
+	if (sysfs_create_link(&rdev->kobj, ko, "block"))
+		/* failure here is OK */;
+	rdev->sysfs_state = sysfs_get_dirent_safe(rdev->kobj.sd, "state");
 
 	list_add_rcu(&rdev->same_set, &mddev->disks);
 	bd_claim_by_disk(rdev->bdev, rdev->bdev->bd_holder, mddev->gendisk);
 
 	/* May as well allow recovery to be retried once */
-	mddev->recovery_disabled = 0;
+	mddev->recovery_disabled++;
 
 	return 0;
 
@@ -1689,12 +2235,12 @@ static int bind_rdev_to_array(mdk_rdev_t * rdev, mddev_t * mddev)
 
 static void md_delayed_delete(struct work_struct *ws)
 {
-	mdk_rdev_t *rdev = container_of(ws, mdk_rdev_t, del_work);
+	struct md_rdev *rdev = container_of(ws, struct md_rdev, del_work);
 	kobject_del(&rdev->kobj);
 	kobject_put(&rdev->kobj);
 }
 
-static void unbind_rdev_from_array(mdk_rdev_t * rdev)
+static void unbind_rdev_from_array(struct md_rdev * rdev)
 {
 	char b[BDEVNAME_SIZE];
 	if (!rdev->mddev) {
@@ -1708,6 +2254,7 @@ static void unbind_rdev_from_array(mdk_rdev_t * rdev)
 	sysfs_remove_link(&rdev->kobj, "block");
 	sysfs_put(rdev->sysfs_state);
 	rdev->sysfs_state = NULL;
+	rdev->badblocks.count = 0;
 	/* We need to delay this, otherwise we can deadlock when
 	 * writing to 'remove' to "dev/state".  We also need
 	 * to delay it due to rcu usage.
@@ -1715,7 +2262,7 @@ static void unbind_rdev_from_array(mdk_rdev_t * rdev)
 	synchronize_rcu();
 	INIT_WORK(&rdev->del_work, md_delayed_delete);
 	kobject_get(&rdev->kobj);
-	schedule_work(&rdev->del_work);
+	queue_work(md_misc_wq, &rdev->del_work);
 }
 
 /*
@@ -1723,7 +2270,7 @@ static void unbind_rdev_from_array(mdk_rdev_t * rdev)
  * otherwise reused by a RAID array (or any other kernel
  * subsystem), by bd_claiming the device.
  */
-static int lock_rdev(mdk_rdev_t *rdev, dev_t dev, int shared)
+static int lock_rdev(struct md_rdev *rdev, dev_t dev, int shared)
 {
 	int err = 0;
 	struct block_device *bdev;
@@ -1735,20 +2282,18 @@ static int lock_rdev(mdk_rdev_t *rdev, dev_t dev, int shared)
 			__bdevname(dev, b));
 		return PTR_ERR(bdev);
 	}
-	err = bd_claim(bdev, shared ? (mdk_rdev_t *)lock_rdev : rdev);
+	err = bd_claim(bdev, shared ? (struct md_rdev *)lock_rdev : rdev);
 	if (err) {
 		printk(KERN_ERR "md: could not bd_claim %s.\n",
 			bdevname(bdev, b));
 		blkdev_put(bdev, FMODE_READ|FMODE_WRITE);
 		return err;
 	}
-	if (!shared)
-		set_bit(AllReserved, &rdev->flags);
 	rdev->bdev = bdev;
 	return err;
 }
 
-static void unlock_rdev(mdk_rdev_t *rdev)
+static void unlock_rdev(struct md_rdev *rdev)
 {
 	struct block_device *bdev = rdev->bdev;
 	rdev->bdev = NULL;
@@ -1760,14 +2305,14 @@ static void unlock_rdev(mdk_rdev_t *rdev)
 
 void md_autodetect_dev(dev_t dev);
 
-static void export_rdev(mdk_rdev_t * rdev)
+static void export_rdev(struct md_rdev * rdev)
 {
 	char b[BDEVNAME_SIZE];
 	printk(KERN_INFO "md: export_rdev(%s)\n",
 		bdevname(rdev->bdev,b));
 	if (rdev->mddev)
 		MD_BUG();
-	free_disk_sb(rdev);
+	md_rdev_clear(rdev);
 #ifndef MODULE
 	if (test_bit(AutoDetected, &rdev->flags))
 		md_autodetect_dev(rdev->bdev->bd_dev);
@@ -1776,17 +2321,17 @@ static void export_rdev(mdk_rdev_t * rdev)
 	kobject_put(&rdev->kobj);
 }
 
-static void kick_rdev_from_array(mdk_rdev_t * rdev)
+static void kick_rdev_from_array(struct md_rdev * rdev)
 {
 	unbind_rdev_from_array(rdev);
 	export_rdev(rdev);
 }
 
-static void export_array(mddev_t *mddev)
+static void export_array(struct mddev *mddev)
 {
-	mdk_rdev_t *rdev, *tmp;
+	struct md_rdev *rdev, *tmp;
 
-	rdev_for_each(rdev, tmp, mddev) {
+	rdev_for_each_safe(rdev, tmp, mddev) {
 		if (!rdev->mddev) {
 			MD_BUG();
 			continue;
@@ -1844,15 +2389,11 @@ static void print_sb_1(struct mdp_superblock_1 *sb)
 
 	uuid = sb->set_uuid;
 	printk(KERN_INFO
-	       "md:  SB: (V:%u) (F:0x%08x) Array-ID:<%02x%02x%02x%02x"
-	       ":%02x%02x:%02x%02x:%02x%02x:%02x%02x%02x%02x%02x%02x>\n"
+	       "md:  SB: (V:%u) (F:0x%08x) Array-ID:<%pU>\n"
 	       "md:    Name: \"%s\" CT:%llu\n",
 		le32_to_cpu(sb->major_version),
 		le32_to_cpu(sb->feature_map),
-		uuid[0], uuid[1], uuid[2], uuid[3],
-		uuid[4], uuid[5], uuid[6], uuid[7],
-		uuid[8], uuid[9], uuid[10], uuid[11],
-		uuid[12], uuid[13], uuid[14], uuid[15],
+		uuid,
 		sb->set_name,
 		(unsigned long long)le64_to_cpu(sb->ctime)
 		       & MD_SUPERBLOCK_1_TIME_SEC_MASK);
@@ -1861,8 +2402,7 @@ static void print_sb_1(struct mdp_superblock_1 *sb)
 	printk(KERN_INFO
 	       "md:       L%u SZ%llu RD:%u LO:%u CS:%u DO:%llu DS:%llu SO:%llu"
 			" RO:%llu\n"
-	       "md:     Dev:%08x UUID: %02x%02x%02x%02x:%02x%02x:%02x%02x:%02x%02x"
-	                ":%02x%02x%02x%02x%02x%02x\n"
+	       "md:     Dev:%08x UUID: %pU\n"
 	       "md:       (F:0x%08x) UT:%llu Events:%llu ResyncOffset:%llu CSUM:0x%08x\n"
 	       "md:         (MaxDev:%u) \n",
 		le32_to_cpu(sb->level),
@@ -1875,10 +2415,7 @@ static void print_sb_1(struct mdp_superblock_1 *sb)
 		(unsigned long long)le64_to_cpu(sb->super_offset),
 		(unsigned long long)le64_to_cpu(sb->recovery_offset),
 		le32_to_cpu(sb->dev_number),
-		uuid[0], uuid[1], uuid[2], uuid[3],
-		uuid[4], uuid[5], uuid[6], uuid[7],
-		uuid[8], uuid[9], uuid[10], uuid[11],
-		uuid[12], uuid[13], uuid[14], uuid[15],
+		uuid,
 		sb->devflags,
 		(unsigned long long)le64_to_cpu(sb->utime) & MD_SUPERBLOCK_1_TIME_SEC_MASK,
 		(unsigned long long)le64_to_cpu(sb->events),
@@ -1888,7 +2425,7 @@ static void print_sb_1(struct mdp_superblock_1 *sb)
 		);
 }
 
-static void print_rdev(mdk_rdev_t *rdev, int major_version)
+static void print_rdev(struct md_rdev *rdev, int major_version)
 {
 	char b[BDEVNAME_SIZE];
 	printk(KERN_INFO "md: rdev %s, Sect:%08llu F:%d S:%d DN:%u\n",
@@ -1899,10 +2436,10 @@ static void print_rdev(mdk_rdev_t *rdev, int major_version)
 		printk(KERN_INFO "md: rdev superblock (MJ:%d):\n", major_version);
 		switch (major_version) {
 		case 0:
-			print_sb_90((mdp_super_t*)page_address(rdev->sb_page));
+			print_sb_90(page_address(rdev->sb_page));
 			break;
 		case 1:
-			print_sb_1((struct mdp_superblock_1 *)page_address(rdev->sb_page));
+			print_sb_1(page_address(rdev->sb_page));
 			break;
 		}
 	} else
@@ -1912,8 +2449,8 @@ static void print_rdev(mdk_rdev_t *rdev, int major_version)
 static void md_print_devices(void)
 {
 	struct list_head *tmp;
-	mdk_rdev_t *rdev;
-	mddev_t *mddev;
+	struct md_rdev *rdev;
+	struct mddev *mddev;
 	char b[BDEVNAME_SIZE];
 
 	printk("\n");
@@ -1926,11 +2463,11 @@ static void md_print_devices(void)
 			bitmap_print_sb(mddev->bitmap);
 		else
 			printk("%s: ", mdname(mddev));
-		list_for_each_entry(rdev, &mddev->disks, same_set)
+		rdev_for_each(rdev, mddev)
 			printk("<%s>", bdevname(rdev->bdev,b));
 		printk("\n");
 
-		list_for_each_entry(rdev, &mddev->disks, same_set)
+		rdev_for_each(rdev, mddev)
 			print_rdev(rdev, mddev->major_version);
 	}
 	printk("md:	**********************************\n");
@@ -1938,7 +2475,7 @@ static void md_print_devices(void)
 }
 
 
-static void sync_sbs(mddev_t * mddev, int nospares)
+static void sync_sbs(struct mddev * mddev, int nospares)
 {
 	/* Update each superblock (in-memory image), but
 	 * if we are allowed to, skip spares which already
@@ -1946,45 +2483,67 @@ static void sync_sbs(mddev_t * mddev, int nospares)
 	 * (which would mean they aren't being marked as dirty
 	 * with the rest of the array)
 	 */
-	mdk_rdev_t *rdev;
-
-	/* First make sure individual recovery_offsets are correct */
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
-		if (rdev->raid_disk >= 0 &&
-		    !test_bit(In_sync, &rdev->flags) &&
-		    mddev->curr_resync_completed > rdev->recovery_offset)
-				rdev->recovery_offset = mddev->curr_resync_completed;
-
-	}	
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	struct md_rdev *rdev;
+	rdev_for_each(rdev, mddev) {
 		if (rdev->sb_events == mddev->events ||
 		    (nospares &&
 		     rdev->raid_disk < 0 &&
-		     (rdev->sb_events&1)==0 &&
 		     rdev->sb_events+1 == mddev->events)) {
 			/* Don't update this superblock */
 			rdev->sb_loaded = 2;
 		} else {
-			super_types[mddev->major_version].
-				sync_super(mddev, rdev);
+			sync_super(mddev, rdev);
 			rdev->sb_loaded = 1;
 		}
 	}
 }
 
-static void md_update_sb(mddev_t * mddev, int force_change)
+static void md_update_sb(struct mddev * mddev, int force_change)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	int sync_req;
 	int nospares = 0;
+	int any_badblocks_changed = 0;
 
-	mddev->utime = get_seconds();
-	if (mddev->external)
+	if (mddev->ro) {
+		if (force_change)
+			set_bit(MD_CHANGE_DEVS, &mddev->flags);
 		return;
+	}
 repeat:
+	/* First make sure individual recovery_offsets are correct */
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk >= 0 &&
+		    mddev->delta_disks >= 0 &&
+		    !test_bit(In_sync, &rdev->flags) &&
+		    mddev->curr_resync_completed > rdev->recovery_offset)
+				rdev->recovery_offset = mddev->curr_resync_completed;
+
+	}	
+	if (!mddev->persistent) {
+		clear_bit(MD_CHANGE_CLEAN, &mddev->flags);
+		clear_bit(MD_CHANGE_DEVS, &mddev->flags);
+		if (!mddev->external) {
+			clear_bit(MD_CHANGE_PENDING, &mddev->flags);
+			rdev_for_each(rdev, mddev) {
+				if (rdev->badblocks.changed) {
+					rdev->badblocks.changed = 0;
+					md_ack_all_badblocks(&rdev->badblocks);
+					md_error(mddev, rdev);
+				}
+				clear_bit(Blocked, &rdev->flags);
+				clear_bit(BlockedBadBlocks, &rdev->flags);
+				wake_up(&rdev->blocked_wait);
+			}
+		}
+		wake_up(&mddev->sb_wait);
+		return;
+	}
+
 	spin_lock_irq(&mddev->write_lock);
 
-	set_bit(MD_CHANGE_PENDING, &mddev->flags);
+	mddev->utime = get_seconds();
+
 	if (test_and_clear_bit(MD_CHANGE_DEVS, &mddev->flags))
 		force_change = 1;
 	if (test_and_clear_bit(MD_CHANGE_CLEAN, &mddev->flags))
@@ -2013,28 +2572,14 @@ repeat:
 	 * and 'events' is odd, we can roll back to the previous clean state */
 	if (nospares
 	    && (mddev->in_sync && mddev->recovery_cp == MaxSector)
-	    && (mddev->events & 1)
-	    && mddev->events != 1)
+	    && mddev->can_decrease_events
+	    && mddev->events != 1) {
 		mddev->events--;
-	else {
+		mddev->can_decrease_events = 0;
+	} else {
 		/* otherwise we have to go forward and ... */
 		mddev->events ++;
-		if (!mddev->in_sync || mddev->recovery_cp != MaxSector) { /* not clean */
-			/* .. if the array isn't clean, an 'even' event must also go
-			 * to spares. */
-			if ((mddev->events&1)==0) {
-				nospares = 0;
-				sync_req = 2; /* force a second update to get the
-					       * even/odd in sync */
-			}
-		} else {
-			/* otherwise an 'odd' event must go to spares */
-			if ((mddev->events&1)) {
-				nospares = 0;
-				sync_req = 2; /* force a second update to get the
-					       * even/odd in sync */
-			}
-		}
+		mddev->can_decrease_events = nospares;
 	}
 
 	if (!mddev->events) {
@@ -2047,46 +2592,49 @@ repeat:
 		mddev->events --;
 	}
 
-	/*
-	 * do not write anything to disk if using
-	 * nonpersistent superblocks
-	 */
-	if (!mddev->persistent) {
-		if (!mddev->external)
-			clear_bit(MD_CHANGE_PENDING, &mddev->flags);
-
-		spin_unlock_irq(&mddev->write_lock);
-		wake_up(&mddev->sb_wait);
-		return;
+	rdev_for_each(rdev, mddev) {
+		if (rdev->badblocks.changed)
+			any_badblocks_changed++;
+		if (test_bit(Faulty, &rdev->flags))
+			set_bit(FaultRecorded, &rdev->flags);
 	}
+
 	sync_sbs(mddev, nospares);
 	spin_unlock_irq(&mddev->write_lock);
 
-	dprintk(KERN_INFO 
-		"md: updating %s RAID superblock on device (in sync %d)\n",
-		mdname(mddev),mddev->in_sync);
+	pr_debug("md: updating %s RAID superblock on device (in sync %d)\n",
+		 mdname(mddev), mddev->in_sync);
 
 	bitmap_update_sb(mddev->bitmap);
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	rdev_for_each(rdev, mddev) {
 		char b[BDEVNAME_SIZE];
-		dprintk(KERN_INFO "md: ");
+
 		if (rdev->sb_loaded != 1)
 			continue; /* no noise on spare devices */
-		if (test_bit(Faulty, &rdev->flags))
-			dprintk("(skipping faulty ");
 
-		dprintk("%s ", bdevname(rdev->bdev,b));
-		if (!test_bit(Faulty, &rdev->flags)) {
+		if (!test_bit(Faulty, &rdev->flags) &&
+		    rdev->saved_raid_disk == -1) {
 			md_super_write(mddev,rdev,
 				       rdev->sb_start, rdev->sb_size,
 				       rdev->sb_page);
-			dprintk(KERN_INFO "(write) %s's sb offset: %llu\n",
-				bdevname(rdev->bdev,b),
-				(unsigned long long)rdev->sb_start);
+			pr_debug("md: (write) %s's sb offset: %llu\n",
+				 bdevname(rdev->bdev, b),
+				 (unsigned long long)rdev->sb_start);
 			rdev->sb_events = mddev->events;
+			if (rdev->badblocks.size) {
+				md_super_write(mddev, rdev,
+					       rdev->badblocks.sector,
+					       rdev->badblocks.size << 9,
+					       rdev->bb_page);
+				rdev->badblocks.size = 0;
+			}
 
-		} else
-			dprintk(")\n");
+		} else if (test_bit(Faulty, &rdev->flags))
+			pr_debug("md: %s (skipping faulty)\n",
+				 bdevname(rdev->bdev, b));
+		else
+			pr_debug("(skipping incremental s/r ");
+
 		if (mddev->level == LEVEL_MULTIPATH)
 			/* only need to write one superblock... */
 			break;
@@ -2107,6 +2655,15 @@ repeat:
 	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
 		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
 
+	rdev_for_each(rdev, mddev) {
+		if (test_and_clear_bit(FaultRecorded, &rdev->flags))
+			clear_bit(Blocked, &rdev->flags);
+
+		if (any_badblocks_changed)
+			md_ack_all_badblocks(&rdev->badblocks);
+		clear_bit(BlockedBadBlocks, &rdev->flags);
+		wake_up(&rdev->blocked_wait);
+	}
 }
 
 /* words written to sysfs files may, or may not, be \n terminated.
@@ -2131,17 +2688,18 @@ static int cmd_match(const char *cmd, const char *str)
 
 struct rdev_sysfs_entry {
 	struct attribute attr;
-	ssize_t (*show)(mdk_rdev_t *, char *);
-	ssize_t (*store)(mdk_rdev_t *, const char *, size_t);
+	ssize_t (*show)(struct md_rdev *, char *);
+	ssize_t (*store)(struct md_rdev *, const char *, size_t);
 };
 
 static ssize_t
-state_show(mdk_rdev_t *rdev, char *page)
+state_show(struct md_rdev *rdev, char *page)
 {
 	char *sep = "";
 	size_t len = 0;
 
-	if (test_bit(Faulty, &rdev->flags)) {
+	if (test_bit(Faulty, &rdev->flags) ||
+	    rdev->badblocks.unacked_exist) {
 		len+= sprintf(page+len, "%sfaulty",sep);
 		sep = ",";
 	}
@@ -2153,7 +2711,9 @@ state_show(mdk_rdev_t *rdev, char *page)
 		len += sprintf(page+len, "%swrite_mostly",sep);
 		sep = ",";
 	}
-	if (test_bit(Blocked, &rdev->flags)) {
+	if (test_bit(Blocked, &rdev->flags) ||
+	    (rdev->badblocks.unacked_exist
+	     && !test_bit(Faulty, &rdev->flags))) {
 		len += sprintf(page+len, "%sblocked", sep);
 		sep = ",";
 	}
@@ -2162,30 +2722,48 @@ state_show(mdk_rdev_t *rdev, char *page)
 		len += sprintf(page+len, "%sspare", sep);
 		sep = ",";
 	}
+	if (test_bit(WriteErrorSeen, &rdev->flags)) {
+		len += sprintf(page+len, "%swrite_error", sep);
+		sep = ",";
+	}
+	if (test_bit(WantReplacement, &rdev->flags)) {
+		len += sprintf(page+len, "%swant_replacement", sep);
+		sep = ",";
+	}
+	if (test_bit(Replacement, &rdev->flags)) {
+		len += sprintf(page+len, "%sreplacement", sep);
+		sep = ",";
+	}
+
 	return len+sprintf(page+len, "\n");
 }
 
 static ssize_t
-state_store(mdk_rdev_t *rdev, const char *buf, size_t len)
+state_store(struct md_rdev *rdev, const char *buf, size_t len)
 {
 	/* can write
-	 *  faulty  - simulates and error
+	 *  faulty  - simulates an error
 	 *  remove  - disconnects the device
 	 *  writemostly - sets write_mostly
 	 *  -writemostly - clears write_mostly
-	 *  blocked - sets the Blocked flag
-	 *  -blocked - clears the Blocked flag
+	 *  blocked - sets the Blocked flags
+	 *  -blocked - clears the Blocked and possibly simulates an error
 	 *  insync - sets Insync providing device isn't active
+	 *  write_error - sets WriteErrorSeen
+	 *  -write_error - clears WriteErrorSeen
 	 */
 	int err = -EINVAL;
 	if (cmd_match(buf, "faulty") && rdev->mddev->pers) {
 		md_error(rdev->mddev, rdev);
-		err = 0;
+		if (test_bit(Faulty, &rdev->flags))
+			err = 0;
+		else
+			err = -EBUSY;
 	} else if (cmd_match(buf, "remove")) {
 		if (rdev->raid_disk >= 0)
 			err = -EBUSY;
 		else {
-			mddev_t *mddev = rdev->mddev;
+			struct mddev *mddev = rdev->mddev;
 			kick_rdev_from_array(rdev);
 			if (mddev->pers)
 				md_update_sb(mddev, 1);
@@ -2202,7 +2780,15 @@ state_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 		set_bit(Blocked, &rdev->flags);
 		err = 0;
 	} else if (cmd_match(buf, "-blocked")) {
+		if (!test_bit(Faulty, &rdev->flags) &&
+		    rdev->badblocks.unacked_exist) {
+			/* metadata handler doesn't understand badblocks,
+			 * so we need to fail the device
+			 */
+			md_error(rdev->mddev, rdev);
+		}
 		clear_bit(Blocked, &rdev->flags);
+		clear_bit(BlockedBadBlocks, &rdev->flags);
 		wake_up(&rdev->blocked_wait);
 		set_bit(MD_RECOVERY_NEEDED, &rdev->mddev->recovery);
 		md_wakeup_thread(rdev->mddev->thread);
@@ -2211,22 +2797,64 @@ state_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 	} else if (cmd_match(buf, "insync") && rdev->raid_disk == -1) {
 		set_bit(In_sync, &rdev->flags);
 		err = 0;
+	} else if (cmd_match(buf, "write_error")) {
+		set_bit(WriteErrorSeen, &rdev->flags);
+		err = 0;
+	} else if (cmd_match(buf, "-write_error")) {
+		clear_bit(WriteErrorSeen, &rdev->flags);
+		err = 0;
+	} else if (cmd_match(buf, "want_replacement")) {
+		/* Any non-spare device that is not a replacement can
+		 * become want_replacement at any time, but we then need to
+		 * check if recovery is needed.
+		 */
+		if (rdev->raid_disk >= 0 &&
+		    !test_bit(Replacement, &rdev->flags))
+			set_bit(WantReplacement, &rdev->flags);
+		set_bit(MD_RECOVERY_NEEDED, &rdev->mddev->recovery);
+		md_wakeup_thread(rdev->mddev->thread);
+		err = 0;
+	} else if (cmd_match(buf, "-want_replacement")) {
+		/* Clearing 'want_replacement' is always allowed.
+		 * Once replacements starts it is too late though.
+		 */
+		err = 0;
+		clear_bit(WantReplacement, &rdev->flags);
+	} else if (cmd_match(buf, "replacement")) {
+		/* Can only set a device as a replacement when array has not
+		 * yet been started.  Once running, replacement is automatic
+		 * from spares, or by assigning 'slot'.
+		 */
+		if (rdev->mddev->pers)
+			err = -EBUSY;
+		else {
+			set_bit(Replacement, &rdev->flags);
+			err = 0;
+		}
+	} else if (cmd_match(buf, "-replacement")) {
+		/* Similarly, can only clear Replacement before start */
+		if (rdev->mddev->pers)
+			err = -EBUSY;
+		else {
+			clear_bit(Replacement, &rdev->flags);
+			err = 0;
+		}
 	}
-	if (!err && rdev->sysfs_state)
-		sysfs_notify_dirent(rdev->sysfs_state);
+	if (!err)
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
 	return err ? err : len;
 }
 static struct rdev_sysfs_entry rdev_state =
 __ATTR(state, S_IRUGO|S_IWUSR, state_show, state_store);
 
 static ssize_t
-errors_show(mdk_rdev_t *rdev, char *page)
+errors_show(struct md_rdev *rdev, char *page)
 {
 	return sprintf(page, "%d\n", atomic_read(&rdev->corrected_errors));
 }
 
 static ssize_t
-errors_store(mdk_rdev_t *rdev, const char *buf, size_t len)
+errors_store(struct md_rdev *rdev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long n = simple_strtoul(buf, &e, 10);
@@ -2240,7 +2868,7 @@ static struct rdev_sysfs_entry rdev_errors =
 __ATTR(errors, S_IRUGO|S_IWUSR, errors_show, errors_store);
 
 static ssize_t
-slot_show(mdk_rdev_t *rdev, char *page)
+slot_show(struct md_rdev *rdev, char *page)
 {
 	if (rdev->raid_disk < 0)
 		return sprintf(page, "none\n");
@@ -2249,11 +2877,10 @@ slot_show(mdk_rdev_t *rdev, char *page)
 }
 
 static ssize_t
-slot_store(mdk_rdev_t *rdev, const char *buf, size_t len)
+slot_store(struct md_rdev *rdev, const char *buf, size_t len)
 {
 	char *e;
 	int err;
-	char nm[20];
 	int slot = simple_strtoul(buf, &e, 10);
 	if (strncmp(buf, "none", 4)==0)
 		slot = -1;
@@ -2272,16 +2899,13 @@ slot_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 		/* personality does all needed checks */
 		if (rdev->mddev->pers->hot_remove_disk == NULL)
 			return -EINVAL;
-		err = rdev->mddev->pers->
-			hot_remove_disk(rdev->mddev, rdev->raid_disk);
-		if (err)
-			return err;
-		sprintf(nm, "rd%d", rdev->raid_disk);
-		sysfs_remove_link(&rdev->mddev->kobj, nm);
+		clear_bit(Blocked, &rdev->flags);
+		remove_and_add_spares(rdev->mddev, rdev);
+		if (rdev->raid_disk >= 0)
+			return -EBUSY;
 		set_bit(MD_RECOVERY_NEEDED, &rdev->mddev->recovery);
 		md_wakeup_thread(rdev->mddev->thread);
 	} else if (rdev->mddev->pers) {
-		mdk_rdev_t *rdev2;
 		/* Activating a spare .. or possibly reactivating
 		 * if we ever get bitmaps working here.
 		 */
@@ -2289,42 +2913,42 @@ slot_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 		if (rdev->raid_disk != -1)
 			return -EBUSY;
 
+		if (test_bit(MD_RECOVERY_RUNNING, &rdev->mddev->recovery))
+			return -EBUSY;
+
 		if (rdev->mddev->pers->hot_add_disk == NULL)
 			return -EINVAL;
 
-		list_for_each_entry(rdev2, &rdev->mddev->disks, same_set)
-			if (rdev2->raid_disk == slot)
-				return -EEXIST;
+		if (slot >= rdev->mddev->raid_disks &&
+		    slot >= rdev->mddev->raid_disks + rdev->mddev->delta_disks)
+			return -ENOSPC;
 
 		rdev->raid_disk = slot;
 		if (test_bit(In_sync, &rdev->flags))
 			rdev->saved_raid_disk = slot;
 		else
 			rdev->saved_raid_disk = -1;
+		clear_bit(In_sync, &rdev->flags);
 		err = rdev->mddev->pers->
 			hot_add_disk(rdev->mddev, rdev);
 		if (err) {
 			rdev->raid_disk = -1;
 			return err;
 		} else
-			sysfs_notify_dirent(rdev->sysfs_state);
-		sprintf(nm, "rd%d", rdev->raid_disk);
-		if (sysfs_create_link(&rdev->mddev->kobj, &rdev->kobj, nm))
-			printk(KERN_WARNING
-			       "md: cannot register "
-			       "%s for %s\n",
-			       nm, mdname(rdev->mddev));
-
+			sysfs_notify_dirent_safe(rdev->sysfs_state);
+		if (sysfs_link_rdev(rdev->mddev, rdev))
+			/* failure here is OK */;
 		/* don't wakeup anyone, leave that to userspace. */
 	} else {
-		if (slot >= rdev->mddev->raid_disks)
+		if (slot >= rdev->mddev->raid_disks &&
+		    slot >= rdev->mddev->raid_disks + rdev->mddev->delta_disks)
 			return -ENOSPC;
 		rdev->raid_disk = slot;
 		/* assume it is working */
 		clear_bit(Faulty, &rdev->flags);
 		clear_bit(WriteMostly, &rdev->flags);
 		set_bit(In_sync, &rdev->flags);
-		sysfs_notify_dirent(rdev->sysfs_state);
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
 	}
 	return len;
 }
@@ -2334,17 +2958,16 @@ static struct rdev_sysfs_entry rdev_slot =
 __ATTR(slot, S_IRUGO|S_IWUSR, slot_show, slot_store);
 
 static ssize_t
-offset_show(mdk_rdev_t *rdev, char *page)
+offset_show(struct md_rdev *rdev, char *page)
 {
 	return sprintf(page, "%llu\n", (unsigned long long)rdev->data_offset);
 }
 
 static ssize_t
-offset_store(mdk_rdev_t *rdev, const char *buf, size_t len)
+offset_store(struct md_rdev *rdev, const char *buf, size_t len)
 {
-	char *e;
-	unsigned long long offset = simple_strtoull(buf, &e, 10);
-	if (e==buf || (*e && *e != '\n'))
+	unsigned long long offset;
+	if (kstrtoull(buf, 10, &offset) < 0)
 		return -EINVAL;
 	if (rdev->mddev->pers && rdev->raid_disk >= 0)
 		return -EBUSY;
@@ -2353,14 +2976,72 @@ offset_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 		 * can be sane */
 		return -EBUSY;
 	rdev->data_offset = offset;
+	rdev->new_data_offset = offset;
 	return len;
 }
 
 static struct rdev_sysfs_entry rdev_offset =
 __ATTR(offset, S_IRUGO|S_IWUSR, offset_show, offset_store);
 
+static ssize_t new_offset_show(struct md_rdev *rdev, char *page)
+{
+	return sprintf(page, "%llu\n",
+		       (unsigned long long)rdev->new_data_offset);
+}
+
+static ssize_t new_offset_store(struct md_rdev *rdev,
+				const char *buf, size_t len)
+{
+	unsigned long long new_offset;
+	struct mddev *mddev = rdev->mddev;
+
+	if (kstrtoull(buf, 10, &new_offset) < 0)
+		return -EINVAL;
+
+	if (mddev->sync_thread)
+		return -EBUSY;
+	if (new_offset == rdev->data_offset)
+		/* reset is always permitted */
+		;
+	else if (new_offset > rdev->data_offset) {
+		/* must not push array size beyond rdev_sectors */
+		if (new_offset - rdev->data_offset
+		    + mddev->dev_sectors > rdev->sectors)
+				return -E2BIG;
+	}
+	/* Metadata worries about other space details. */
+
+	/* decreasing the offset is inconsistent with a backwards
+	 * reshape.
+	 */
+	if (new_offset < rdev->data_offset &&
+	    mddev->reshape_backwards)
+		return -EINVAL;
+	/* Increasing offset is inconsistent with forwards
+	 * reshape.  reshape_direction should be set to
+	 * 'backwards' first.
+	 */
+	if (new_offset > rdev->data_offset &&
+	    !mddev->reshape_backwards)
+		return -EINVAL;
+
+	if (mddev->pers && mddev->persistent &&
+	    !super_types[mddev->major_version]
+	    .allow_new_offset(rdev, new_offset))
+		return -E2BIG;
+	rdev->new_data_offset = new_offset;
+	if (new_offset > rdev->data_offset)
+		mddev->reshape_backwards = 1;
+	else if (new_offset < rdev->data_offset)
+		mddev->reshape_backwards = 0;
+
+	return len;
+}
+static struct rdev_sysfs_entry rdev_new_offset =
+__ATTR(new_offset, S_IRUGO|S_IWUSR, new_offset_show, new_offset_store);
+
 static ssize_t
-rdev_size_show(mdk_rdev_t *rdev, char *page)
+rdev_size_show(struct md_rdev *rdev, char *page)
 {
 	return sprintf(page, "%llu\n", (unsigned long long)rdev->sectors / 2);
 }
@@ -2380,7 +3061,7 @@ static int strict_blocks_to_sectors(const char *buf, sector_t *sectors)
 	unsigned long long blocks;
 	sector_t new;
 
-	if (strict_strtoull(buf, 10, &blocks) < 0)
+	if (kstrtoull(buf, 10, &blocks) < 0)
 		return -EINVAL;
 
 	if (blocks & 1ULL << (8 * sizeof(blocks) - 1))
@@ -2395,14 +3076,16 @@ static int strict_blocks_to_sectors(const char *buf, sector_t *sectors)
 }
 
 static ssize_t
-rdev_size_store(mdk_rdev_t *rdev, const char *buf, size_t len)
+rdev_size_store(struct md_rdev *rdev, const char *buf, size_t len)
 {
-	mddev_t *my_mddev = rdev->mddev;
+	struct mddev *my_mddev = rdev->mddev;
 	sector_t oldsectors = rdev->sectors;
 	sector_t sectors;
 
 	if (strict_blocks_to_sectors(buf, &sectors) < 0)
 		return -EINVAL;
+	if (rdev->data_offset != rdev->new_data_offset)
+		return -EINVAL; /* too confusing */
 	if (my_mddev->pers && rdev->raid_disk >= 0) {
 		if (my_mddev->persistent) {
 			sectors = super_types[my_mddev->major_version].
@@ -2410,8 +3093,11 @@ rdev_size_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 			if (!sectors)
 				return -EBUSY;
 		} else if (!sectors)
-			sectors = (rdev->bdev->bd_inode->i_size >> 9) -
+			sectors = (i_size_read(rdev->bdev->bd_inode) >> 9) -
 				rdev->data_offset;
+		if (!my_mddev->pers->resize)
+			/* Cannot change size for RAID0 or Linear etc */
+			return -EINVAL;
 	}
 	if (sectors < my_mddev->dev_sectors)
 		return -EINVAL; /* component must fit device */
@@ -2423,22 +3109,21 @@ rdev_size_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 		 * a deadlock.  We have already changed rdev->sectors, and if
 		 * we have to change it back, we will have the lock again.
 		 */
-		mddev_t *mddev;
+		struct mddev *mddev;
 		int overlap = 0;
 		struct list_head *tmp;
 
 		mddev_unlock(my_mddev);
 		for_each_mddev(mddev, tmp) {
-			mdk_rdev_t *rdev2;
+			struct md_rdev *rdev2;
 
 			mddev_lock(mddev);
-			list_for_each_entry(rdev2, &mddev->disks, same_set)
-				if (test_bit(AllReserved, &rdev2->flags) ||
-				    (rdev->bdev == rdev2->bdev &&
-				     rdev != rdev2 &&
-				     overlaps(rdev->data_offset, rdev->sectors,
-					      rdev2->data_offset,
-					      rdev2->sectors))) {
+			rdev_for_each(rdev2, mddev)
+				if (rdev->bdev == rdev2->bdev &&
+				    rdev != rdev2 &&
+				    overlaps(rdev->data_offset, rdev->sectors,
+					     rdev2->data_offset,
+					     rdev2->sectors)) {
 					overlap = 1;
 					break;
 				}
@@ -2466,20 +3151,93 @@ rdev_size_store(mdk_rdev_t *rdev, const char *buf, size_t len)
 static struct rdev_sysfs_entry rdev_size =
 __ATTR(size, S_IRUGO|S_IWUSR, rdev_size_show, rdev_size_store);
 
+
+static ssize_t recovery_start_show(struct md_rdev *rdev, char *page)
+{
+	unsigned long long recovery_start = rdev->recovery_offset;
+
+	if (test_bit(In_sync, &rdev->flags) ||
+	    recovery_start == MaxSector)
+		return sprintf(page, "none\n");
+
+	return sprintf(page, "%llu\n", recovery_start);
+}
+
+static ssize_t recovery_start_store(struct md_rdev *rdev, const char *buf, size_t len)
+{
+	unsigned long long recovery_start;
+
+	if (cmd_match(buf, "none"))
+		recovery_start = MaxSector;
+	else if (kstrtoull(buf, 10, &recovery_start))
+		return -EINVAL;
+
+	if (rdev->mddev->pers &&
+	    rdev->raid_disk >= 0)
+		return -EBUSY;
+
+	rdev->recovery_offset = recovery_start;
+	if (recovery_start == MaxSector)
+		set_bit(In_sync, &rdev->flags);
+	else
+		clear_bit(In_sync, &rdev->flags);
+	return len;
+}
+
+static struct rdev_sysfs_entry rdev_recovery_start =
+__ATTR(recovery_start, S_IRUGO|S_IWUSR, recovery_start_show, recovery_start_store);
+
+
+static ssize_t
+badblocks_show(struct badblocks *bb, char *page, int unack);
+static ssize_t
+badblocks_store(struct badblocks *bb, const char *page, size_t len, int unack);
+
+static ssize_t bb_show(struct md_rdev *rdev, char *page)
+{
+	return badblocks_show(&rdev->badblocks, page, 0);
+}
+static ssize_t bb_store(struct md_rdev *rdev, const char *page, size_t len)
+{
+	int rv = badblocks_store(&rdev->badblocks, page, len, 0);
+	/* Maybe that ack was all we needed */
+	if (test_and_clear_bit(BlockedBadBlocks, &rdev->flags))
+		wake_up(&rdev->blocked_wait);
+	return rv;
+}
+static struct rdev_sysfs_entry rdev_bad_blocks =
+__ATTR(bad_blocks, S_IRUGO|S_IWUSR, bb_show, bb_store);
+
+
+static ssize_t ubb_show(struct md_rdev *rdev, char *page)
+{
+	return badblocks_show(&rdev->badblocks, page, 1);
+}
+static ssize_t ubb_store(struct md_rdev *rdev, const char *page, size_t len)
+{
+	return badblocks_store(&rdev->badblocks, page, len, 1);
+}
+static struct rdev_sysfs_entry rdev_unack_bad_blocks =
+__ATTR(unacknowledged_bad_blocks, S_IRUGO|S_IWUSR, ubb_show, ubb_store);
+
 static struct attribute *rdev_default_attrs[] = {
 	&rdev_state.attr,
 	&rdev_errors.attr,
 	&rdev_slot.attr,
 	&rdev_offset.attr,
+	&rdev_new_offset.attr,
 	&rdev_size.attr,
+	&rdev_recovery_start.attr,
+	&rdev_bad_blocks.attr,
+	&rdev_unack_bad_blocks.attr,
 	NULL,
 };
 static ssize_t
 rdev_attr_show(struct kobject *kobj, struct attribute *attr, char *page)
 {
 	struct rdev_sysfs_entry *entry = container_of(attr, struct rdev_sysfs_entry, attr);
-	mdk_rdev_t *rdev = container_of(kobj, mdk_rdev_t, kobj);
-	mddev_t *mddev = rdev->mddev;
+	struct md_rdev *rdev = container_of(kobj, struct md_rdev, kobj);
+	struct mddev *mddev = rdev->mddev;
 	ssize_t rv;
 
 	if (!entry->show)
@@ -2501,9 +3259,9 @@ rdev_attr_store(struct kobject *kobj, struct attribute *attr,
 	      const char *page, size_t length)
 {
 	struct rdev_sysfs_entry *entry = container_of(attr, struct rdev_sysfs_entry, attr);
-	mdk_rdev_t *rdev = container_of(kobj, mdk_rdev_t, kobj);
+	struct md_rdev *rdev = container_of(kobj, struct md_rdev, kobj);
 	ssize_t rv;
-	mddev_t *mddev = rdev->mddev;
+	struct mddev *mddev = rdev->mddev;
 
 	if (!entry->store)
 		return -EIO;
@@ -2522,10 +3280,10 @@ rdev_attr_store(struct kobject *kobj, struct attribute *attr,
 
 static void rdev_free(struct kobject *ko)
 {
-	mdk_rdev_t *rdev = container_of(ko, mdk_rdev_t, kobj);
+	struct md_rdev *rdev = container_of(ko, struct md_rdev, kobj);
 	kfree(rdev);
 }
-static struct sysfs_ops rdev_sysfs_ops = {
+static const struct sysfs_ops rdev_sysfs_ops = {
 	.show		= rdev_attr_show,
 	.store		= rdev_attr_store,
 };
@@ -2535,6 +3293,40 @@ static struct kobj_type rdev_ktype = {
 	.default_attrs	= rdev_default_attrs,
 };
 
+int md_rdev_init(struct md_rdev *rdev)
+{
+	rdev->desc_nr = -1;
+	rdev->saved_raid_disk = -1;
+	rdev->raid_disk = -1;
+	rdev->flags = 0;
+	rdev->data_offset = 0;
+	rdev->new_data_offset = 0;
+	rdev->sb_events = 0;
+	rdev->last_read_error.tv_sec  = 0;
+	rdev->last_read_error.tv_nsec = 0;
+	rdev->sb_loaded = 0;
+	rdev->bb_page = NULL;
+	atomic_set(&rdev->nr_pending, 0);
+	atomic_set(&rdev->read_errors, 0);
+	atomic_set(&rdev->corrected_errors, 0);
+
+	INIT_LIST_HEAD(&rdev->same_set);
+	init_waitqueue_head(&rdev->blocked_wait);
+
+	/* Add space to store bad block list.
+	 * This reserves the space even on arrays where it cannot
+	 * be used - I wonder if that matters
+	 */
+	rdev->badblocks.count = 0;
+	rdev->badblocks.shift = -1; /* disabled until explicitly enabled */
+	rdev->badblocks.page = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	seqlock_init(&rdev->badblocks.lock);
+	if (rdev->badblocks.page == NULL)
+		return -ENOMEM;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(md_rdev_init);
 /*
  * Import a device. If 'super_format' >= 0, then sanity check the superblock
  *
@@ -2545,11 +3337,11 @@ static struct kobj_type rdev_ktype = {
  *
  * a faulty rdev _never_ has rdev->sb set.
  */
-static mdk_rdev_t *md_import_device(dev_t newdev, int super_format, int super_minor)
+static struct md_rdev *md_import_device(dev_t newdev, int super_format, int super_minor)
 {
 	char b[BDEVNAME_SIZE];
 	int err;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	sector_t size;
 
 	rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
@@ -2558,7 +3350,11 @@ static mdk_rdev_t *md_import_device(dev_t newdev, int super_format, int super_mi
 		return ERR_PTR(-ENOMEM);
 	}
 
-	if ((err = alloc_disk_sb(rdev)))
+	err = md_rdev_init(rdev);
+	if (err)
+		goto abort_free;
+	err = alloc_disk_sb(rdev);
+	if (err)
 		goto abort_free;
 
 	err = lock_rdev(rdev, newdev, super_format == -2);
@@ -2567,17 +3363,7 @@ static mdk_rdev_t *md_import_device(dev_t newdev, int super_format, int super_mi
 
 	kobject_init(&rdev->kobj, &rdev_ktype);
 
-	rdev->desc_nr = -1;
-	rdev->saved_raid_disk = -1;
-	rdev->raid_disk = -1;
-	rdev->flags = 0;
-	rdev->data_offset = 0;
-	rdev->sb_events = 0;
-	atomic_set(&rdev->nr_pending, 0);
-	atomic_set(&rdev->read_errors, 0);
-	atomic_set(&rdev->corrected_errors, 0);
-
-	size = rdev->bdev->bd_inode->i_size >> BLOCK_SIZE_BITS;
+	size = i_size_read(rdev->bdev->bd_inode) >> BLOCK_SIZE_BITS;
 	if (!size) {
 		printk(KERN_WARNING 
 			"md: %s has zero or unknown size, marking faulty!\n",
@@ -2605,17 +3391,12 @@ static mdk_rdev_t *md_import_device(dev_t newdev, int super_format, int super_mi
 		}
 	}
 
-	INIT_LIST_HEAD(&rdev->same_set);
-	init_waitqueue_head(&rdev->blocked_wait);
-
 	return rdev;
 
 abort_free:
-	if (rdev->sb_page) {
-		if (rdev->bdev)
-			unlock_rdev(rdev);
-		free_disk_sb(rdev);
-	}
+	if (rdev->bdev)
+		unlock_rdev(rdev);
+	md_rdev_clear(rdev);
 	kfree(rdev);
 	return ERR_PTR(err);
 }
@@ -2625,14 +3406,14 @@ abort_free:
  */
 
 
-static void analyze_sbs(mddev_t * mddev)
+static void analyze_sbs(struct mddev * mddev)
 {
 	int i;
-	mdk_rdev_t *rdev, *freshest, *tmp;
+	struct md_rdev *rdev, *freshest, *tmp;
 	char b[BDEVNAME_SIZE];
 
 	freshest = NULL;
-	rdev_for_each(rdev, tmp, mddev)
+	rdev_for_each_safe(rdev, tmp, mddev)
 		switch (super_types[mddev->major_version].
 			load_super(rdev, freshest, mddev->minor_version)) {
 		case 1:
@@ -2653,9 +3434,10 @@ static void analyze_sbs(mddev_t * mddev)
 		validate_super(mddev, freshest);
 
 	i = 0;
-	rdev_for_each(rdev, tmp, mddev) {
-		if (rdev->desc_nr >= mddev->max_disks ||
-		    i > mddev->max_disks) {
+	rdev_for_each_safe(rdev, tmp, mddev) {
+		if (mddev->max_disks &&
+		    (rdev->desc_nr >= mddev->max_disks ||
+		     i > mddev->max_disks)) {
 			printk(KERN_WARNING
 			       "md: %s: %s: only %d devices permitted\n",
 			       mdname(mddev), bdevname(rdev->bdev, b),
@@ -2683,42 +3465,62 @@ static void analyze_sbs(mddev_t * mddev)
 	}
 }
 
+/* Read a fixed-point number.
+ * Numbers in sysfs attributes should be in "standard" units where
+ * possible, so time should be in seconds.
+ * However we internally use a a much smaller unit such as 
+ * milliseconds or jiffies.
+ * This function takes a decimal number with a possible fractional
+ * component, and produces an integer which is the result of
+ * multiplying that number by 10^'scale'.
+ * all without any floating-point arithmetic.
+ */
+int strict_strtoul_scaled(const char *cp, unsigned long *res, int scale)
+{
+	unsigned long result = 0;
+	long decimals = -1;
+	while (isdigit(*cp) || (*cp == '.' && decimals < 0)) {
+		if (*cp == '.')
+			decimals = 0;
+		else if (decimals < scale) {
+			unsigned int value;
+			value = *cp - '0';
+			result = result * 10 + value;
+			if (decimals >= 0)
+				decimals++;
+		}
+		cp++;
+	}
+	if (*cp == '\n')
+		cp++;
+	if (*cp)
+		return -EINVAL;
+	if (decimals < 0)
+		decimals = 0;
+	while (decimals < scale) {
+		result *= 10;
+		decimals ++;
+	}
+	*res = result;
+	return 0;
+}
+
+
 static void md_safemode_timeout(unsigned long data);
 
 static ssize_t
-safe_delay_show(mddev_t *mddev, char *page)
+safe_delay_show(struct mddev *mddev, char *page)
 {
 	int msec = (mddev->safemode_delay*1000)/HZ;
 	return sprintf(page, "%d.%03d\n", msec/1000, msec%1000);
 }
 static ssize_t
-safe_delay_store(mddev_t *mddev, const char *cbuf, size_t len)
+safe_delay_store(struct mddev *mddev, const char *cbuf, size_t len)
 {
-	int scale=1;
-	int dot=0;
-	int i;
 	unsigned long msec;
-	char buf[30];
 
-	/* remove a period, and count digits after it */
-	if (len >= sizeof(buf))
+	if (strict_strtoul_scaled(cbuf, &msec, 3) < 0)
 		return -EINVAL;
-	strlcpy(buf, cbuf, sizeof(buf));
-	for (i=0; i<len; i++) {
-		if (dot) {
-			if (isdigit(buf[i])) {
-				buf[i-1] = buf[i];
-				scale *= 10;
-			}
-			buf[i] = 0;
-		} else if (buf[i] == '.') {
-			dot=1;
-			buf[i] = 0;
-		}
-	}
-	if (strict_strtoul(buf, 10, &msec) < 0)
-		return -EINVAL;
-	msec = (msec * 1000) / scale;
 	if (msec == 0)
 		mddev->safemode_delay = 0;
 	else {
@@ -2735,9 +3537,9 @@ static struct md_sysfs_entry md_safe_delay =
 __ATTR(safe_mode_delay, S_IRUGO|S_IWUSR,safe_delay_show, safe_delay_store);
 
 static ssize_t
-level_show(mddev_t *mddev, char *page)
+level_show(struct mddev *mddev, char *page)
 {
-	struct mdk_personality *p = mddev->pers;
+	struct md_personality *p = mddev->pers;
 	if (p)
 		return sprintf(page, "%s\n", p->name);
 	else if (mddev->clevel[0])
@@ -2749,13 +3551,14 @@ level_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-level_store(mddev_t *mddev, const char *buf, size_t len)
+level_store(struct mddev *mddev, const char *buf, size_t len)
 {
-	char level[16];
+	char clevel[16];
 	ssize_t rv = len;
-	struct mdk_personality *pers;
+	struct md_personality *pers;
+	long level;
 	void *priv;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
 	if (mddev->pers == NULL) {
 		if (len == 0)
@@ -2776,7 +3579,9 @@ level_store(mddev_t *mddev, const char *buf, size_t len)
 	 *  - new personality will access other array.
 	 */
 
-	if (mddev->sync_thread || mddev->reshape_position != MaxSector)
+	if (mddev->sync_thread ||
+	    mddev->reshape_position != MaxSector ||
+	    mddev->sysfs_active)
 		return -EBUSY;
 
 	if (!mddev->pers->quiesce) {
@@ -2786,19 +3591,22 @@ level_store(mddev_t *mddev, const char *buf, size_t len)
 	}
 
 	/* Now find the new personality */
-	if (len == 0 || len >= sizeof(level))
+	if (len == 0 || len >= sizeof(clevel))
 		return -EINVAL;
-	strncpy(level, buf, len);
-	if (level[len-1] == '\n')
+	strncpy(clevel, buf, len);
+	if (clevel[len-1] == '\n')
 		len--;
-	level[len] = 0;
+	clevel[len] = 0;
+	if (kstrtol(clevel, 10, &level))
+		level = LEVEL_NONE;
 
-	request_module("md-%s", level);
+	if (request_module("md-%s", clevel) != 0)
+		request_module("md-level-%s", clevel);
 	spin_lock(&pers_lock);
-	pers = find_pers(LEVEL_NONE, level);
+	pers = find_pers(level, clevel);
 	if (!pers || !try_module_get(pers->owner)) {
 		spin_unlock(&pers_lock);
-		printk(KERN_WARNING "md: personality %s not loaded\n", level);
+		printk(KERN_WARNING "md: personality %s not loaded\n", clevel);
 		return -EINVAL;
 	}
 	spin_unlock(&pers_lock);
@@ -2811,9 +3619,12 @@ level_store(mddev_t *mddev, const char *buf, size_t len)
 	if (!pers->takeover) {
 		module_put(pers->owner);
 		printk(KERN_WARNING "md: %s: %s does not support personality takeover\n",
-		       mdname(mddev), level);
+		       mdname(mddev), clevel);
 		return -EINVAL;
 	}
+
+	rdev_for_each(rdev, mddev)
+		rdev->new_raid_disk = rdev->raid_disk;
 
 	/* ->takeover must set new_* and/or delta_disks
 	 * if it succeeds, and may set them when it fails.
@@ -2825,22 +3636,73 @@ level_store(mddev_t *mddev, const char *buf, size_t len)
 		mddev->new_chunk_sectors = mddev->chunk_sectors;
 		mddev->raid_disks -= mddev->delta_disks;
 		mddev->delta_disks = 0;
+		mddev->reshape_backwards = 0;
 		module_put(pers->owner);
 		printk(KERN_WARNING "md: %s: %s would not accept array\n",
-		       mdname(mddev), level);
+		       mdname(mddev), clevel);
 		return PTR_ERR(priv);
 	}
 
 	/* Looks like we have a winner */
 	mddev_suspend(mddev);
 	mddev->pers->stop(mddev);
-	module_put(mddev->pers->owner);
-	/* Invalidate devices that are now superfluous */
-	list_for_each_entry(rdev, &mddev->disks, same_set)
-		if (rdev->raid_disk >= mddev->raid_disks) {
-			rdev->raid_disk = -1;
+	
+	if (mddev->pers->sync_request == NULL &&
+	    pers->sync_request != NULL) {
+		/* need to add the md_redundancy_group */
+		if (sysfs_create_group(&mddev->kobj, &md_redundancy_group))
+			printk(KERN_WARNING
+			       "md: cannot register extra attributes for %s\n",
+			       mdname(mddev));
+		mddev->sysfs_action = sysfs_get_dirent(mddev->kobj.sd, "sync_action");
+	}		
+	if (mddev->pers->sync_request != NULL &&
+	    pers->sync_request == NULL) {
+		/* need to remove the md_redundancy_group */
+		if (mddev->to_remove == NULL)
+			mddev->to_remove = &md_redundancy_group;
+	}
+
+	if (mddev->pers->sync_request == NULL &&
+	    mddev->external) {
+		/* We are converting from a no-redundancy array
+		 * to a redundancy array and metadata is managed
+		 * externally so we need to be sure that writes
+		 * won't block due to a need to transition
+		 *      clean->dirty
+		 * until external management is started.
+		 */
+		mddev->in_sync = 0;
+		mddev->safemode_delay = 0;
+		mddev->safemode = 0;
+	}
+
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk < 0)
+			continue;
+		if (rdev->new_raid_disk >= mddev->raid_disks)
+			rdev->new_raid_disk = -1;
+		if (rdev->new_raid_disk == rdev->raid_disk)
+			continue;
+		sysfs_unlink_rdev(mddev, rdev);
+	}
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk < 0)
+			continue;
+		if (rdev->new_raid_disk == rdev->raid_disk)
+			continue;
+		rdev->raid_disk = rdev->new_raid_disk;
+		if (rdev->raid_disk < 0)
 			clear_bit(In_sync, &rdev->flags);
+		else {
+			if (sysfs_link_rdev(mddev, rdev))
+				printk(KERN_WARNING "md: cannot register rd%d"
+				       " for %s after level change\n",
+				       rdev->raid_disk, mdname(mddev));
 		}
+	}
+
+	module_put(mddev->pers->owner);
 	mddev->pers = pers;
 	mddev->private = priv;
 	strlcpy(mddev->clevel, pers->name, sizeof(mddev->clevel));
@@ -2848,11 +3710,21 @@ level_store(mddev_t *mddev, const char *buf, size_t len)
 	mddev->layout = mddev->new_layout;
 	mddev->chunk_sectors = mddev->new_chunk_sectors;
 	mddev->delta_disks = 0;
+	mddev->reshape_backwards = 0;
+	mddev->degraded = 0;
+	if (mddev->pers->sync_request == NULL) {
+		/* this is now an array without redundancy, so
+		 * it must always be in_sync
+		 */
+		mddev->in_sync = 1;
+		del_timer_sync(&mddev->safemode_timer);
+	}
+	blk_set_stacking_limits(&mddev->queue->limits);
 	pers->run(mddev);
-	mddev_resume(mddev);
 	set_bit(MD_CHANGE_DEVS, &mddev->flags);
-	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-	md_wakeup_thread(mddev->thread);
+	mddev_resume(mddev);
+	sysfs_notify(&mddev->kobj, NULL, "level");
+	md_new_event(mddev);
 	return rv;
 }
 
@@ -2861,7 +3733,7 @@ __ATTR(level, S_IRUGO|S_IWUSR, level_show, level_store);
 
 
 static ssize_t
-layout_show(mddev_t *mddev, char *page)
+layout_show(struct mddev *mddev, char *page)
 {
 	/* just a number, not meaningful for all levels */
 	if (mddev->reshape_position != MaxSector &&
@@ -2872,7 +3744,7 @@ layout_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-layout_store(mddev_t *mddev, const char *buf, size_t len)
+layout_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long n = simple_strtoul(buf, &e, 10);
@@ -2902,7 +3774,7 @@ __ATTR(layout, S_IRUGO|S_IWUSR, layout_show, layout_store);
 
 
 static ssize_t
-raid_disks_show(mddev_t *mddev, char *page)
+raid_disks_show(struct mddev *mddev, char *page)
 {
 	if (mddev->raid_disks == 0)
 		return 0;
@@ -2913,10 +3785,10 @@ raid_disks_show(mddev_t *mddev, char *page)
 	return sprintf(page, "%d\n", mddev->raid_disks);
 }
 
-static int update_raid_disks(mddev_t *mddev, int raid_disks);
+static int update_raid_disks(struct mddev *mddev, int raid_disks);
 
 static ssize_t
-raid_disks_store(mddev_t *mddev, const char *buf, size_t len)
+raid_disks_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	int rv = 0;
@@ -2928,9 +3800,20 @@ raid_disks_store(mddev_t *mddev, const char *buf, size_t len)
 	if (mddev->pers)
 		rv = update_raid_disks(mddev, n);
 	else if (mddev->reshape_position != MaxSector) {
+		struct md_rdev *rdev;
 		int olddisks = mddev->raid_disks - mddev->delta_disks;
+
+		rdev_for_each(rdev, mddev) {
+			if (olddisks < n &&
+			    rdev->data_offset < rdev->new_data_offset)
+				return -EINVAL;
+			if (olddisks > n &&
+			    rdev->data_offset > rdev->new_data_offset)
+				return -EINVAL;
+		}
 		mddev->delta_disks = n - olddisks;
 		mddev->raid_disks = n;
+		mddev->reshape_backwards = (mddev->delta_disks < 0);
 	} else
 		mddev->raid_disks = n;
 	return rv ? rv : len;
@@ -2939,7 +3822,7 @@ static struct md_sysfs_entry md_raid_disks =
 __ATTR(raid_disks, S_IRUGO|S_IWUSR, raid_disks_show, raid_disks_store);
 
 static ssize_t
-chunk_size_show(mddev_t *mddev, char *page)
+chunk_size_show(struct mddev *mddev, char *page)
 {
 	if (mddev->reshape_position != MaxSector &&
 	    mddev->chunk_sectors != mddev->new_chunk_sectors)
@@ -2950,7 +3833,7 @@ chunk_size_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-chunk_size_store(mddev_t *mddev, const char *buf, size_t len)
+chunk_size_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long n = simple_strtoul(buf, &e, 10);
@@ -2979,7 +3862,7 @@ static struct md_sysfs_entry md_chunk_size =
 __ATTR(chunk_size, S_IRUGO|S_IWUSR, chunk_size_show, chunk_size_store);
 
 static ssize_t
-resync_start_show(mddev_t *mddev, char *page)
+resync_start_show(struct mddev *mddev, char *page)
 {
 	if (mddev->recovery_cp == MaxSector)
 		return sprintf(page, "none\n");
@@ -2987,17 +3870,21 @@ resync_start_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-resync_start_store(mddev_t *mddev, const char *buf, size_t len)
+resync_start_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long long n = simple_strtoull(buf, &e, 10);
 
-	if (mddev->pers)
+	if (mddev->pers && !test_bit(MD_RECOVERY_FROZEN, &mddev->recovery))
 		return -EBUSY;
-	if (!*buf || (*e && *e != '\n'))
+	if (cmd_match(buf, "none"))
+		n = MaxSector;
+	else if (!*buf || (*e && *e != '\n'))
 		return -EINVAL;
 
 	mddev->recovery_cp = n;
+	if (mddev->pers)
+		set_bit(MD_CHANGE_CLEAN, &mddev->flags);
 	return len;
 }
 static struct md_sysfs_entry md_resync_start =
@@ -3055,7 +3942,7 @@ static int match_word(const char *word, char **list)
 }
 
 static ssize_t
-array_state_show(mddev_t *mddev, char *page)
+array_state_show(struct mddev *mddev, char *page)
 {
 	enum array_state st = inactive;
 
@@ -3070,7 +3957,7 @@ array_state_show(mddev_t *mddev, char *page)
 		case 0:
 			if (mddev->in_sync)
 				st = clean;
-			else if (test_bit(MD_CHANGE_CLEAN, &mddev->flags))
+			else if (test_bit(MD_CHANGE_PENDING, &mddev->flags))
 				st = write_pending;
 			else if (mddev->safemode)
 				st = active_idle;
@@ -3088,12 +3975,13 @@ array_state_show(mddev_t *mddev, char *page)
 	return sprintf(page, "%s\n", array_states[st]);
 }
 
-static int do_md_stop(mddev_t * mddev, int ro, int is_open);
-static int do_md_run(mddev_t * mddev);
-static int restart_array(mddev_t *mddev);
+static int do_md_stop(struct mddev * mddev, int ro, struct block_device *bdev);
+static int md_set_readonly(struct mddev * mddev, struct block_device *bdev);
+static int do_md_run(struct mddev * mddev);
+static int restart_array(struct mddev *mddev);
 
 static ssize_t
-array_state_store(mddev_t *mddev, const char *buf, size_t len)
+array_state_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	int err = -EINVAL;
 	enum array_state st = match_word(buf, array_states);
@@ -3102,24 +3990,20 @@ array_state_store(mddev_t *mddev, const char *buf, size_t len)
 		break;
 	case clear:
 		/* stopping an active array */
-		if (atomic_read(&mddev->openers) > 0)
-			return -EBUSY;
-		err = do_md_stop(mddev, 0, 0);
+		err = do_md_stop(mddev, 0, NULL);
 		break;
 	case inactive:
 		/* stopping an active array */
-		if (mddev->pers) {
-			if (atomic_read(&mddev->openers) > 0)
-				return -EBUSY;
-			err = do_md_stop(mddev, 2, 0);
-		} else
+		if (mddev->pers)
+			err = do_md_stop(mddev, 2, NULL);
+		else
 			err = 0; /* already inactive */
 		break;
 	case suspended:
 		break; /* not supported yet */
 	case readonly:
 		if (mddev->pers)
-			err = do_md_stop(mddev, 1, 0);
+			err = md_set_readonly(mddev, NULL);
 		else {
 			mddev->ro = 1;
 			set_disk_ro(mddev->gendisk, 1);
@@ -3129,7 +4013,7 @@ array_state_store(mddev_t *mddev, const char *buf, size_t len)
 	case read_auto:
 		if (mddev->pers) {
 			if (mddev->ro == 0)
-				err = do_md_stop(mddev, 1, 0);
+				err = md_set_readonly(mddev, NULL);
 			else if (mddev->ro == 1)
 				err = restart_array(mddev);
 			if (err == 0) {
@@ -3150,9 +4034,7 @@ array_state_store(mddev_t *mddev, const char *buf, size_t len)
 					mddev->in_sync = 1;
 					if (mddev->safemode == 1)
 						mddev->safemode = 0;
-					if (mddev->persistent)
-						set_bit(MD_CHANGE_CLEAN,
-							&mddev->flags);
+					set_bit(MD_CHANGE_CLEAN, &mddev->flags);
 				}
 				err = 0;
 			} else
@@ -3164,8 +4046,7 @@ array_state_store(mddev_t *mddev, const char *buf, size_t len)
 	case active:
 		if (mddev->pers) {
 			restart_array(mddev);
-			if (mddev->external)
-				clear_bit(MD_CHANGE_CLEAN, &mddev->flags);
+			clear_bit(MD_CHANGE_PENDING, &mddev->flags);
 			wake_up(&mddev->sb_wait);
 			err = 0;
 		} else {
@@ -3182,7 +4063,9 @@ array_state_store(mddev_t *mddev, const char *buf, size_t len)
 	if (err)
 		return err;
 	else {
-		sysfs_notify_dirent(mddev->sysfs_state);
+		if (mddev->hold_active == UNTIL_IOCTL)
+			mddev->hold_active = 0;
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
 		return len;
 	}
 }
@@ -3190,13 +4073,36 @@ static struct md_sysfs_entry md_array_state =
 __ATTR(array_state, S_IRUGO|S_IWUSR, array_state_show, array_state_store);
 
 static ssize_t
-null_show(mddev_t *mddev, char *page)
+max_corrected_read_errors_show(struct mddev *mddev, char *page) {
+	return sprintf(page, "%d\n",
+		       atomic_read(&mddev->max_corr_read_errors));
+}
+
+static ssize_t
+max_corrected_read_errors_store(struct mddev *mddev, const char *buf, size_t len)
+{
+	char *e;
+	unsigned long n = simple_strtoul(buf, &e, 10);
+
+	if (*buf && (*e == 0 || *e == '\n')) {
+		atomic_set(&mddev->max_corr_read_errors, n);
+		return len;
+	}
+	return -EINVAL;
+}
+
+static struct md_sysfs_entry max_corr_read_errors =
+__ATTR(max_read_errors, S_IRUGO|S_IWUSR, max_corrected_read_errors_show,
+	max_corrected_read_errors_store);
+
+static ssize_t
+null_show(struct mddev *mddev, char *page)
 {
 	return -EINVAL;
 }
 
 static ssize_t
-new_dev_store(mddev_t *mddev, const char *buf, size_t len)
+new_dev_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	/* buf must be %d:%d\n? giving major and minor numbers */
 	/* The new device is added to the array.
@@ -3209,7 +4115,7 @@ new_dev_store(mddev_t *mddev, const char *buf, size_t len)
 	int major = simple_strtoul(buf, &e, 10);
 	int minor;
 	dev_t dev;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	int err;
 
 	if (!*buf || *e != ':' || !e[1] || e[1] == '\n')
@@ -3227,8 +4133,9 @@ new_dev_store(mddev_t *mddev, const char *buf, size_t len)
 		rdev = md_import_device(dev, mddev->major_version,
 					mddev->minor_version);
 		if (!IS_ERR(rdev) && !list_empty(&mddev->disks)) {
-			mdk_rdev_t *rdev0 = list_entry(mddev->disks.next,
-						       mdk_rdev_t, same_set);
+			struct md_rdev *rdev0
+				= list_entry(mddev->disks.next,
+					     struct md_rdev, same_set);
 			err = super_types[mddev->major_version]
 				.load_super(rdev, rdev0, mddev->minor_version);
 			if (err < 0)
@@ -3252,7 +4159,7 @@ static struct md_sysfs_entry md_new_device =
 __ATTR(new_dev, S_IWUSR, null_show, new_dev_store);
 
 static ssize_t
-bitmap_store(mddev_t *mddev, const char *buf, size_t len)
+bitmap_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *end;
 	unsigned long chunk, end_chunk;
@@ -3270,8 +4177,7 @@ bitmap_store(mddev_t *mddev, const char *buf, size_t len)
 		}
 		if (*end && !isspace(*end)) break;
 		bitmap_dirty_bits(mddev->bitmap, chunk, end_chunk);
-		buf = end;
-		while (isspace(*buf)) buf++;
+		buf = skip_spaces(end);
 	}
 	bitmap_unplug(mddev->bitmap); /* flush the bits to disk */
 out:
@@ -3282,16 +4188,16 @@ static struct md_sysfs_entry md_bitmap =
 __ATTR(bitmap_set_bits, S_IWUSR, null_show, bitmap_store);
 
 static ssize_t
-size_show(mddev_t *mddev, char *page)
+size_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%llu\n",
 		(unsigned long long)mddev->dev_sectors / 2);
 }
 
-static int update_size(mddev_t *mddev, sector_t num_sectors);
+static int update_size(struct mddev *mddev, sector_t num_sectors);
 
 static ssize_t
-size_store(mddev_t *mddev, const char *buf, size_t len)
+size_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	/* If array is inactive, we can reduce the component size, but
 	 * not increase it (except from 0).
@@ -3319,14 +4225,14 @@ static struct md_sysfs_entry md_size =
 __ATTR(component_size, S_IRUGO|S_IWUSR, size_show, size_store);
 
 
-/* Metdata version.
+/* Metadata version.
  * This is one of
  *   'none' for arrays with no metadata (good luck...)
  *   'external' for arrays with externally managed metadata,
  * or N.M for internally known formats
  */
 static ssize_t
-metadata_show(mddev_t *mddev, char *page)
+metadata_show(struct mddev *mddev, char *page)
 {
 	if (mddev->persistent)
 		return sprintf(page, "%d.%d\n",
@@ -3338,7 +4244,7 @@ metadata_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-metadata_store(mddev_t *mddev, const char *buf, size_t len)
+metadata_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	int major, minor;
 	char *e;
@@ -3392,7 +4298,7 @@ static struct md_sysfs_entry md_metadata =
 __ATTR(metadata_version, S_IRUGO|S_IWUSR, metadata_show, metadata_store);
 
 static ssize_t
-action_show(mddev_t *mddev, char *page)
+action_show(struct mddev *mddev, char *page)
 {
 	char *type = "idle";
 	if (test_bit(MD_RECOVERY_FROZEN, &mddev->recovery))
@@ -3415,7 +4321,7 @@ action_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-action_store(mddev_t *mddev, const char *page, size_t len)
+action_store(struct mddev *mddev, const char *page, size_t len)
 {
 	if (!mddev->pers || !mddev->pers->sync_request)
 		return -EINVAL;
@@ -3428,9 +4334,7 @@ action_store(mddev_t *mddev, const char *page, size_t len)
 	if (cmd_match(page, "idle") || cmd_match(page, "frozen")) {
 		if (mddev->sync_thread) {
 			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-			md_unregister_thread(mddev->sync_thread);
-			mddev->sync_thread = NULL;
-			mddev->recovery = 0;
+			md_reap_sync_thread(mddev);
 		}
 	} else if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
 		   test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))
@@ -3456,34 +4360,49 @@ action_store(mddev_t *mddev, const char *page, size_t len)
 		set_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
 		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
 	}
+	if (mddev->ro == 2) {
+		/* A write to sync_action is enough to justify
+		 * canceling read-auto mode
+		 */
+		mddev->ro = 0;
+		md_wakeup_thread(mddev->sync_thread);
+	}
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	md_wakeup_thread(mddev->thread);
-	sysfs_notify_dirent(mddev->sysfs_action);
+	sysfs_notify_dirent_safe(mddev->sysfs_action);
 	return len;
-}
-
-static ssize_t
-mismatch_cnt_show(mddev_t *mddev, char *page)
-{
-	return sprintf(page, "%llu\n",
-		       (unsigned long long) mddev->resync_mismatches);
 }
 
 static struct md_sysfs_entry md_scan_mode =
 __ATTR(sync_action, S_IRUGO|S_IWUSR, action_show, action_store);
 
+static ssize_t
+last_sync_action_show(struct mddev *mddev, char *page)
+{
+	return sprintf(page, "%s\n", mddev->last_sync_action);
+}
+
+static struct md_sysfs_entry md_last_scan_mode = __ATTR_RO(last_sync_action);
+
+static ssize_t
+mismatch_cnt_show(struct mddev *mddev, char *page)
+{
+	return sprintf(page, "%llu\n",
+		       (unsigned long long)
+		       atomic64_read(&mddev->resync_mismatches));
+}
 
 static struct md_sysfs_entry md_mismatches = __ATTR_RO(mismatch_cnt);
 
 static ssize_t
-sync_min_show(mddev_t *mddev, char *page)
+sync_min_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%d (%s)\n", speed_min(mddev),
 		       mddev->sync_speed_min ? "local": "system");
 }
 
 static ssize_t
-sync_min_store(mddev_t *mddev, const char *buf, size_t len)
+sync_min_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	int min;
 	char *e;
@@ -3502,14 +4421,14 @@ static struct md_sysfs_entry md_sync_min =
 __ATTR(sync_speed_min, S_IRUGO|S_IWUSR, sync_min_show, sync_min_store);
 
 static ssize_t
-sync_max_show(mddev_t *mddev, char *page)
+sync_max_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%d (%s)\n", speed_max(mddev),
 		       mddev->sync_speed_max ? "local": "system");
 }
 
 static ssize_t
-sync_max_store(mddev_t *mddev, const char *buf, size_t len)
+sync_max_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	int max;
 	char *e;
@@ -3528,24 +4447,24 @@ static struct md_sysfs_entry md_sync_max =
 __ATTR(sync_speed_max, S_IRUGO|S_IWUSR, sync_max_show, sync_max_store);
 
 static ssize_t
-degraded_show(mddev_t *mddev, char *page)
+degraded_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%d\n", mddev->degraded);
 }
 static struct md_sysfs_entry md_degraded = __ATTR_RO(degraded);
 
 static ssize_t
-sync_force_parallel_show(mddev_t *mddev, char *page)
+sync_force_parallel_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%d\n", mddev->parallel_resync);
 }
 
 static ssize_t
-sync_force_parallel_store(mddev_t *mddev, const char *buf, size_t len)
+sync_force_parallel_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	long n;
 
-	if (strict_strtol(buf, 10, &n))
+	if (kstrtol(buf, 10, &n))
 		return -EINVAL;
 
 	if (n != 0 && n != 1)
@@ -3565,7 +4484,7 @@ __ATTR(sync_force_parallel, S_IRUGO|S_IWUSR,
        sync_force_parallel_show, sync_force_parallel_store);
 
 static ssize_t
-sync_speed_show(mddev_t *mddev, char *page)
+sync_speed_show(struct mddev *mddev, char *page)
 {
 	unsigned long resync, dt, db;
 	if (mddev->curr_resync == 0)
@@ -3580,35 +4499,40 @@ sync_speed_show(mddev_t *mddev, char *page)
 static struct md_sysfs_entry md_sync_speed = __ATTR_RO(sync_speed);
 
 static ssize_t
-sync_completed_show(mddev_t *mddev, char *page)
+sync_completed_show(struct mddev *mddev, char *page)
 {
-	unsigned long max_sectors, resync;
+	unsigned long long max_sectors, resync;
 
 	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
 		return sprintf(page, "none\n");
 
-	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery))
+	if (mddev->curr_resync == 1 ||
+	    mddev->curr_resync == 2)
+		return sprintf(page, "delayed\n");
+
+	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) ||
+	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		max_sectors = mddev->resync_max_sectors;
 	else
 		max_sectors = mddev->dev_sectors;
 
 	resync = mddev->curr_resync_completed;
-	return sprintf(page, "%lu / %lu\n", resync, max_sectors);
+	return sprintf(page, "%llu / %llu\n", resync, max_sectors);
 }
 
 static struct md_sysfs_entry md_sync_completed = __ATTR_RO(sync_completed);
 
 static ssize_t
-min_sync_show(mddev_t *mddev, char *page)
+min_sync_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%llu\n",
 		       (unsigned long long)mddev->resync_min);
 }
 static ssize_t
-min_sync_store(mddev_t *mddev, const char *buf, size_t len)
+min_sync_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	unsigned long long min;
-	if (strict_strtoull(buf, 10, &min))
+	if (kstrtoull(buf, 10, &min))
 		return -EINVAL;
 	if (min > mddev->resync_max)
 		return -EINVAL;
@@ -3630,7 +4554,7 @@ static struct md_sysfs_entry md_min_sync =
 __ATTR(sync_min, S_IRUGO|S_IWUSR, min_sync_show, min_sync_store);
 
 static ssize_t
-max_sync_show(mddev_t *mddev, char *page)
+max_sync_show(struct mddev *mddev, char *page)
 {
 	if (mddev->resync_max == MaxSector)
 		return sprintf(page, "max\n");
@@ -3639,13 +4563,13 @@ max_sync_show(mddev_t *mddev, char *page)
 			       (unsigned long long)mddev->resync_max);
 }
 static ssize_t
-max_sync_store(mddev_t *mddev, const char *buf, size_t len)
+max_sync_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	if (strncmp(buf, "max", 3) == 0)
 		mddev->resync_max = MaxSector;
 	else {
 		unsigned long long max;
-		if (strict_strtoull(buf, 10, &max))
+		if (kstrtoull(buf, 10, &max))
 			return -EINVAL;
 		if (max < mddev->resync_min)
 			return -EINVAL;
@@ -3670,65 +4594,74 @@ static struct md_sysfs_entry md_max_sync =
 __ATTR(sync_max, S_IRUGO|S_IWUSR, max_sync_show, max_sync_store);
 
 static ssize_t
-suspend_lo_show(mddev_t *mddev, char *page)
+suspend_lo_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%llu\n", (unsigned long long)mddev->suspend_lo);
 }
 
 static ssize_t
-suspend_lo_store(mddev_t *mddev, const char *buf, size_t len)
+suspend_lo_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long long new = simple_strtoull(buf, &e, 10);
+	unsigned long long old = mddev->suspend_lo;
 
 	if (mddev->pers == NULL || 
 	    mddev->pers->quiesce == NULL)
 		return -EINVAL;
 	if (buf == e || (*e && *e != '\n'))
 		return -EINVAL;
-	if (new >= mddev->suspend_hi ||
-	    (new > mddev->suspend_lo && new < mddev->suspend_hi)) {
-		mddev->suspend_lo = new;
+
+	mddev->suspend_lo = new;
+	if (new >= old)
+		/* Shrinking suspended region */
 		mddev->pers->quiesce(mddev, 2);
-		return len;
-	} else
-		return -EINVAL;
+	else {
+		/* Expanding suspended region - need to wait */
+		mddev->pers->quiesce(mddev, 1);
+		mddev->pers->quiesce(mddev, 0);
+	}
+	return len;
 }
 static struct md_sysfs_entry md_suspend_lo =
 __ATTR(suspend_lo, S_IRUGO|S_IWUSR, suspend_lo_show, suspend_lo_store);
 
 
 static ssize_t
-suspend_hi_show(mddev_t *mddev, char *page)
+suspend_hi_show(struct mddev *mddev, char *page)
 {
 	return sprintf(page, "%llu\n", (unsigned long long)mddev->suspend_hi);
 }
 
 static ssize_t
-suspend_hi_store(mddev_t *mddev, const char *buf, size_t len)
+suspend_hi_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	char *e;
 	unsigned long long new = simple_strtoull(buf, &e, 10);
+	unsigned long long old = mddev->suspend_hi;
 
 	if (mddev->pers == NULL ||
 	    mddev->pers->quiesce == NULL)
 		return -EINVAL;
 	if (buf == e || (*e && *e != '\n'))
 		return -EINVAL;
-	if ((new <= mddev->suspend_lo && mddev->suspend_lo >= mddev->suspend_hi) ||
-	    (new > mddev->suspend_lo && new > mddev->suspend_hi)) {
-		mddev->suspend_hi = new;
+
+	mddev->suspend_hi = new;
+	if (new <= old)
+		/* Shrinking suspended region */
+		mddev->pers->quiesce(mddev, 2);
+	else {
+		/* Expanding suspended region - need to wait */
 		mddev->pers->quiesce(mddev, 1);
 		mddev->pers->quiesce(mddev, 0);
-		return len;
-	} else
-		return -EINVAL;
+	}
+	return len;
 }
 static struct md_sysfs_entry md_suspend_hi =
 __ATTR(suspend_hi, S_IRUGO|S_IWUSR, suspend_hi_show, suspend_hi_store);
 
 static ssize_t
-reshape_position_show(mddev_t *mddev, char *page)
+reshape_position_show(struct mddev *mddev, char *page)
 {
 	if (mddev->reshape_position != MaxSector)
 		return sprintf(page, "%llu\n",
@@ -3738,8 +4671,9 @@ reshape_position_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-reshape_position_store(mddev_t *mddev, const char *buf, size_t len)
+reshape_position_store(struct mddev *mddev, const char *buf, size_t len)
 {
+	struct md_rdev *rdev;
 	char *e;
 	unsigned long long new = simple_strtoull(buf, &e, 10);
 	if (mddev->pers)
@@ -3748,9 +4682,12 @@ reshape_position_store(mddev_t *mddev, const char *buf, size_t len)
 		return -EINVAL;
 	mddev->reshape_position = new;
 	mddev->delta_disks = 0;
+	mddev->reshape_backwards = 0;
 	mddev->new_level = mddev->level;
 	mddev->new_layout = mddev->layout;
 	mddev->new_chunk_sectors = mddev->chunk_sectors;
+	rdev_for_each(rdev, mddev)
+		rdev->new_data_offset = rdev->data_offset;
 	return len;
 }
 
@@ -3759,7 +4696,43 @@ __ATTR(reshape_position, S_IRUGO|S_IWUSR, reshape_position_show,
        reshape_position_store);
 
 static ssize_t
-array_size_show(mddev_t *mddev, char *page)
+reshape_direction_show(struct mddev *mddev, char *page)
+{
+	return sprintf(page, "%s\n",
+		       mddev->reshape_backwards ? "backwards" : "forwards");
+}
+
+static ssize_t
+reshape_direction_store(struct mddev *mddev, const char *buf, size_t len)
+{
+	int backwards = 0;
+	if (cmd_match(buf, "forwards"))
+		backwards = 0;
+	else if (cmd_match(buf, "backwards"))
+		backwards = 1;
+	else
+		return -EINVAL;
+	if (mddev->reshape_backwards == backwards)
+		return len;
+
+	/* check if we are allowed to change */
+	if (mddev->delta_disks)
+		return -EBUSY;
+
+	if (mddev->persistent &&
+	    mddev->major_version == 0)
+		return -EINVAL;
+
+	mddev->reshape_backwards = backwards;
+	return len;
+}
+
+static struct md_sysfs_entry md_reshape_direction =
+__ATTR(reshape_direction, S_IRUGO|S_IWUSR, reshape_direction_show,
+       reshape_direction_store);
+
+static ssize_t
+array_size_show(struct mddev *mddev, char *page)
 {
 	if (mddev->external_size)
 		return sprintf(page, "%llu\n",
@@ -3769,7 +4742,7 @@ array_size_show(mddev_t *mddev, char *page)
 }
 
 static ssize_t
-array_size_store(mddev_t *mddev, const char *buf, size_t len)
+array_size_store(struct mddev *mddev, const char *buf, size_t len)
 {
 	sector_t sectors;
 
@@ -3790,10 +4763,10 @@ array_size_store(mddev_t *mddev, const char *buf, size_t len)
 	}
 
 	mddev->array_sectors = sectors;
-	set_capacity(mddev->gendisk, mddev->array_sectors);
-	if (mddev->pers)
+	if (mddev->pers) {
+		set_capacity(mddev->gendisk, mddev->array_sectors);
 		revalidate_disk(mddev->gendisk);
-
+	}
 	return len;
 }
 
@@ -3813,12 +4786,15 @@ static struct attribute *md_default_attrs[] = {
 	&md_safe_delay.attr,
 	&md_array_state.attr,
 	&md_reshape_position.attr,
+	&md_reshape_direction.attr,
 	&md_array_size.attr,
+	&max_corr_read_errors.attr,
 	NULL,
 };
 
 static struct attribute *md_redundancy_attrs[] = {
 	&md_scan_mode.attr,
+	&md_last_scan_mode.attr,
 	&md_mismatches.attr,
 	&md_sync_min.attr,
 	&md_sync_max.attr,
@@ -3843,16 +4819,25 @@ static ssize_t
 md_attr_show(struct kobject *kobj, struct attribute *attr, char *page)
 {
 	struct md_sysfs_entry *entry = container_of(attr, struct md_sysfs_entry, attr);
-	mddev_t *mddev = container_of(kobj, struct mddev_s, kobj);
+	struct mddev *mddev = container_of(kobj, struct mddev, kobj);
 	ssize_t rv;
 
 	if (!entry->show)
 		return -EIO;
+	spin_lock(&all_mddevs_lock);
+	if (list_empty(&mddev->all_mddevs)) {
+		spin_unlock(&all_mddevs_lock);
+		return -EBUSY;
+	}
+	mddev_get(mddev);
+	spin_unlock(&all_mddevs_lock);
+
 	rv = mddev_lock(mddev);
 	if (!rv) {
 		rv = entry->show(mddev, page);
 		mddev_unlock(mddev);
 	}
+	mddev_put(mddev);
 	return rv;
 }
 
@@ -3861,26 +4846,34 @@ md_attr_store(struct kobject *kobj, struct attribute *attr,
 	      const char *page, size_t length)
 {
 	struct md_sysfs_entry *entry = container_of(attr, struct md_sysfs_entry, attr);
-	mddev_t *mddev = container_of(kobj, struct mddev_s, kobj);
+	struct mddev *mddev = container_of(kobj, struct mddev, kobj);
 	ssize_t rv;
 
 	if (!entry->store)
 		return -EIO;
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
+	spin_lock(&all_mddevs_lock);
+	if (list_empty(&mddev->all_mddevs)) {
+		spin_unlock(&all_mddevs_lock);
+		return -EBUSY;
+	}
+	mddev_get(mddev);
+	spin_unlock(&all_mddevs_lock);
+	if (entry->store == new_dev_store)
+		flush_workqueue(md_misc_wq);
 	rv = mddev_lock(mddev);
-	if (mddev->hold_active == UNTIL_IOCTL)
-		mddev->hold_active = 0;
 	if (!rv) {
 		rv = entry->store(mddev, page, length);
 		mddev_unlock(mddev);
 	}
+	mddev_put(mddev);
 	return rv;
 }
 
 static void md_free(struct kobject *ko)
 {
-	mddev_t *mddev = container_of(ko, mddev_t, kobj);
+	struct mddev *mddev = container_of(ko, struct mddev, kobj);
 
 	if (mddev->sysfs_state)
 		sysfs_put(mddev->sysfs_state);
@@ -3895,7 +4888,7 @@ static void md_free(struct kobject *ko)
 	kfree(mddev);
 }
 
-static struct sysfs_ops md_sysfs_ops = {
+static const struct sysfs_ops md_sysfs_ops = {
 	.show	= md_attr_show,
 	.store	= md_attr_store,
 };
@@ -3909,15 +4902,9 @@ int mdp_major = 0;
 
 static void mddev_delayed_delete(struct work_struct *ws)
 {
-	mddev_t *mddev = container_of(ws, mddev_t, del_work);
+	struct mddev *mddev = container_of(ws, struct mddev, del_work);
 
-	if (mddev->private == &md_redundancy_group) {
-		sysfs_remove_group(&mddev->kobj, &md_redundancy_group);
-		if (mddev->sysfs_action)
-			sysfs_put(mddev->sysfs_action);
-		mddev->sysfs_action = NULL;
-		mddev->private = NULL;
-	}
+	sysfs_remove_group(&mddev->kobj, &md_bitmap_group);
 	kobject_del(&mddev->kobj);
 	kobject_put(&mddev->kobj);
 }
@@ -3925,7 +4912,7 @@ static void mddev_delayed_delete(struct work_struct *ws)
 static int md_alloc(dev_t dev, char *name)
 {
 	static DEFINE_MUTEX(disks_mutex);
-	mddev_t *mddev = mddev_find(dev);
+	struct mddev *mddev = mddev_find(dev);
 	struct gendisk *disk;
 	int partitioned;
 	int shift;
@@ -3939,10 +4926,10 @@ static int md_alloc(dev_t dev, char *name)
 	shift = partitioned ? MdpMinorShift : 0;
 	unit = MINOR(mddev->unit) >> shift;
 
-	/* wait for any previous instance if this device
-	 * to be completed removed (mddev_delayed_delete).
+	/* wait for any previous instance of this device to be
+	 * completely removed (mddev_delayed_delete).
 	 */
-	flush_scheduled_work();
+	flush_workqueue(md_misc_wq);
 
 	mutex_lock(&disks_mutex);
 	error = -EEXIST;
@@ -3952,7 +4939,7 @@ static int md_alloc(dev_t dev, char *name)
 	if (name) {
 		/* Need to ensure that 'name' is not a duplicate.
 		 */
-		mddev_t *mddev2;
+		struct mddev *mddev2;
 		spin_lock(&all_mddevs_lock);
 
 		list_for_each_entry(mddev2, &all_mddevs, all_mddevs)
@@ -3970,7 +4957,11 @@ static int md_alloc(dev_t dev, char *name)
 		goto abort;
 	mddev->queue->queuedata = mddev;
 
+	/* Can be unlocked because the queue is new: no concurrency */
+	queue_flag_set_unlocked(QUEUE_FLAG_CLUSTER, mddev->queue);
+
 	blk_queue_make_request(mddev->queue, md_make_request);
+	blk_set_stacking_limits(&mddev->queue->limits);
 
 	disk = alloc_disk(1 << shift);
 	if (!disk) {
@@ -3989,13 +4980,19 @@ static int md_alloc(dev_t dev, char *name)
 	disk->fops = &md_fops;
 	disk->private_data = mddev;
 	disk->queue = mddev->queue;
+	blk_queue_flush(mddev->queue, REQ_FLUSH | REQ_FUA);
 	/* Allow extended partitions.  This makes the
 	 * 'mdp' device redundant, but we can't really
 	 * remove it now.
 	 */
 	disk->flags |= GENHD_FL_EXT_DEVT;
-	add_disk(disk);
 	mddev->gendisk = disk;
+	/* As soon as we call add_disk(), another thread could get
+	 * through to md_open, so make sure it doesn't get too far
+	 */
+	mutex_lock(&mddev->open_mutex);
+	add_disk(disk);
+
 	error = kobject_init_and_add(&mddev->kobj, &md_ktype,
 				     &disk_to_dev(disk)->kobj, "%s", "md");
 	if (error) {
@@ -4006,11 +5003,15 @@ static int md_alloc(dev_t dev, char *name)
 		       disk->disk_name);
 		error = 0;
 	}
+	if (mddev->kobj.sd &&
+	    sysfs_create_group(&mddev->kobj, &md_bitmap_group))
+		printk(KERN_DEBUG "pointless warning\n");
+	mutex_unlock(&mddev->open_mutex);
  abort:
 	mutex_unlock(&disks_mutex);
-	if (!error) {
+	if (!error && mddev->kobj.sd) {
 		kobject_uevent(&mddev->kobj, KOBJ_ADD);
-		mddev->sysfs_state = sysfs_get_dirent(mddev->kobj.sd, "array_state");
+		mddev->sysfs_state = sysfs_get_dirent_safe(mddev->kobj.sd, "array_state");
 	}
 	mddev_put(mddev);
 	return error;
@@ -4043,30 +5044,32 @@ static int add_named_array(const char *val, struct kernel_param *kp)
 
 static void md_safemode_timeout(unsigned long data)
 {
-	mddev_t *mddev = (mddev_t *) data;
+	struct mddev *mddev = (struct mddev *) data;
 
 	if (!atomic_read(&mddev->writes_pending)) {
 		mddev->safemode = 1;
 		if (mddev->external)
-			sysfs_notify_dirent(mddev->sysfs_state);
+			sysfs_notify_dirent_safe(mddev->sysfs_state);
 	}
 	md_wakeup_thread(mddev->thread);
 }
 
 static int start_dirty_degraded;
 
-static int do_md_run(mddev_t * mddev)
+int md_run(struct mddev *mddev)
 {
 	int err;
-	mdk_rdev_t *rdev;
-	struct gendisk *disk;
-	struct mdk_personality *pers;
+	struct md_rdev *rdev;
+	struct md_personality *pers;
 
 	if (list_empty(&mddev->disks))
 		/* cannot run an array with no devices.. */
 		return -EINVAL;
 
 	if (mddev->pers)
+		return -EBUSY;
+	/* Cannot run until previous stop completes properly */
+	if (mddev->sysfs_active)
 		return -EBUSY;
 
 	/*
@@ -4088,7 +5091,7 @@ static int do_md_run(mddev_t * mddev)
 	 * the only valid external interface is through the md
 	 * device.
 	 */
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	rdev_for_each(rdev, mddev) {
 		if (test_bit(Faulty, &rdev->flags))
 			continue;
 		sync_blockdev(rdev->bdev);
@@ -4098,7 +5101,9 @@ static int do_md_run(mddev_t * mddev)
 		 * We don't want the data to overlap the metadata,
 		 * Internal Bitmap issues have been handled elsewhere.
 		 */
-		if (rdev->data_offset < rdev->sb_start) {
+		if (rdev->meta_bdev) {
+			/* Nothing to check */;
+		} else if (rdev->data_offset < rdev->sb_start) {
 			if (mddev->dev_sectors &&
 			    rdev->data_offset + mddev->dev_sectors
 			    > rdev->sb_start) {
@@ -4114,13 +5119,12 @@ static int do_md_run(mddev_t * mddev)
 				return -EINVAL;
 			}
 		}
-		sysfs_notify_dirent(rdev->sysfs_state);
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
 	}
 
-	md_probe(mddev->unit, NULL, NULL);
-	disk = mddev->gendisk;
-	if (!disk)
-		return -ENOMEM;
+	if (mddev->bio_set == NULL)
+		mddev->bio_set = bioset_create(BIO_POOL_SIZE,
+					       sizeof(struct mddev *));
 
 	spin_lock(&pers_lock);
 	pers = find_pers(mddev->level, mddev->clevel);
@@ -4155,11 +5159,11 @@ static int do_md_run(mddev_t * mddev)
 		 * configuration.
 		 */
 		char b[BDEVNAME_SIZE], b2[BDEVNAME_SIZE];
-		mdk_rdev_t *rdev2;
+		struct md_rdev *rdev2;
 		int warned = 0;
 
-		list_for_each_entry(rdev, &mddev->disks, same_set)
-			list_for_each_entry(rdev2, &mddev->disks, same_set) {
+		rdev_for_each(rdev, mddev)
+			rdev_for_each(rdev2, mddev) {
 				if (rdev < rdev2 &&
 				    rdev->bdev->bd_contains ==
 				    rdev2->bdev->bd_contains) {
@@ -4184,7 +5188,6 @@ static int do_md_run(mddev_t * mddev)
 	/* may be over-ridden by personality */
 	mddev->resync_max_sectors = mddev->dev_sectors;
 
-	mddev->barriers_work = 1;
 	mddev->ok_start_degraded = start_dirty_degraded;
 
 	if (start_readonly && mddev->ro == 0)
@@ -4203,7 +5206,8 @@ static int do_md_run(mddev_t * mddev)
 		err = -EINVAL;
 		mddev->pers->stop(mddev);
 	}
-	if (err == 0 && mddev->pers->sync_request) {
+	if (err == 0 && mddev->pers->sync_request &&
+	    (mddev->bitmap_info.file || mddev->bitmap_info.offset)) {
 		err = bitmap_create(mddev);
 		if (err) {
 			printk(KERN_ERR "%s: failed to create bitmap (%d)\n",
@@ -4218,79 +5222,68 @@ static int do_md_run(mddev_t * mddev)
 		return err;
 	}
 	if (mddev->pers->sync_request) {
-		if (sysfs_create_group(&mddev->kobj, &md_redundancy_group))
+		if (mddev->kobj.sd &&
+		    sysfs_create_group(&mddev->kobj, &md_redundancy_group))
 			printk(KERN_WARNING
 			       "md: cannot register extra attributes for %s\n",
 			       mdname(mddev));
-		mddev->sysfs_action = sysfs_get_dirent(mddev->kobj.sd, "sync_action");
+		mddev->sysfs_action = sysfs_get_dirent_safe(mddev->kobj.sd, "sync_action");
 	} else if (mddev->ro == 2) /* auto-readonly not meaningful */
 		mddev->ro = 0;
 
  	atomic_set(&mddev->writes_pending,0);
+	atomic_set(&mddev->max_corr_read_errors,
+		   MD_DEFAULT_MAX_CORRECTED_READ_ERRORS);
 	mddev->safemode = 0;
 	mddev->safemode_timer.function = md_safemode_timeout;
 	mddev->safemode_timer.data = (unsigned long) mddev;
 	mddev->safemode_delay = (200 * HZ)/1000 +1; /* 200 msec delay */
 	mddev->in_sync = 1;
-
-	list_for_each_entry(rdev, &mddev->disks, same_set)
-		if (rdev->raid_disk >= 0) {
-			char nm[20];
-			sprintf(nm, "rd%d", rdev->raid_disk);
-			if (sysfs_create_link(&mddev->kobj, &rdev->kobj, nm))
-				printk("md: cannot register %s for %s\n",
-				       nm, mdname(mddev));
-		}
+	smp_wmb();
+	mddev->ready = 1;
+	rdev_for_each(rdev, mddev)
+		if (rdev->raid_disk >= 0)
+			if (sysfs_link_rdev(mddev, rdev))
+				/* failure here is OK */;
 	
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	
 	if (mddev->flags)
 		md_update_sb(mddev, 0);
 
-	set_capacity(disk, mddev->array_sectors);
+	md_new_event(mddev);
+	sysfs_notify_dirent_safe(mddev->sysfs_state);
+	sysfs_notify_dirent_safe(mddev->sysfs_action);
+	sysfs_notify(&mddev->kobj, NULL, "degraded");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(md_run);
 
-	/* If there is a partially-recovered drive we need to
-	 * start recovery here.  If we leave it to md_check_recovery,
-	 * it will remove the drives and not do the right thing
-	 */
-	if (mddev->degraded && !mddev->sync_thread) {
-		int spares = 0;
-		list_for_each_entry(rdev, &mddev->disks, same_set)
-			if (rdev->raid_disk >= 0 &&
-			    !test_bit(In_sync, &rdev->flags) &&
-			    !test_bit(Faulty, &rdev->flags))
-				/* complete an interrupted recovery */
-				spares++;
-		if (spares && mddev->pers->sync_request) {
-			mddev->recovery = 0;
-			set_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
-			mddev->sync_thread = md_register_thread(md_do_sync,
-								mddev,
-								"resync");
-			if (!mddev->sync_thread) {
-				printk(KERN_ERR "%s: could not start resync"
-				       " thread...\n",
-				       mdname(mddev));
-				/* leave the spares where they are, it shouldn't hurt */
-				mddev->recovery = 0;
-			}
-		}
+static int do_md_run(struct mddev *mddev)
+{
+	int err;
+
+	err = md_run(mddev);
+	if (err)
+		goto out;
+	err = bitmap_load(mddev);
+	if (err) {
+		bitmap_destroy(mddev);
+		goto out;
 	}
+
 	md_wakeup_thread(mddev->thread);
 	md_wakeup_thread(mddev->sync_thread); /* possibly kick off a reshape */
 
+	set_capacity(mddev->gendisk, mddev->array_sectors);
 	revalidate_disk(mddev->gendisk);
 	mddev->changed = 1;
-	md_new_event(mddev);
-	sysfs_notify_dirent(mddev->sysfs_state);
-	if (mddev->sysfs_action)
-		sysfs_notify_dirent(mddev->sysfs_action);
-	sysfs_notify(&mddev->kobj, NULL, "degraded");
 	kobject_uevent(&disk_to_dev(mddev->gendisk)->kobj, KOBJ_CHANGE);
-	return 0;
+out:
+	return err;
 }
 
-static int restart_array(mddev_t *mddev)
+static int restart_array(struct mddev *mddev)
 {
 	struct gendisk *disk = mddev->gendisk;
 
@@ -4310,7 +5303,7 @@ static int restart_array(mddev_t *mddev)
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	md_wakeup_thread(mddev->thread);
 	md_wakeup_thread(mddev->sync_thread);
-	sysfs_notify_dirent(mddev->sysfs_state);
+	sysfs_notify_dirent_safe(mddev->sysfs_state);
 	return 0;
 }
 
@@ -4331,7 +5324,7 @@ static int deny_bitmap_write_access(struct file * file)
 	return 0;
 }
 
-static void restore_bitmap_write_access(struct file *file)
+void restore_bitmap_write_access(struct file *file)
 {
 	struct inode *inode = file->f_mapping->host;
 
@@ -4340,156 +5333,216 @@ static void restore_bitmap_write_access(struct file *file)
 	spin_unlock(&inode->i_lock);
 }
 
-/* mode:
- *   0 - completely stop and dis-assemble array
- *   1 - switch to readonly
- *   2 - stop but do not disassemble array
- */
-static int do_md_stop(mddev_t * mddev, int mode, int is_open)
+static void md_clean(struct mddev *mddev)
+{
+	mddev->array_sectors = 0;
+	mddev->external_size = 0;
+	mddev->dev_sectors = 0;
+	mddev->raid_disks = 0;
+	mddev->recovery_cp = 0;
+	mddev->resync_min = 0;
+	mddev->resync_max = MaxSector;
+	mddev->reshape_position = MaxSector;
+	mddev->external = 0;
+	mddev->persistent = 0;
+	mddev->level = LEVEL_NONE;
+	mddev->clevel[0] = 0;
+	mddev->flags = 0;
+	mddev->ro = 0;
+	mddev->metadata_type[0] = 0;
+	mddev->chunk_sectors = 0;
+	mddev->ctime = mddev->utime = 0;
+	mddev->layout = 0;
+	mddev->max_disks = 0;
+	mddev->events = 0;
+	mddev->can_decrease_events = 0;
+	mddev->delta_disks = 0;
+	mddev->reshape_backwards = 0;
+	mddev->new_level = LEVEL_NONE;
+	mddev->new_layout = 0;
+	mddev->new_chunk_sectors = 0;
+	mddev->curr_resync = 0;
+	atomic64_set(&mddev->resync_mismatches, 0);
+	mddev->suspend_lo = mddev->suspend_hi = 0;
+	mddev->sync_speed_min = mddev->sync_speed_max = 0;
+	mddev->recovery = 0;
+	mddev->in_sync = 0;
+	mddev->changed = 0;
+	mddev->degraded = 0;
+	mddev->safemode = 0;
+	mddev->merge_check_needed = 0;
+	mddev->bitmap_info.offset = 0;
+	mddev->bitmap_info.default_offset = 0;
+	mddev->bitmap_info.default_space = 0;
+	mddev->bitmap_info.chunksize = 0;
+	mddev->bitmap_info.daemon_sleep = 0;
+	mddev->bitmap_info.max_write_behind = 0;
+	mddev->plug = NULL;
+}
+
+static void __md_stop_writes(struct mddev *mddev)
+{
+	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+	if (mddev->sync_thread) {
+		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+		md_reap_sync_thread(mddev);
+	}
+
+	del_timer_sync(&mddev->safemode_timer);
+
+	bitmap_flush(mddev);
+	md_super_wait(mddev);
+
+	if (mddev->ro == 0 &&
+	    (!mddev->in_sync || mddev->flags)) {
+		/* mark array as shutdown cleanly */
+		mddev->in_sync = 1;
+		md_update_sb(mddev, 1);
+	}
+}
+
+void md_stop_writes(struct mddev *mddev)
+{
+	mddev_lock(mddev);
+	__md_stop_writes(mddev);
+	mddev_unlock(mddev);
+}
+EXPORT_SYMBOL_GPL(md_stop_writes);
+
+static void __md_stop(struct mddev *mddev)
+{
+	mddev->ready = 0;
+	mddev->pers->stop(mddev);
+	if (mddev->pers->sync_request && mddev->to_remove == NULL)
+		mddev->to_remove = &md_redundancy_group;
+	module_put(mddev->pers->owner);
+	mddev->pers = NULL;
+	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+}
+
+void md_stop(struct mddev *mddev)
+{
+	/* stop the array and free an attached data structures.
+	 * This is called from dm-raid
+	 */
+	__md_stop(mddev);
+	bitmap_destroy(mddev);
+	if (mddev->bio_set)
+		bioset_free(mddev->bio_set);
+}
+
+EXPORT_SYMBOL_GPL(md_stop);
+
+static int md_set_readonly(struct mddev *mddev, struct block_device *bdev)
 {
 	int err = 0;
-	struct gendisk *disk = mddev->gendisk;
-	mdk_rdev_t *rdev;
-
 	mutex_lock(&mddev->open_mutex);
-	if (atomic_read(&mddev->openers) > is_open) {
+	if (atomic_read(&mddev->openers) > !!bdev) {
 		printk("md: %s still in use.\n",mdname(mddev));
 		err = -EBUSY;
-	} else if (mddev->pers) {
+		goto out;
+	}
+	if (bdev)
+		sync_blockdev(bdev);
+	if (mddev->pers) {
+		__md_stop_writes(mddev);
 
-		if (mddev->sync_thread) {
-			set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
-			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
-			md_unregister_thread(mddev->sync_thread);
-			mddev->sync_thread = NULL;
-		}
-
-		del_timer_sync(&mddev->safemode_timer);
-
-		switch(mode) {
-		case 1: /* readonly */
-			err  = -ENXIO;
-			if (mddev->ro==1)
-				goto out;
-			mddev->ro = 1;
-			break;
-		case 0: /* disassemble */
-		case 2: /* stop */
-			bitmap_flush(mddev);
-			md_super_wait(mddev);
-			if (mddev->ro)
-				set_disk_ro(disk, 0);
-
-			mddev->pers->stop(mddev);
-			mddev->queue->merge_bvec_fn = NULL;
-			mddev->queue->unplug_fn = NULL;
-			mddev->queue->backing_dev_info.congested_fn = NULL;
-			module_put(mddev->pers->owner);
-			if (mddev->pers->sync_request)
-				mddev->private = &md_redundancy_group;
-			mddev->pers = NULL;
-			/* tell userspace to handle 'inactive' */
-			sysfs_notify_dirent(mddev->sysfs_state);
-
-			list_for_each_entry(rdev, &mddev->disks, same_set)
-				if (rdev->raid_disk >= 0) {
-					char nm[20];
-					sprintf(nm, "rd%d", rdev->raid_disk);
-					sysfs_remove_link(&mddev->kobj, nm);
-				}
-
-			set_capacity(disk, 0);
-			mddev->changed = 1;
-
-			if (mddev->ro)
-				mddev->ro = 0;
-		}
-		if (!mddev->in_sync || mddev->flags) {
-			/* mark array as shutdown cleanly */
-			mddev->in_sync = 1;
-			md_update_sb(mddev, 1);
-		}
-		if (mode == 1)
-			set_disk_ro(disk, 1);
+		err  = -ENXIO;
+		if (mddev->ro==1)
+			goto out;
+		mddev->ro = 1;
+		set_disk_ro(mddev->gendisk, 1);
 		clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
-		err = 0;
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
+		err = 0;	
 	}
 out:
 	mutex_unlock(&mddev->open_mutex);
-	if (err)
-		return err;
+	return err;
+}
+
+/* mode:
+ *   0 - completely stop and dis-assemble array
+ *   2 - stop but do not disassemble array
+ */
+static int do_md_stop(struct mddev * mddev, int mode,
+		      struct block_device *bdev)
+{
+	struct gendisk *disk = mddev->gendisk;
+	struct md_rdev *rdev;
+
+	mutex_lock(&mddev->open_mutex);
+	if (atomic_read(&mddev->openers) > !!bdev ||
+	    mddev->sysfs_active) {
+		printk("md: %s still in use.\n",mdname(mddev));
+		mutex_unlock(&mddev->open_mutex);
+		return -EBUSY;
+	}
+	if (bdev)
+		/* It is possible IO was issued on some other
+		 * open file which was closed before we took ->open_mutex.
+		 * As that was not the last close __blkdev_put will not
+		 * have called sync_blockdev, so we must.
+		 */
+		sync_blockdev(bdev);
+
+	if (mddev->pers) {
+		if (mddev->ro)
+			set_disk_ro(disk, 0);
+
+		__md_stop_writes(mddev);
+		__md_stop(mddev);
+		mddev->queue->merge_bvec_fn = NULL;
+		mddev->queue->unplug_fn = NULL;
+		mddev->queue->backing_dev_info.congested_fn = NULL;
+
+		/* tell userspace to handle 'inactive' */
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
+
+		rdev_for_each(rdev, mddev)
+			if (rdev->raid_disk >= 0)
+				sysfs_unlink_rdev(mddev, rdev);
+
+		set_capacity(disk, 0);
+		mutex_unlock(&mddev->open_mutex);
+		mddev->changed = 1;
+		revalidate_disk(disk);
+
+		if (mddev->ro)
+			mddev->ro = 0;
+	} else
+		mutex_unlock(&mddev->open_mutex);
 	/*
 	 * Free resources if final stop
 	 */
 	if (mode == 0) {
-
 		printk(KERN_INFO "md: %s stopped.\n", mdname(mddev));
 
 		bitmap_destroy(mddev);
-		if (mddev->bitmap_file) {
-			restore_bitmap_write_access(mddev->bitmap_file);
-			fput(mddev->bitmap_file);
-			mddev->bitmap_file = NULL;
+		if (mddev->bitmap_info.file) {
+			restore_bitmap_write_access(mddev->bitmap_info.file);
+			fput(mddev->bitmap_info.file);
+			mddev->bitmap_info.file = NULL;
 		}
-		mddev->bitmap_offset = 0;
-
-		/* make sure all md_delayed_delete calls have finished */
-		flush_scheduled_work();
+		mddev->bitmap_info.offset = 0;
 
 		export_array(mddev);
 
-		mddev->array_sectors = 0;
-		mddev->external_size = 0;
-		mddev->dev_sectors = 0;
-		mddev->raid_disks = 0;
-		mddev->recovery_cp = 0;
-		mddev->resync_min = 0;
-		mddev->resync_max = MaxSector;
-		mddev->reshape_position = MaxSector;
-		mddev->external = 0;
-		mddev->persistent = 0;
-		mddev->level = LEVEL_NONE;
-		mddev->clevel[0] = 0;
-		mddev->flags = 0;
-		mddev->ro = 0;
-		mddev->metadata_type[0] = 0;
-		mddev->chunk_sectors = 0;
-		mddev->ctime = mddev->utime = 0;
-		mddev->layout = 0;
-		mddev->max_disks = 0;
-		mddev->events = 0;
-		mddev->delta_disks = 0;
-		mddev->new_level = LEVEL_NONE;
-		mddev->new_layout = 0;
-		mddev->new_chunk_sectors = 0;
-		mddev->curr_resync = 0;
-		mddev->resync_mismatches = 0;
-		mddev->suspend_lo = mddev->suspend_hi = 0;
-		mddev->sync_speed_min = mddev->sync_speed_max = 0;
-		mddev->recovery = 0;
-		mddev->in_sync = 0;
-		mddev->changed = 0;
-		mddev->degraded = 0;
-		mddev->barriers_work = 0;
-		mddev->safemode = 0;
+		md_clean(mddev);
 		kobject_uevent(&disk_to_dev(mddev->gendisk)->kobj, KOBJ_CHANGE);
 		if (mddev->hold_active == UNTIL_STOP)
 			mddev->hold_active = 0;
-
-	} else if (mddev->pers)
-		printk(KERN_INFO "md: %s switched to read-only mode.\n",
-			mdname(mddev));
-	err = 0;
+	}
 	blk_integrity_unregister(disk);
 	md_new_event(mddev);
-	sysfs_notify_dirent(mddev->sysfs_state);
-	return err;
+	sysfs_notify_dirent_safe(mddev->sysfs_state);
+	return 0;
 }
 
 #ifndef MODULE
-static void autorun_array(mddev_t *mddev)
+static void autorun_array(struct mddev *mddev)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	int err;
 
 	if (list_empty(&mddev->disks))
@@ -4497,7 +5550,7 @@ static void autorun_array(mddev_t *mddev)
 
 	printk(KERN_INFO "md: running: ");
 
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	rdev_for_each(rdev, mddev) {
 		char b[BDEVNAME_SIZE];
 		printk("<%s>", bdevname(rdev->bdev,b));
 	}
@@ -4506,7 +5559,7 @@ static void autorun_array(mddev_t *mddev)
 	err = do_md_run(mddev);
 	if (err) {
 		printk(KERN_WARNING "md: do_md_run() returned %d\n", err);
-		do_md_stop(mddev, 0, 0);
+		do_md_stop(mddev, 0, NULL);
 	}
 }
 
@@ -4524,8 +5577,8 @@ static void autorun_array(mddev_t *mddev)
  */
 static void autorun_devices(int part)
 {
-	mdk_rdev_t *rdev0, *rdev, *tmp;
-	mddev_t *mddev;
+	struct md_rdev *rdev0, *rdev, *tmp;
+	struct mddev *mddev;
 	char b[BDEVNAME_SIZE];
 
 	printk(KERN_INFO "md: autorun ...\n");
@@ -4534,7 +5587,7 @@ static void autorun_devices(int part)
 		dev_t dev;
 		LIST_HEAD(candidates);
 		rdev0 = list_entry(pending_raid_disks.next,
-					 mdk_rdev_t, same_set);
+					 struct md_rdev, same_set);
 
 		printk(KERN_INFO "md: considering %s ...\n",
 			bdevname(rdev0->bdev,b));
@@ -4620,14 +5673,15 @@ static int get_version(void __user * arg)
 	return 0;
 }
 
-static int get_array_info(mddev_t * mddev, void __user * arg)
+static int get_array_info(struct mddev * mddev, void __user * arg)
 {
 	mdu_array_info_t info;
 	int nr,working,insync,failed,spare;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
-	nr=working=insync=failed=spare=0;
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+	nr = working = insync = failed = spare = 0;
+	rcu_read_lock();
+	rdev_for_each_rcu(rdev, mddev) {
 		nr++;
 		if (test_bit(Faulty, &rdev->flags))
 			failed++;
@@ -4639,6 +5693,7 @@ static int get_array_info(mddev_t * mddev, void __user * arg)
 				spare++;
 		}
 	}
+	rcu_read_unlock();
 
 	info.major_version = mddev->major_version;
 	info.minor_version = mddev->minor_version;
@@ -4657,7 +5712,7 @@ static int get_array_info(mddev_t * mddev, void __user * arg)
 	info.state         = 0;
 	if (mddev->in_sync)
 		info.state = (1<<MD_SB_CLEAN);
-	if (mddev->bitmap && mddev->bitmap_offset)
+	if (mddev->bitmap && mddev->bitmap_info.offset)
 		info.state = (1<<MD_SB_BITMAP_PRESENT);
 	info.active_disks  = insync;
 	info.working_disks = working;
@@ -4673,7 +5728,7 @@ static int get_array_info(mddev_t * mddev, void __user * arg)
 	return 0;
 }
 
-static int get_bitmap_file(mddev_t * mddev, void __user * arg)
+static int get_bitmap_file(struct mddev * mddev, void __user * arg)
 {
 	mdu_bitmap_file_t *file = NULL; /* too big for stack allocation */
 	char *ptr, *buf = NULL;
@@ -4688,7 +5743,7 @@ static int get_bitmap_file(mddev_t * mddev, void __user * arg)
 		goto out;
 
 	/* bitmap disabled, zero the first byte and copy out */
-	if (!mddev->bitmap || !mddev->bitmap->file) {
+	if (!mddev->bitmap || !mddev->bitmap->storage.file) {
 		file->pathname[0] = '\0';
 		goto copy_out;
 	}
@@ -4697,7 +5752,8 @@ static int get_bitmap_file(mddev_t * mddev, void __user * arg)
 	if (!buf)
 		goto out;
 
-	ptr = d_path(&mddev->bitmap->file->f_path, buf, sizeof(file->pathname));
+	ptr = d_path(&mddev->bitmap->storage.file->f_path,
+		     buf, sizeof(file->pathname));
 	if (IS_ERR(ptr))
 		goto out;
 
@@ -4713,15 +5769,16 @@ out:
 	return err;
 }
 
-static int get_disk_info(mddev_t * mddev, void __user * arg)
+static int get_disk_info(struct mddev * mddev, void __user * arg)
 {
 	mdu_disk_info_t info;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
 	if (copy_from_user(&info, arg, sizeof(info)))
 		return -EFAULT;
 
-	rdev = find_rdev_nr(mddev, info.number);
+	rcu_read_lock();
+	rdev = find_rdev_nr_rcu(mddev, info.number);
 	if (rdev) {
 		info.major = MAJOR(rdev->bdev->bd_dev);
 		info.minor = MINOR(rdev->bdev->bd_dev);
@@ -4740,6 +5797,7 @@ static int get_disk_info(mddev_t * mddev, void __user * arg)
 		info.raid_disk = -1;
 		info.state = (1<<MD_DISK_REMOVED);
 	}
+	rcu_read_unlock();
 
 	if (copy_to_user(arg, &info, sizeof(info)))
 		return -EFAULT;
@@ -4747,10 +5805,10 @@ static int get_disk_info(mddev_t * mddev, void __user * arg)
 	return 0;
 }
 
-static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
+static int add_new_disk(struct mddev * mddev, mdu_disk_info_t *info)
 {
 	char b[BDEVNAME_SIZE], b2[BDEVNAME_SIZE];
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	dev_t dev = MKDEV(info->major,info->minor);
 
 	if (info->major != MAJOR(dev) || info->minor != MINOR(dev))
@@ -4767,8 +5825,9 @@ static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
 			return PTR_ERR(rdev);
 		}
 		if (!list_empty(&mddev->disks)) {
-			mdk_rdev_t *rdev0 = list_entry(mddev->disks.next,
-							mdk_rdev_t, same_set);
+			struct md_rdev *rdev0
+				= list_entry(mddev->disks.next,
+					     struct md_rdev, same_set);
 			err = super_types[mddev->major_version]
 				.load_super(rdev, rdev0, mddev->minor_version);
 			if (err < 0) {
@@ -4821,6 +5880,15 @@ static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
 		} else
 			super_types[mddev->major_version].
 				validate_super(mddev, rdev);
+		if ((info->state & (1<<MD_DISK_SYNC)) &&
+		     rdev->raid_disk != info->raid_disk) {
+			/* This was a hot-add request, but events doesn't
+			 * match, so reject it.
+			 */
+			export_rdev(rdev);
+			return -EINVAL;
+		}
+
 		if (test_bit(In_sync, &rdev->flags))
 			rdev->saved_raid_disk = rdev->raid_disk;
 		else
@@ -4848,12 +5916,14 @@ static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
 		if (err)
 			export_rdev(rdev);
 		else
-			sysfs_notify_dirent(rdev->sysfs_state);
+			sysfs_notify_dirent_safe(rdev->sysfs_state);
 
-		md_update_sb(mddev, 1);
+		set_bit(MD_CHANGE_DEVS, &mddev->flags);
 		if (mddev->degraded)
 			set_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
 		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		if (!err)
+			md_new_event(mddev);
 		md_wakeup_thread(mddev->thread);
 		return err;
 	}
@@ -4891,9 +5961,9 @@ static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
 
 		if (!mddev->persistent) {
 			printk(KERN_INFO "md: nonpersistent superblock ...\n");
-			rdev->sb_start = rdev->bdev->bd_inode->i_size / 512;
-		} else 
-			rdev->sb_start = calc_dev_sboffset(rdev->bdev);
+			rdev->sb_start = i_size_read(rdev->bdev->bd_inode) / 512;
+		} else
+			rdev->sb_start = calc_dev_sboffset(rdev);
 		rdev->sectors = rdev->sb_start;
 
 		err = bind_rdev_to_array(rdev, mddev);
@@ -4906,14 +5976,17 @@ static int add_new_disk(mddev_t * mddev, mdu_disk_info_t *info)
 	return 0;
 }
 
-static int hot_remove_disk(mddev_t * mddev, dev_t dev)
+static int hot_remove_disk(struct mddev * mddev, dev_t dev)
 {
 	char b[BDEVNAME_SIZE];
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
 	rdev = find_rdev(mddev, dev);
 	if (!rdev)
 		return -ENXIO;
+
+	clear_bit(Blocked, &rdev->flags);
+	remove_and_add_spares(mddev, rdev);
 
 	if (rdev->raid_disk >= 0)
 		goto busy;
@@ -4929,11 +6002,11 @@ busy:
 	return -EBUSY;
 }
 
-static int hot_add_disk(mddev_t * mddev, dev_t dev)
+static int hot_add_disk(struct mddev * mddev, dev_t dev)
 {
 	char b[BDEVNAME_SIZE];
 	int err;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
 	if (!mddev->pers)
 		return -ENODEV;
@@ -4960,9 +6033,9 @@ static int hot_add_disk(mddev_t * mddev, dev_t dev)
 	}
 
 	if (mddev->persistent)
-		rdev->sb_start = calc_dev_sboffset(rdev->bdev);
+		rdev->sb_start = calc_dev_sboffset(rdev);
 	else
-		rdev->sb_start = rdev->bdev->bd_inode->i_size / 512;
+		rdev->sb_start = i_size_read(rdev->bdev->bd_inode) / 512;
 
 	rdev->sectors = rdev->sb_start;
 
@@ -5003,7 +6076,7 @@ abort_export:
 	return err;
 }
 
-static int set_bitmap_file(mddev_t *mddev, int fd)
+static int set_bitmap_file(struct mddev *mddev, int fd)
 {
 	int err;
 
@@ -5019,30 +6092,33 @@ static int set_bitmap_file(mddev_t *mddev, int fd)
 	if (fd >= 0) {
 		if (mddev->bitmap)
 			return -EEXIST; /* cannot add when bitmap is present */
-		mddev->bitmap_file = fget(fd);
+		mddev->bitmap_info.file = fget(fd);
 
-		if (mddev->bitmap_file == NULL) {
+		if (mddev->bitmap_info.file == NULL) {
 			printk(KERN_ERR "%s: error: failed to get bitmap file\n",
 			       mdname(mddev));
 			return -EBADF;
 		}
 
-		err = deny_bitmap_write_access(mddev->bitmap_file);
+		err = deny_bitmap_write_access(mddev->bitmap_info.file);
 		if (err) {
 			printk(KERN_ERR "%s: error: bitmap file is already in use\n",
 			       mdname(mddev));
-			fput(mddev->bitmap_file);
-			mddev->bitmap_file = NULL;
+			fput(mddev->bitmap_info.file);
+			mddev->bitmap_info.file = NULL;
 			return err;
 		}
-		mddev->bitmap_offset = 0; /* file overrides offset */
+		mddev->bitmap_info.offset = 0; /* file overrides offset */
 	} else if (mddev->bitmap == NULL)
 		return -ENOENT; /* cannot remove what isn't there */
 	err = 0;
 	if (mddev->pers) {
 		mddev->pers->quiesce(mddev, 1);
-		if (fd >= 0)
+		if (fd >= 0) {
 			err = bitmap_create(mddev);
+			if (!err)
+				err = bitmap_load(mddev);
+		}
 		if (fd < 0 || err) {
 			bitmap_destroy(mddev);
 			fd = -1; /* make sure to put the file */
@@ -5050,11 +6126,11 @@ static int set_bitmap_file(mddev_t *mddev, int fd)
 		mddev->pers->quiesce(mddev, 0);
 	}
 	if (fd < 0) {
-		if (mddev->bitmap_file) {
-			restore_bitmap_write_access(mddev->bitmap_file);
-			fput(mddev->bitmap_file);
+		if (mddev->bitmap_info.file) {
+			restore_bitmap_write_access(mddev->bitmap_info.file);
+			fput(mddev->bitmap_info.file);
 		}
-		mddev->bitmap_file = NULL;
+		mddev->bitmap_info.file = NULL;
 	}
 
 	return err;
@@ -5073,7 +6149,7 @@ static int set_bitmap_file(mddev_t *mddev, int fd)
  *  The minor and patch _version numbers are also kept incase the
  *  super_block handler wishes to interpret them.
  */
-static int set_array_info(mddev_t * mddev, mdu_array_info_t *info)
+static int set_array_info(struct mddev * mddev, mdu_array_info_t *info)
 {
 
 	if (info->raid_disks == 0) {
@@ -5125,8 +6201,9 @@ static int set_array_info(mddev_t * mddev, mdu_array_info_t *info)
 		mddev->flags         = 0;
 	set_bit(MD_CHANGE_DEVS, &mddev->flags);
 
-	mddev->default_bitmap_offset = MD_SB_BYTES >> 9;
-	mddev->bitmap_offset = 0;
+	mddev->bitmap_info.default_offset = MD_SB_BYTES >> 9;
+	mddev->bitmap_info.default_space = 64*2 - (MD_SB_BYTES >> 9);
+	mddev->bitmap_info.offset = 0;
 
 	mddev->reshape_position = MaxSector;
 
@@ -5139,11 +6216,12 @@ static int set_array_info(mddev_t * mddev, mdu_array_info_t *info)
 	mddev->new_chunk_sectors = mddev->chunk_sectors;
 	mddev->new_layout = mddev->layout;
 	mddev->delta_disks = 0;
+	mddev->reshape_backwards = 0;
 
 	return 0;
 }
 
-void md_set_array_sectors(mddev_t *mddev, sector_t array_sectors)
+void md_set_array_sectors(struct mddev *mddev, sector_t array_sectors)
 {
 	WARN(!mddev_is_locked(mddev), "%s: unlocked mddev!\n", __func__);
 
@@ -5154,9 +6232,9 @@ void md_set_array_sectors(mddev_t *mddev, sector_t array_sectors)
 }
 EXPORT_SYMBOL(md_set_array_sectors);
 
-static int update_size(mddev_t *mddev, sector_t num_sectors)
+static int update_size(struct mddev *mddev, sector_t num_sectors)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	int rv;
 	int fit = (num_sectors == 0);
 
@@ -5170,16 +6248,11 @@ static int update_size(mddev_t *mddev, sector_t num_sectors)
 	 * sb_start or, if that is <data_offset, it must fit before the size
 	 * of each device.  If num_sectors is zero, we find the largest size
 	 * that fits.
-
 	 */
 	if (mddev->sync_thread)
 		return -EBUSY;
-	if (mddev->bitmap)
-		/* Sorry, cannot grow a bitmap yet, just remove it,
-		 * grow, and re-add.
-		 */
-		return -EBUSY;
-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+
+	rdev_for_each(rdev, mddev) {
 		sector_t avail = rdev->sectors;
 
 		if (fit && (num_sectors == 0 || num_sectors > avail))
@@ -5193,20 +6266,39 @@ static int update_size(mddev_t *mddev, sector_t num_sectors)
 	return rv;
 }
 
-static int update_raid_disks(mddev_t *mddev, int raid_disks)
+static int update_raid_disks(struct mddev *mddev, int raid_disks)
 {
 	int rv;
+	struct md_rdev *rdev;
 	/* change the number of raid disks */
 	if (mddev->pers->check_reshape == NULL)
 		return -EINVAL;
 	if (raid_disks <= 0 ||
-	    raid_disks >= mddev->max_disks)
+	    (mddev->max_disks && raid_disks >= mddev->max_disks))
 		return -EINVAL;
 	if (mddev->sync_thread || mddev->reshape_position != MaxSector)
 		return -EBUSY;
+
+	rdev_for_each(rdev, mddev) {
+		if (mddev->raid_disks < raid_disks &&
+		    rdev->data_offset < rdev->new_data_offset)
+			return -EINVAL;
+		if (mddev->raid_disks > raid_disks &&
+		    rdev->data_offset > rdev->new_data_offset)
+			return -EINVAL;
+	}
+
 	mddev->delta_disks = raid_disks - mddev->raid_disks;
+	if (mddev->delta_disks < 0)
+		mddev->reshape_backwards = 1;
+	else if (mddev->delta_disks > 0)
+		mddev->reshape_backwards = 0;
 
 	rv = mddev->pers->check_reshape(mddev);
+	if (rv < 0) {
+		mddev->delta_disks = 0;
+		mddev->reshape_backwards = 0;
+	}
 	return rv;
 }
 
@@ -5219,14 +6311,14 @@ static int update_raid_disks(mddev_t *mddev, int raid_disks)
  * Any differences that cannot be handled will cause an error.
  * Normally, only one change can be managed at a time.
  */
-static int update_array_info(mddev_t *mddev, mdu_array_info_t *info)
+static int update_array_info(struct mddev *mddev, mdu_array_info_t *info)
 {
 	int rv = 0;
 	int cnt = 0;
 	int state = 0;
 
 	/* calculate expected state,ignoring low bits */
-	if (mddev->bitmap && mddev->bitmap_offset)
+	if (mddev->bitmap && mddev->bitmap_info.offset)
 		state |= (1 << MD_SB_BITMAP_PRESENT);
 
 	if (mddev->major_version != info->major_version ||
@@ -5285,11 +6377,16 @@ static int update_array_info(mddev_t *mddev, mdu_array_info_t *info)
 			/* add the bitmap */
 			if (mddev->bitmap)
 				return -EEXIST;
-			if (mddev->default_bitmap_offset == 0)
+			if (mddev->bitmap_info.default_offset == 0)
 				return -EINVAL;
-			mddev->bitmap_offset = mddev->default_bitmap_offset;
+			mddev->bitmap_info.offset =
+				mddev->bitmap_info.default_offset;
+			mddev->bitmap_info.space =
+				mddev->bitmap_info.default_space;
 			mddev->pers->quiesce(mddev, 1);
 			rv = bitmap_create(mddev);
+			if (!rv)
+				rv = bitmap_load(mddev);
 			if (rv)
 				bitmap_destroy(mddev);
 			mddev->pers->quiesce(mddev, 0);
@@ -5297,31 +6394,37 @@ static int update_array_info(mddev_t *mddev, mdu_array_info_t *info)
 			/* remove the bitmap */
 			if (!mddev->bitmap)
 				return -ENOENT;
-			if (mddev->bitmap->file)
+			if (mddev->bitmap->storage.file)
 				return -EINVAL;
 			mddev->pers->quiesce(mddev, 1);
 			bitmap_destroy(mddev);
 			mddev->pers->quiesce(mddev, 0);
-			mddev->bitmap_offset = 0;
+			mddev->bitmap_info.offset = 0;
 		}
 	}
 	md_update_sb(mddev, 1);
 	return rv;
 }
 
-static int set_disk_faulty(mddev_t *mddev, dev_t dev)
+static int set_disk_faulty(struct mddev *mddev, dev_t dev)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
+	int err = 0;
 
 	if (mddev->pers == NULL)
 		return -ENODEV;
 
-	rdev = find_rdev(mddev, dev);
+	rcu_read_lock();
+	rdev = find_rdev_rcu(mddev, dev);
 	if (!rdev)
-		return -ENODEV;
-
-	md_error(mddev, rdev);
-	return 0;
+		err =  -ENODEV;
+	else {
+		md_error(mddev, rdev);
+		if (!test_bit(Faulty, &rdev->flags))
+			err = -EBUSY;
+	}
+	rcu_read_unlock();
+	return err;
 }
 
 /*
@@ -5332,11 +6435,11 @@ static int set_disk_faulty(mddev_t *mddev, dev_t dev)
  */
 static int md_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 {
-	mddev_t *mddev = bdev->bd_disk->private_data;
+	struct mddev *mddev = bdev->bd_disk->private_data;
 
 	geo->heads = 2;
 	geo->sectors = 4;
-	geo->cylinders = get_capacity(mddev->gendisk) / 8;
+	geo->cylinders = mddev->array_sectors / 8;
 	return 0;
 }
 
@@ -5345,34 +6448,40 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
 {
 	int err = 0;
 	void __user *argp = (void __user *)arg;
-	mddev_t *mddev = NULL;
+	struct mddev *mddev = NULL;
 	int ro;
 
-	if (!capable(CAP_SYS_ADMIN))
-		return -EACCES;
+	switch (cmd) {
+	case RAID_VERSION:
+	case GET_ARRAY_INFO:
+	case GET_DISK_INFO:
+		break;
+	default:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EACCES;
+	}
 
 	/*
 	 * Commands dealing with the RAID driver but not any
 	 * particular array:
 	 */
-	switch (cmd)
-	{
-		case RAID_VERSION:
-			err = get_version(argp);
-			goto done;
+	switch (cmd) {
+	case RAID_VERSION:
+		err = get_version(argp);
+		goto done;
 
-		case PRINT_RAID_DEBUG:
-			err = 0;
-			md_print_devices();
-			goto done;
+	case PRINT_RAID_DEBUG:
+		err = 0;
+		md_print_devices();
+		goto done;
 
 #ifndef MODULE
-		case RAID_AUTORUN:
-			err = 0;
-			autostart_arrays(arg);
-			goto done;
+	case RAID_AUTORUN:
+		err = 0;
+		autostart_arrays(arg);
+		goto done;
 #endif
-		default:;
+	default:;
 	}
 
 	/*
@@ -5386,6 +6495,37 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
 		goto abort;
 	}
 
+	/* Some actions do not requires the mutex */
+	switch (cmd) {
+	case GET_ARRAY_INFO:
+		if (!mddev->raid_disks && !mddev->external)
+			err = -ENODEV;
+		else
+			err = get_array_info(mddev, argp);
+		goto abort;
+
+	case GET_DISK_INFO:
+		if (!mddev->raid_disks && !mddev->external)
+			err = -ENODEV;
+		else
+			err = get_disk_info(mddev, argp);
+		goto abort;
+
+	case SET_DISK_FAULTY:
+		err = set_disk_faulty(mddev, new_decode_dev(arg));
+		goto abort;
+	}
+
+	if (cmd == ADD_NEW_DISK)
+		/* need to ensure md_delayed_delete() has completed */
+		flush_workqueue(md_misc_wq);
+
+	if (cmd == HOT_REMOVE_DISK)
+		/* need to ensure recovery thread has run */
+		wait_event_interruptible_timeout(mddev->sb_wait,
+						 !test_bit(MD_RECOVERY_NEEDED,
+							   &mddev->flags),
+						 msecs_to_jiffies(5000));
 	err = mddev_lock(mddev);
 	if (err) {
 		printk(KERN_INFO 
@@ -5394,50 +6534,44 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
 		goto abort;
 	}
 
-	switch (cmd)
-	{
-		case SET_ARRAY_INFO:
-			{
-				mdu_array_info_t info;
-				if (!arg)
-					memset(&info, 0, sizeof(info));
-				else if (copy_from_user(&info, argp, sizeof(info))) {
-					err = -EFAULT;
-					goto abort_unlock;
-				}
-				if (mddev->pers) {
-					err = update_array_info(mddev, &info);
-					if (err) {
-						printk(KERN_WARNING "md: couldn't update"
-						       " array info. %d\n", err);
-						goto abort_unlock;
-					}
-					goto done_unlock;
-				}
-				if (!list_empty(&mddev->disks)) {
-					printk(KERN_WARNING
-					       "md: array %s already has disks!\n",
-					       mdname(mddev));
-					err = -EBUSY;
-					goto abort_unlock;
-				}
-				if (mddev->raid_disks) {
-					printk(KERN_WARNING
-					       "md: array %s already initialised!\n",
-					       mdname(mddev));
-					err = -EBUSY;
-					goto abort_unlock;
-				}
-				err = set_array_info(mddev, &info);
-				if (err) {
-					printk(KERN_WARNING "md: couldn't set"
-					       " array info. %d\n", err);
-					goto abort_unlock;
-				}
+	if (cmd == SET_ARRAY_INFO) {
+		mdu_array_info_t info;
+		if (!arg)
+			memset(&info, 0, sizeof(info));
+		else if (copy_from_user(&info, argp, sizeof(info))) {
+			err = -EFAULT;
+			goto abort_unlock;
+		}
+		if (mddev->pers) {
+			err = update_array_info(mddev, &info);
+			if (err) {
+				printk(KERN_WARNING "md: couldn't update"
+				       " array info. %d\n", err);
+				goto abort_unlock;
 			}
 			goto done_unlock;
-
-		default:;
+		}
+		if (!list_empty(&mddev->disks)) {
+			printk(KERN_WARNING
+			       "md: array %s already has disks!\n",
+			       mdname(mddev));
+			err = -EBUSY;
+			goto abort_unlock;
+		}
+		if (mddev->raid_disks) {
+			printk(KERN_WARNING
+			       "md: array %s already initialised!\n",
+			       mdname(mddev));
+			err = -EBUSY;
+			goto abort_unlock;
+		}
+		err = set_array_info(mddev, &info);
+		if (err) {
+			printk(KERN_WARNING "md: couldn't set"
+			       " array info. %d\n", err);
+			goto abort_unlock;
+		}
+		goto done_unlock;
 	}
 
 	/*
@@ -5456,60 +6590,73 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
 	/*
 	 * Commands even a read-only array can execute:
 	 */
-	switch (cmd)
-	{
-		case GET_ARRAY_INFO:
-			err = get_array_info(mddev, argp);
-			goto done_unlock;
+	switch (cmd) {
+	case GET_BITMAP_FILE:
+		err = get_bitmap_file(mddev, argp);
+		goto done_unlock;
 
-		case GET_BITMAP_FILE:
-			err = get_bitmap_file(mddev, argp);
-			goto done_unlock;
+	case RESTART_ARRAY_RW:
+		err = restart_array(mddev);
+		goto done_unlock;
 
-		case GET_DISK_INFO:
-			err = get_disk_info(mddev, argp);
-			goto done_unlock;
+	case STOP_ARRAY:
+		err = do_md_stop(mddev, 0, bdev);
+		goto done_unlock;
 
-		case RESTART_ARRAY_RW:
-			err = restart_array(mddev);
-			goto done_unlock;
+	case STOP_ARRAY_RO:
+		err = md_set_readonly(mddev, bdev);
+		goto done_unlock;
 
-		case STOP_ARRAY:
-			err = do_md_stop(mddev, 0, 1);
-			goto done_unlock;
+	case HOT_REMOVE_DISK:
+		err = hot_remove_disk(mddev, new_decode_dev(arg));
+		goto done_unlock;
 
-		case STOP_ARRAY_RO:
-			err = do_md_stop(mddev, 1, 1);
-			goto done_unlock;
-
-		case BLKROSET:
-			if (get_user(ro, (int __user *)(arg))) {
+	case ADD_NEW_DISK:
+		/* We can support ADD_NEW_DISK on read-only arrays
+		 * on if we are re-adding a preexisting device.
+		 * So require mddev->pers and MD_DISK_SYNC.
+		 */
+		if (mddev->pers) {
+			mdu_disk_info_t info;
+			if (copy_from_user(&info, argp, sizeof(info)))
 				err = -EFAULT;
-				goto done_unlock;
-			}
-			err = -EINVAL;
-
-			/* if the bdev is going readonly the value of mddev->ro
-			 * does not matter, no writes are coming
-			 */
-			if (ro)
-				goto done_unlock;
-
-			/* are we are already prepared for writes? */
-			if (mddev->ro != 1)
-				goto done_unlock;
-
-			/* transitioning to readauto need only happen for
-			 * arrays that call md_write_start
-			 */
-			if (mddev->pers) {
-				err = restart_array(mddev);
-				if (err == 0) {
-					mddev->ro = 2;
-					set_disk_ro(mddev->gendisk, 0);
-				}
-			}
+			else if (!(info.state & (1<<MD_DISK_SYNC)))
+				/* Need to clear read-only for this */
+				break;
+			else
+				err = add_new_disk(mddev, &info);
 			goto done_unlock;
+		}
+		break;
+
+	case BLKROSET:
+		if (get_user(ro, (int __user *)(arg))) {
+			err = -EFAULT;
+			goto done_unlock;
+		}
+		err = -EINVAL;
+
+		/* if the bdev is going readonly the value of mddev->ro
+		 * does not matter, no writes are coming
+		 */
+		if (ro)
+			goto done_unlock;
+
+		/* are we are already prepared for writes? */
+		if (mddev->ro != 1)
+			goto done_unlock;
+
+		/* transitioning to readauto need only happen for
+		 * arrays that call md_write_start
+		 */
+		if (mddev->pers) {
+			err = restart_array(mddev);
+			if (err == 0) {
+				mddev->ro = 2;
+				set_disk_ro(mddev->gendisk, 0);
+			}
+		}
+		goto done_unlock;
 	}
 
 	/*
@@ -5522,50 +6669,51 @@ static int md_ioctl(struct block_device *bdev, fmode_t mode,
 	if (_IOC_TYPE(cmd) == MD_MAJOR && mddev->ro && mddev->pers) {
 		if (mddev->ro == 2) {
 			mddev->ro = 0;
-			sysfs_notify_dirent(mddev->sysfs_state);
+			sysfs_notify_dirent_safe(mddev->sysfs_state);
 			set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-			md_wakeup_thread(mddev->thread);
+			/* mddev_unlock will wake thread */
+			/* If a device failed while we were read-only, we
+			 * need to make sure the metadata is updated now.
+			 */
+			if (test_bit(MD_CHANGE_DEVS, &mddev->flags)) {
+				mddev_unlock(mddev);
+				wait_event(mddev->sb_wait,
+					   !test_bit(MD_CHANGE_DEVS, &mddev->flags) &&
+					   !test_bit(MD_CHANGE_PENDING, &mddev->flags));
+				mddev_lock(mddev);
+			}
 		} else {
 			err = -EROFS;
 			goto abort_unlock;
 		}
 	}
 
-	switch (cmd)
+	switch (cmd) {
+	case ADD_NEW_DISK:
 	{
-		case ADD_NEW_DISK:
-		{
-			mdu_disk_info_t info;
-			if (copy_from_user(&info, argp, sizeof(info)))
-				err = -EFAULT;
-			else
-				err = add_new_disk(mddev, &info);
-			goto done_unlock;
-		}
+		mdu_disk_info_t info;
+		if (copy_from_user(&info, argp, sizeof(info)))
+			err = -EFAULT;
+		else
+			err = add_new_disk(mddev, &info);
+		goto done_unlock;
+	}
 
-		case HOT_REMOVE_DISK:
-			err = hot_remove_disk(mddev, new_decode_dev(arg));
-			goto done_unlock;
+	case HOT_ADD_DISK:
+		err = hot_add_disk(mddev, new_decode_dev(arg));
+		goto done_unlock;
 
-		case HOT_ADD_DISK:
-			err = hot_add_disk(mddev, new_decode_dev(arg));
-			goto done_unlock;
+	case RUN_ARRAY:
+		err = do_md_run(mddev);
+		goto done_unlock;
 
-		case SET_DISK_FAULTY:
-			err = set_disk_faulty(mddev, new_decode_dev(arg));
-			goto done_unlock;
+	case SET_BITMAP_FILE:
+		err = set_bitmap_file(mddev, (int)arg);
+		goto done_unlock;
 
-		case RUN_ARRAY:
-			err = do_md_run(mddev);
-			goto done_unlock;
-
-		case SET_BITMAP_FILE:
-			err = set_bitmap_file(mddev, (int)arg);
-			goto done_unlock;
-
-		default:
-			err = -EINVAL;
-			goto abort_unlock;
+	default:
+		err = -EINVAL;
+		goto abort_unlock;
 	}
 
 done_unlock:
@@ -5582,6 +6730,25 @@ done:
 abort:
 	return err;
 }
+#ifdef CONFIG_COMPAT
+static int md_compat_ioctl(struct block_device *bdev, fmode_t mode,
+		    unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case HOT_REMOVE_DISK:
+	case HOT_ADD_DISK:
+	case SET_DISK_FAULTY:
+	case SET_BITMAP_FILE:
+		/* These take in integer arg, do not convert */
+		break;
+	default:
+		arg = (unsigned long)compat_ptr(arg);
+		break;
+	}
+
+	return md_ioctl(bdev, mode, cmd, arg);
+}
+#endif /* CONFIG_COMPAT */
 
 static int md_open(struct block_device *bdev, fmode_t mode)
 {
@@ -5589,8 +6756,11 @@ static int md_open(struct block_device *bdev, fmode_t mode)
 	 * Succeed if we can lock the mddev, which confirms that
 	 * it isn't being stopped right now.
 	 */
-	mddev_t *mddev = mddev_find(bdev->bd_dev);
+	struct mddev *mddev = mddev_find(bdev->bd_dev);
 	int err;
+
+	if (!mddev)
+		return -ENODEV;
 
 	if (mddev->gendisk != bdev->bd_disk) {
 		/* we are racing with mddev_put which is discarding this
@@ -5598,7 +6768,7 @@ static int md_open(struct block_device *bdev, fmode_t mode)
 		 */
 		mddev_put(mddev);
 		/* Wait until bdev->bd_disk is definitely gone */
-		flush_scheduled_work();
+		flush_workqueue(md_misc_wq);
 		/* Then retry the open from the top */
 		return -ERESTARTSYS;
 	}
@@ -5618,7 +6788,7 @@ static int md_open(struct block_device *bdev, fmode_t mode)
 
 static int md_release(struct gendisk *disk, fmode_t mode)
 {
- 	mddev_t *mddev = disk->private_data;
+ 	struct mddev *mddev = disk->private_data;
 
 	BUG_ON(!mddev);
 	atomic_dec(&mddev->openers);
@@ -5629,14 +6799,14 @@ static int md_release(struct gendisk *disk, fmode_t mode)
 
 static int md_media_changed(struct gendisk *disk)
 {
-	mddev_t *mddev = disk->private_data;
+	struct mddev *mddev = disk->private_data;
 
 	return mddev->changed;
 }
 
 static int md_revalidate(struct gendisk *disk)
 {
-	mddev_t *mddev = disk->private_data;
+	struct mddev *mddev = disk->private_data;
 
 	mddev->changed = 0;
 	return 0;
@@ -5647,14 +6817,17 @@ static const struct block_device_operations md_fops =
 	.open		= md_open,
 	.release	= md_release,
 	.ioctl		= md_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= md_compat_ioctl,
+#endif
 	.getgeo		= md_getgeo,
-	.media_changed	= md_media_changed,
+	.media_changed  = md_media_changed,
 	.revalidate_disk= md_revalidate,
 };
 
 static int md_thread(void * arg)
 {
-	mdk_thread_t *thread = arg;
+	struct md_thread *thread = arg;
 
 	/*
 	 * md_thread is a 'system-thread', it's priority should be very
@@ -5686,28 +6859,28 @@ static int md_thread(void * arg)
 			 thread->timeout);
 
 		clear_bit(THREAD_WAKEUP, &thread->flags);
-
-		thread->run(thread->mddev);
+		if (!kthread_should_stop())
+			thread->run(thread);
 	}
 
 	return 0;
 }
 
-void md_wakeup_thread(mdk_thread_t *thread)
+void md_wakeup_thread(struct md_thread *thread)
 {
 	if (thread) {
-		dprintk("md: waking up MD thread %s.\n", thread->tsk->comm);
+		pr_debug("md: waking up MD thread %s.\n", thread->tsk->comm);
 		set_bit(THREAD_WAKEUP, &thread->flags);
 		wake_up(&thread->wqueue);
 	}
 }
 
-mdk_thread_t *md_register_thread(void (*run) (mddev_t *), mddev_t *mddev,
-				 const char *name)
+struct md_thread *md_register_thread(void (*run) (struct md_thread *),
+		struct mddev *mddev, const char *name)
 {
-	mdk_thread_t *thread;
+	struct md_thread *thread;
 
-	thread = kzalloc(sizeof(mdk_thread_t), GFP_KERNEL);
+	thread = kzalloc(sizeof(struct md_thread), GFP_KERNEL);
 	if (!thread)
 		return NULL;
 
@@ -5719,7 +6892,7 @@ mdk_thread_t *md_register_thread(void (*run) (mddev_t *), mddev_t *mddev,
 	thread->tsk = kthread_run(md_thread, thread,
 				  "%s_%s",
 				  mdname(thread->mddev),
-				  name ?: mddev->pers->name);
+				  name);
 	if (IS_ERR(thread->tsk)) {
 		kfree(thread);
 		return NULL;
@@ -5727,17 +6900,24 @@ mdk_thread_t *md_register_thread(void (*run) (mddev_t *), mddev_t *mddev,
 	return thread;
 }
 
-void md_unregister_thread(mdk_thread_t *thread)
+void md_unregister_thread(struct md_thread **threadp)
 {
+	struct md_thread *thread = *threadp;
 	if (!thread)
 		return;
-	dprintk("interrupting MD-thread pid %d\n", task_pid_nr(thread->tsk));
+	pr_debug("interrupting MD-thread pid %d\n", task_pid_nr(thread->tsk));
+	/* Locking ensures that mddev_unlock does not wake_up a
+	 * non-existent thread
+	 */
+	spin_lock(&pers_lock);
+	*threadp = NULL;
+	spin_unlock(&pers_lock);
 
 	kthread_stop(thread->tsk);
 	kfree(thread);
 }
 
-void md_error(mddev_t *mddev, mdk_rdev_t *rdev)
+void md_error(struct mddev *mddev, struct md_rdev *rdev)
 {
 	if (!mddev) {
 		MD_BUG();
@@ -5747,26 +6927,17 @@ void md_error(mddev_t *mddev, mdk_rdev_t *rdev)
 	if (!rdev || test_bit(Faulty, &rdev->flags))
 		return;
 
-	if (mddev->external)
-		set_bit(Blocked, &rdev->flags);
-/*
-	dprintk("md_error dev:%s, rdev:(%d:%d), (caller: %p,%p,%p,%p).\n",
-		mdname(mddev),
-		MAJOR(rdev->bdev->bd_dev), MINOR(rdev->bdev->bd_dev),
-		__builtin_return_address(0),__builtin_return_address(1),
-		__builtin_return_address(2),__builtin_return_address(3));
-*/
-	if (!mddev->pers)
-		return;
-	if (!mddev->pers->error_handler)
+	if (!mddev->pers || !mddev->pers->error_handler)
 		return;
 	mddev->pers->error_handler(mddev,rdev);
 	if (mddev->degraded)
 		set_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
-	set_bit(StateChanged, &rdev->flags);
+	sysfs_notify_dirent_safe(rdev->sysfs_state);
 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
 	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 	md_wakeup_thread(mddev->thread);
+	if (mddev->event_work.func)
+		queue_work(md_misc_wq, &mddev->event_work);
 	md_new_event_inintr(mddev);
 }
 
@@ -5775,7 +6946,7 @@ void md_error(mddev_t *mddev, mdk_rdev_t *rdev)
 static void status_unused(struct seq_file *seq)
 {
 	int i = 0;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 
 	seq_printf(seq, "unused devices: ");
 
@@ -5792,7 +6963,7 @@ static void status_unused(struct seq_file *seq)
 }
 
 
-static void status_resync(struct seq_file *seq, mddev_t * mddev)
+static void status_resync(struct seq_file *seq, struct mddev * mddev)
 {
 	sector_t max_sectors, resync, res;
 	unsigned long dt, db;
@@ -5800,9 +6971,14 @@ static void status_resync(struct seq_file *seq, mddev_t * mddev)
 	int scale;
 	unsigned int per_milli;
 
-	resync = mddev->curr_resync - atomic_read(&mddev->recovery_active);
+	if (mddev->curr_resync <= 3)
+		resync = 0;
+	else
+		resync = mddev->curr_resync
+			- atomic_read(&mddev->recovery_active);
 
-	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery))
+	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) ||
+	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		max_sectors = mddev->resync_max_sectors;
 	else
 		max_sectors = mddev->dev_sectors;
@@ -5883,7 +7059,7 @@ static void *md_seq_start(struct seq_file *seq, loff_t *pos)
 {
 	struct list_head *tmp;
 	loff_t l = *pos;
-	mddev_t *mddev;
+	struct mddev *mddev;
 
 	if (l >= 0x10000)
 		return NULL;
@@ -5894,7 +7070,7 @@ static void *md_seq_start(struct seq_file *seq, loff_t *pos)
 	spin_lock(&all_mddevs_lock);
 	list_for_each(tmp,&all_mddevs)
 		if (!l--) {
-			mddev = list_entry(tmp, mddev_t, all_mddevs);
+			mddev = list_entry(tmp, struct mddev, all_mddevs);
 			mddev_get(mddev);
 			spin_unlock(&all_mddevs_lock);
 			return mddev;
@@ -5908,7 +7084,7 @@ static void *md_seq_start(struct seq_file *seq, loff_t *pos)
 static void *md_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	struct list_head *tmp;
-	mddev_t *next_mddev, *mddev = v;
+	struct mddev *next_mddev, *mddev = v;
 	
 	++*pos;
 	if (v == (void*)2)
@@ -5920,7 +7096,7 @@ static void *md_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 	else
 		tmp = mddev->all_mddevs.next;
 	if (tmp != &all_mddevs)
-		next_mddev = mddev_get(list_entry(tmp,mddev_t,all_mddevs));
+		next_mddev = mddev_get(list_entry(tmp,struct mddev,all_mddevs));
 	else {
 		next_mddev = (void*)2;
 		*pos = 0x10000;
@@ -5935,7 +7111,7 @@ static void *md_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 
 static void md_seq_stop(struct seq_file *seq, void *v)
 {
-	mddev_t *mddev = v;
+	struct mddev *mddev = v;
 
 	if (mddev && v != (void*)1 && v != (void*)2)
 		mddev_put(mddev);
@@ -5947,14 +7123,13 @@ struct mdstat_info {
 
 static int md_seq_show(struct seq_file *seq, void *v)
 {
-	mddev_t *mddev = v;
+	struct mddev *mddev = v;
 	sector_t sectors;
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	struct mdstat_info *mi = seq->private;
-	struct bitmap *bitmap;
 
 	if (v == (void*)1) {
-		struct mdk_personality *pers;
+		struct md_personality *pers;
 		seq_printf(seq, "Personalities : ");
 		spin_lock(&pers_lock);
 		list_for_each_entry(pers, &pers_list, list)
@@ -5985,7 +7160,7 @@ static int md_seq_show(struct seq_file *seq, void *v)
 		}
 
 		sectors = 0;
-		list_for_each_entry(rdev, &mddev->disks, same_set) {
+		rdev_for_each(rdev, mddev) {
 			char b[BDEVNAME_SIZE];
 			seq_printf(seq, " %s[%d]",
 				bdevname(rdev->bdev,b), rdev->desc_nr);
@@ -5994,8 +7169,11 @@ static int md_seq_show(struct seq_file *seq, void *v)
 			if (test_bit(Faulty, &rdev->flags)) {
 				seq_printf(seq, "(F)");
 				continue;
-			} else if (rdev->raid_disk < 0)
+			}
+			if (rdev->raid_disk < 0)
 				seq_printf(seq, "(S)"); /* spare */
+			if (test_bit(Replacement, &rdev->flags))
+				seq_printf(seq, "(R)");
 			sectors += rdev->sectors;
 		}
 
@@ -6028,7 +7206,7 @@ static int md_seq_show(struct seq_file *seq, void *v)
 				if (mddev->curr_resync > 2) {
 					status_resync(seq, mddev);
 					seq_printf(seq, "\n      ");
-				} else if (mddev->curr_resync == 1 || mddev->curr_resync == 2)
+				} else if (mddev->curr_resync >= 1)
 					seq_printf(seq, "\tresync=DELAYED\n      ");
 				else if (mddev->recovery_cp < MaxSector)
 					seq_printf(seq, "\tresync=PENDING\n      ");
@@ -6036,27 +7214,7 @@ static int md_seq_show(struct seq_file *seq, void *v)
 		} else
 			seq_printf(seq, "\n       ");
 
-		if ((bitmap = mddev->bitmap)) {
-			unsigned long chunk_kb;
-			unsigned long flags;
-			spin_lock_irqsave(&bitmap->lock, flags);
-			chunk_kb = bitmap->chunksize >> 10;
-			seq_printf(seq, "bitmap: %lu/%lu pages [%luKB], "
-				"%lu%s chunk",
-				bitmap->pages - bitmap->missing_pages,
-				bitmap->pages,
-				(bitmap->pages - bitmap->missing_pages)
-					<< (PAGE_SHIFT - 10),
-				chunk_kb ? chunk_kb : bitmap->chunksize,
-				chunk_kb ? "KB" : "B");
-			if (bitmap->file) {
-				seq_printf(seq, ", file: ");
-				seq_path(seq, &bitmap->file->f_path, " \t\n");
-			}
-
-			seq_printf(seq, "\n");
-			spin_unlock_irqrestore(&bitmap->lock, flags);
-		}
+		bitmap_status(seq, mddev->bitmap);
 
 		seq_printf(seq, "\n");
 	}
@@ -6115,7 +7273,7 @@ static const struct file_operations md_seq_fops = {
 	.poll		= mdstat_poll,
 };
 
-int register_md_personality(struct mdk_personality *p)
+int register_md_personality(struct md_personality *p)
 {
 	spin_lock(&pers_lock);
 	list_add_tail(&p->list, &pers_list);
@@ -6124,7 +7282,7 @@ int register_md_personality(struct mdk_personality *p)
 	return 0;
 }
 
-int unregister_md_personality(struct mdk_personality *p)
+int unregister_md_personality(struct md_personality *p)
 {
 	printk(KERN_INFO "md: %s personality unregistered\n", p->name);
 	spin_lock(&pers_lock);
@@ -6133,9 +7291,9 @@ int unregister_md_personality(struct mdk_personality *p)
 	return 0;
 }
 
-static int is_mddev_idle(mddev_t *mddev, int init)
+static int is_mddev_idle(struct mddev *mddev, int init)
 {
-	mdk_rdev_t * rdev;
+	struct md_rdev * rdev;
 	int idle;
 	int curr_events;
 
@@ -6177,13 +7335,14 @@ static int is_mddev_idle(mddev_t *mddev, int init)
 	return idle;
 }
 
-void md_done_sync(mddev_t *mddev, int blocks, int ok)
+void md_done_sync(struct mddev *mddev, int blocks, int ok)
 {
 	/* another "blocks" (512byte) blocks have been synced */
 	atomic_sub(blocks, &mddev->recovery_active);
 	wake_up(&mddev->recovery_wait);
 	if (!ok) {
 		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+		set_bit(MD_RECOVERY_ERROR, &mddev->recovery);
 		md_wakeup_thread(mddev->thread);
 		// stop recovery, signal do_sync ....
 	}
@@ -6195,7 +7354,7 @@ void md_done_sync(mddev_t *mddev, int blocks, int ok)
  * in superblock) before writing, schedule a superblock update
  * and wait for it to complete.
  */
-void md_write_start(mddev_t *mddev, struct bio *bi)
+void md_write_start(struct mddev *mddev, struct bio *bi)
 {
 	int did_change = 0;
 	if (bio_data_dir(bi) != WRITE)
@@ -6218,19 +7377,19 @@ void md_write_start(mddev_t *mddev, struct bio *bi)
 		if (mddev->in_sync) {
 			mddev->in_sync = 0;
 			set_bit(MD_CHANGE_CLEAN, &mddev->flags);
+			set_bit(MD_CHANGE_PENDING, &mddev->flags);
 			md_wakeup_thread(mddev->thread);
 			did_change = 1;
 		}
 		spin_unlock_irq(&mddev->write_lock);
 	}
 	if (did_change)
-		sysfs_notify_dirent(mddev->sysfs_state);
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
 	wait_event(mddev->sb_wait,
-		   !test_bit(MD_CHANGE_CLEAN, &mddev->flags) &&
 		   !test_bit(MD_CHANGE_PENDING, &mddev->flags));
 }
 
-void md_write_end(mddev_t *mddev)
+void md_write_end(struct mddev *mddev)
 {
 	if (atomic_dec_and_test(&mddev->writes_pending)) {
 		if (mddev->safemode == 2)
@@ -6249,7 +7408,7 @@ void md_write_end(mddev_t *mddev)
  * In the ->external case MD_CHANGE_CLEAN can not be cleared until mddev->lock
  * is dropped, so return -EAGAIN after notifying userspace.
  */
-int md_allow_write(mddev_t *mddev)
+int md_allow_write(struct mddev *mddev)
 {
 	if (!mddev->pers)
 		return 0;
@@ -6262,38 +7421,50 @@ int md_allow_write(mddev_t *mddev)
 	if (mddev->in_sync) {
 		mddev->in_sync = 0;
 		set_bit(MD_CHANGE_CLEAN, &mddev->flags);
+		set_bit(MD_CHANGE_PENDING, &mddev->flags);
 		if (mddev->safemode_delay &&
 		    mddev->safemode == 0)
 			mddev->safemode = 1;
 		spin_unlock_irq(&mddev->write_lock);
 		md_update_sb(mddev, 0);
-		sysfs_notify_dirent(mddev->sysfs_state);
+		sysfs_notify_dirent_safe(mddev->sysfs_state);
 	} else
 		spin_unlock_irq(&mddev->write_lock);
 
-	if (test_bit(MD_CHANGE_CLEAN, &mddev->flags))
+	if (test_bit(MD_CHANGE_PENDING, &mddev->flags))
 		return -EAGAIN;
 	else
 		return 0;
 }
 EXPORT_SYMBOL_GPL(md_allow_write);
 
+void md_unplug(struct mddev *mddev)
+{
+	if (mddev->queue)
+		blk_unplug(mddev->queue);
+	if (mddev->plug)
+		mddev->plug->unplug_fn(mddev->plug);
+}
+
 #define SYNC_MARKS	10
 #define	SYNC_MARK_STEP	(3*HZ)
-void md_do_sync(mddev_t *mddev)
+#define UPDATE_FREQUENCY (5*60*HZ)
+void md_do_sync(struct md_thread *thread)
 {
-	mddev_t *mddev2;
+	struct mddev *mddev = thread->mddev;
+	struct mddev *mddev2;
 	unsigned int currspeed = 0,
 		 window;
 	sector_t max_sectors,j, io_sectors;
 	unsigned long mark[SYNC_MARKS];
+	unsigned long update_time;
 	sector_t mark_cnt[SYNC_MARKS];
 	int last_mark,m;
 	struct list_head *tmp;
 	sector_t last_check;
 	int skipped = 0;
-	mdk_rdev_t *rdev;
-	char *desc;
+	struct md_rdev *rdev;
+	char *desc, *action = NULL;
 
 	/* just incase thread restarts... */
 	if (test_bit(MD_RECOVERY_DONE, &mddev->recovery))
@@ -6302,16 +7473,20 @@ void md_do_sync(mddev_t *mddev)
 		return;
 
 	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery)) {
-		if (test_bit(MD_RECOVERY_CHECK, &mddev->recovery))
+		if (test_bit(MD_RECOVERY_CHECK, &mddev->recovery)) {
 			desc = "data-check";
-		else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+			action = "check";
+		} else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
 			desc = "requested-resync";
-		else
+			action = "repair";
+		} else
 			desc = "resync";
 	} else if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		desc = "reshape";
 	else
 		desc = "recovery";
+
+	mddev->last_sync_action = action ?: desc;
 
 	/* we overload curr_resync somewhat here.
 	 * 0 == not engaged in resync at all
@@ -6333,10 +7508,11 @@ void md_do_sync(mddev_t *mddev)
 		mddev->curr_resync = 2;
 
 	try_again:
-		if (kthread_should_stop()) {
+		if (kthread_should_stop())
 			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+
+		if (test_bit(MD_RECOVERY_INTR, &mddev->recovery))
 			goto skip;
-		}
 		for_each_mddev(mddev2, tmp) {
 			if (mddev2 == mddev)
 				continue;
@@ -6383,7 +7559,7 @@ void md_do_sync(mddev_t *mddev)
 		 * which defaults to physical size, but can be virtual size
 		 */
 		max_sectors = mddev->resync_max_sectors;
-		mddev->resync_mismatches = 0;
+		atomic64_set(&mddev->resync_mismatches, 0);
 		/* we don't use the checkpoint if there's a bitmap */
 		if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
 			j = mddev->resync_min;
@@ -6391,17 +7567,19 @@ void md_do_sync(mddev_t *mddev)
 			j = mddev->recovery_cp;
 
 	} else if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
-		max_sectors = mddev->dev_sectors;
+		max_sectors = mddev->resync_max_sectors;
 	else {
 		/* recovery follows the physical size of devices */
 		max_sectors = mddev->dev_sectors;
 		j = MaxSector;
-		list_for_each_entry(rdev, &mddev->disks, same_set)
+		rcu_read_lock();
+		rdev_for_each_rcu(rdev, mddev)
 			if (rdev->raid_disk >= 0 &&
 			    !test_bit(Faulty, &rdev->flags) &&
 			    !test_bit(In_sync, &rdev->flags) &&
 			    rdev->recovery_offset < j)
 				j = rdev->recovery_offset;
+		rcu_read_unlock();
 	}
 
 	printk(KERN_INFO "md: %s of RAID array %s\n", desc, mdname(mddev));
@@ -6426,8 +7604,8 @@ void md_do_sync(mddev_t *mddev)
 	 * Tune reconstruction:
 	 */
 	window = 32*(PAGE_SIZE/512);
-	printk(KERN_INFO "md: using %dk window, over a total of %llu blocks.\n",
-		window/2,(unsigned long long) max_sectors/2);
+	printk(KERN_INFO "md: using %dk window, over a total of %lluk.\n",
+		window/2, (unsigned long long)max_sectors/2);
 
 	atomic_set(&mddev->recovery_active, 0);
 	last_check = 0;
@@ -6437,7 +7615,12 @@ void md_do_sync(mddev_t *mddev)
 		       "md: resuming %s of %s from checkpoint.\n",
 		       desc, mdname(mddev));
 		mddev->curr_resync = j;
-	}
+	} else
+		mddev->curr_resync = 3; /* no longer delayed */
+	mddev->curr_resync_completed = j;
+	sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+	md_new_event(mddev);
+	update_time = jiffies;
 
 	while (j < max_sectors) {
 		sector_t sectors;
@@ -6448,15 +7631,19 @@ void md_do_sync(mddev_t *mddev)
 		    ((mddev->curr_resync > mddev->curr_resync_completed &&
 		      (mddev->curr_resync - mddev->curr_resync_completed)
 		      > (max_sectors >> 4)) ||
+		     time_after_eq(jiffies, update_time + UPDATE_FREQUENCY) ||
 		     (j - mddev->curr_resync_completed)*2
 		     >= mddev->resync_max - mddev->curr_resync_completed
 			    )) {
 			/* time to update curr_resync_completed */
-			blk_unplug(mddev->queue);
+			md_unplug(mddev);
 			wait_event(mddev->recovery_wait,
 				   atomic_read(&mddev->recovery_active) == 0);
-			mddev->curr_resync_completed =
-				mddev->curr_resync;
+			mddev->curr_resync_completed = j;
+			if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
+			    j > mddev->recovery_cp)
+				mddev->recovery_cp = j;
+			update_time = jiffies;
 			set_bit(MD_CHANGE_CLEAN, &mddev->flags);
 			sysfs_notify(&mddev->kobj, NULL, "sync_completed");
 		}
@@ -6487,11 +7674,15 @@ void md_do_sync(mddev_t *mddev)
 			atomic_add(sectors, &mddev->recovery_active);
 		}
 
+		if (test_bit(MD_RECOVERY_INTR, &mddev->recovery))
+			break;
+
 		j += sectors;
-		if (j>1) mddev->curr_resync = j;
+		if (j > 2)
+			mddev->curr_resync = j;
 		mddev->curr_mark_cnt = io_sectors;
 		if (last_check == 0)
-			/* this is the earliers that rebuilt will be
+			/* this is the earliest that rebuild will be
 			 * visible in /proc/mdstat
 			 */
 			md_new_event(mddev);
@@ -6500,10 +7691,6 @@ void md_do_sync(mddev_t *mddev)
 			continue;
 
 		last_check = io_sectors;
-
-		if (test_bit(MD_RECOVERY_INTR, &mddev->recovery))
-			break;
-
 	repeat:
 		if (time_after_eq(jiffies, mark[last_mark] + SYNC_MARK_STEP )) {
 			/* step marks */
@@ -6529,7 +7716,7 @@ void md_do_sync(mddev_t *mddev)
 		 * about not overloading the IO subsystem. (things like an
 		 * e2fsck being done on the RAID array should execute fast)
 		 */
-		blk_unplug(mddev->queue);
+		md_unplug(mddev);
 		cond_resched();
 
 		currspeed = ((unsigned long)(io_sectors-mddev->resync_mark_cnt))/2
@@ -6548,7 +7735,7 @@ void md_do_sync(mddev_t *mddev)
 	 * this also signals 'finished resyncing' to md_stop
 	 */
  out:
-	blk_unplug(mddev->queue);
+	md_unplug(mddev);
 
 	wait_event(mddev->recovery_wait, !atomic_read(&mddev->recovery_active));
 
@@ -6563,30 +7750,41 @@ void md_do_sync(mddev_t *mddev)
 					printk(KERN_INFO
 					       "md: checkpointing %s of %s.\n",
 					       desc, mdname(mddev));
-					mddev->recovery_cp = mddev->curr_resync;
+					if (test_bit(MD_RECOVERY_ERROR,
+						&mddev->recovery))
+						mddev->recovery_cp =
+							mddev->curr_resync_completed;
+					else
+						mddev->recovery_cp =
+							mddev->curr_resync;
 				}
 			} else
 				mddev->recovery_cp = MaxSector;
 		} else {
 			if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery))
 				mddev->curr_resync = MaxSector;
-			list_for_each_entry(rdev, &mddev->disks, same_set)
+			rcu_read_lock();
+			rdev_for_each_rcu(rdev, mddev)
 				if (rdev->raid_disk >= 0 &&
+				    mddev->delta_disks >= 0 &&
 				    !test_bit(Faulty, &rdev->flags) &&
 				    !test_bit(In_sync, &rdev->flags) &&
 				    rdev->recovery_offset < mddev->curr_resync)
 					rdev->recovery_offset = mddev->curr_resync;
+			rcu_read_unlock();
 		}
 	}
+ skip:
 	set_bit(MD_CHANGE_DEVS, &mddev->flags);
 
- skip:
-	mddev->curr_resync = 0;
-	mddev->curr_resync_completed = 0;
-	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery))
-		/* We completed so max setting can be forgotten. */
+	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+		/* We completed so min/max setting can be forgotten if used. */
+		if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+			mddev->resync_min = 0;
 		mddev->resync_max = MaxSector;
-	sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+	} else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+		mddev->resync_min = mddev->curr_resync_completed;
+	mddev->curr_resync = 0;
 	wake_up(&resync_wait);
 	set_bit(MD_RECOVERY_DONE, &mddev->recovery);
 	md_wakeup_thread(mddev->thread);
@@ -6604,58 +7802,62 @@ void md_do_sync(mddev_t *mddev)
 }
 EXPORT_SYMBOL_GPL(md_do_sync);
 
-
-static int remove_and_add_spares(mddev_t *mddev)
+static int remove_and_add_spares(struct mddev *mddev,
+				 struct md_rdev *this)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	int spares = 0;
+	int removed = 0;
 
-	mddev->curr_resync_completed = 0;
-
-	list_for_each_entry(rdev, &mddev->disks, same_set)
-		if (rdev->raid_disk >= 0 &&
+	rdev_for_each(rdev, mddev)
+		if ((this == NULL || rdev == this) &&
+		    rdev->raid_disk >= 0 &&
 		    !test_bit(Blocked, &rdev->flags) &&
 		    (test_bit(Faulty, &rdev->flags) ||
 		     ! test_bit(In_sync, &rdev->flags)) &&
 		    atomic_read(&rdev->nr_pending)==0) {
 			if (mddev->pers->hot_remove_disk(
-				    mddev, rdev->raid_disk)==0) {
-				char nm[20];
-				sprintf(nm,"rd%d", rdev->raid_disk);
-				sysfs_remove_link(&mddev->kobj, nm);
+				    mddev, rdev) == 0) {
+				sysfs_unlink_rdev(mddev, rdev);
 				rdev->raid_disk = -1;
+				removed++;
 			}
 		}
+	if (removed && mddev->kobj.sd)
+		sysfs_notify(&mddev->kobj, NULL, "degraded");
 
-	if (mddev->degraded && ! mddev->ro && !mddev->recovery_disabled) {
-		list_for_each_entry(rdev, &mddev->disks, same_set) {
-			if (rdev->raid_disk >= 0 &&
-			    !test_bit(In_sync, &rdev->flags) &&
-			    !test_bit(Faulty, &rdev->flags) &&
-			    !test_bit(Blocked, &rdev->flags))
-				spares++;
-			if (rdev->raid_disk < 0
-			    && !test_bit(Faulty, &rdev->flags)) {
-				rdev->recovery_offset = 0;
-				if (mddev->pers->
-				    hot_add_disk(mddev, rdev) == 0) {
-					char nm[20];
-					sprintf(nm, "rd%d", rdev->raid_disk);
-					if (sysfs_create_link(&mddev->kobj,
-							      &rdev->kobj, nm))
-						printk(KERN_WARNING
-						       "md: cannot register "
-						       "%s for %s\n",
-						       nm, mdname(mddev));
-					spares++;
-					md_new_event(mddev);
-				} else
-					break;
-			}
+	if (this)
+		goto no_add;
+
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk >= 0 &&
+		    !test_bit(In_sync, &rdev->flags) &&
+		    !test_bit(Faulty, &rdev->flags))
+			spares++;
+		if (rdev->raid_disk >= 0)
+			continue;
+		if (test_bit(Faulty, &rdev->flags))
+			continue;
+		if (mddev->ro &&
+		    rdev->saved_raid_disk < 0)
+			continue;
+
+		rdev->recovery_offset = 0;
+		if (mddev->pers->
+		    hot_add_disk(mddev, rdev) == 0) {
+			if (sysfs_link_rdev(mddev, rdev))
+				/* failure here is OK */;
+			spares++;
+			md_new_event(mddev);
+			set_bit(MD_CHANGE_DEVS, &mddev->flags);
 		}
 	}
+no_add:
+	if (removed)
+		set_bit(MD_CHANGE_DEVS, &mddev->flags);
 	return spares;
 }
+
 /*
  * This routine is regularly called by all per-raid-array threads to
  * deal with generic issues like resync and super-block update.
@@ -6678,16 +7880,13 @@ static int remove_and_add_spares(mddev_t *mddev)
  *  5/ If array is degraded, try to add spares devices
  *  6/ If array has spares or is not in-sync, start a resync thread.
  */
-void md_check_recovery(mddev_t *mddev)
+void md_check_recovery(struct mddev *mddev)
 {
-	mdk_rdev_t *rdev;
-
+	if (mddev->suspended)
+		return;
 
 	if (mddev->bitmap)
 		bitmap_daemon_work(mddev);
-
-	if (mddev->ro)
-		return;
 
 	if (signal_pending(current)) {
 		if (mddev->pers->sync_request && !mddev->external) {
@@ -6701,7 +7900,7 @@ void md_check_recovery(mddev_t *mddev)
 	if (mddev->ro && !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))
 		return;
 	if ( ! (
-		(mddev->flags && !mddev->external) ||
+		(mddev->flags & ~ (1<<MD_CHANGE_PENDING)) ||
 		test_bit(MD_RECOVERY_NEEDED, &mddev->recovery) ||
 		test_bit(MD_RECOVERY_DONE, &mddev->recovery) ||
 		(mddev->external == 0 && mddev->safemode == 1) ||
@@ -6714,11 +7913,16 @@ void md_check_recovery(mddev_t *mddev)
 		int spares = 0;
 
 		if (mddev->ro) {
-			/* Only thing we do on a ro array is remove
-			 * failed devices.
+			/* On a read-only array we can:
+			 * - remove failed devices
+			 * - add already-in_sync devices if the array itself
+			 *   is in-sync.
+			 * As we only add devices that are already in-sync,
+			 * we can activate the spares immediately.
 			 */
-			remove_and_add_spares(mddev);
 			clear_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+			remove_and_add_spares(mddev, NULL);
+			mddev->pers->spare_active(mddev);
 			goto unlock;
 		}
 
@@ -6731,23 +7935,17 @@ void md_check_recovery(mddev_t *mddev)
 			    mddev->recovery_cp == MaxSector) {
 				mddev->in_sync = 1;
 				did_change = 1;
-				if (mddev->persistent)
-					set_bit(MD_CHANGE_CLEAN, &mddev->flags);
+				set_bit(MD_CHANGE_CLEAN, &mddev->flags);
 			}
 			if (mddev->safemode == 1)
 				mddev->safemode = 0;
 			spin_unlock_irq(&mddev->write_lock);
 			if (did_change)
-				sysfs_notify_dirent(mddev->sysfs_state);
+				sysfs_notify_dirent_safe(mddev->sysfs_state);
 		}
 
 		if (mddev->flags)
 			md_update_sb(mddev, 0);
-
-		list_for_each_entry(rdev, &mddev->disks, same_set)
-			if (test_and_clear_bit(StateChanged, &rdev->flags))
-				sysfs_notify_dirent(rdev->sysfs_state);
-
 
 		if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
 		    !test_bit(MD_RECOVERY_DONE, &mddev->recovery)) {
@@ -6756,53 +7954,27 @@ void md_check_recovery(mddev_t *mddev)
 			goto unlock;
 		}
 		if (mddev->sync_thread) {
-			/* resync has finished, collect result */
-			md_unregister_thread(mddev->sync_thread);
-			mddev->sync_thread = NULL;
-			if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
-			    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
-				/* success...*/
-				/* activate any spares */
-				if (mddev->pers->spare_active(mddev))
-					sysfs_notify(&mddev->kobj, NULL,
-						     "degraded");
-			}
-			if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
-			    mddev->pers->finish_reshape)
-				mddev->pers->finish_reshape(mddev);
-			md_update_sb(mddev, 1);
-
-			/* if array is no-longer degraded, then any saved_raid_disk
-			 * information must be scrapped
-			 */
-			if (!mddev->degraded)
-				list_for_each_entry(rdev, &mddev->disks, same_set)
-					rdev->saved_raid_disk = -1;
-
-			mddev->recovery = 0;
-			/* flag recovery needed just to double check */
-			set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
-			sysfs_notify_dirent(mddev->sysfs_action);
-			md_new_event(mddev);
+			md_reap_sync_thread(mddev);
 			goto unlock;
 		}
 		/* Set RUNNING before clearing NEEDED to avoid
 		 * any transients in the value of "sync_action".
 		 */
+		mddev->curr_resync_completed = 0;
 		set_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
-		clear_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
 		/* Clear some bits that don't mean anything, but
 		 * might be left set
 		 */
 		clear_bit(MD_RECOVERY_INTR, &mddev->recovery);
 		clear_bit(MD_RECOVERY_DONE, &mddev->recovery);
 
-		if (test_bit(MD_RECOVERY_FROZEN, &mddev->recovery))
+		if (!test_and_clear_bit(MD_RECOVERY_NEEDED, &mddev->recovery) ||
+		    test_bit(MD_RECOVERY_FROZEN, &mddev->recovery))
 			goto unlock;
 		/* no recovery is running.
 		 * remove any failed drives, then
 		 * add spares if possible.
-		 * Spare are also removed and re-added, to allow
+		 * Spares are also removed and re-added, to allow
 		 * the personality to fail the re-add.
 		 */
 
@@ -6813,7 +7985,7 @@ void md_check_recovery(mddev_t *mddev)
 				goto unlock;
 			set_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
 			clear_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
-		} else if ((spares = remove_and_add_spares(mddev))) {
+		} else if ((spares = remove_and_add_spares(mddev, NULL))) {
 			clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
 			clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
 			clear_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
@@ -6826,7 +7998,7 @@ void md_check_recovery(mddev_t *mddev)
 			goto unlock;
 
 		if (mddev->pers->sync_request) {
-			if (spares && mddev->bitmap && ! mddev->bitmap->file) {
+			if (spares) {
 				/* We are adding a device or devices to an array
 				 * which has the bitmap stored on all devices.
 				 * So make sure all bitmap pages get written
@@ -6841,61 +8013,622 @@ void md_check_recovery(mddev_t *mddev)
 					" thread...\n", 
 					mdname(mddev));
 				/* leave the spares where they are, it shouldn't hurt */
-				mddev->recovery = 0;
+				clear_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+				clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+				clear_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+				clear_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+				clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
 			} else
 				md_wakeup_thread(mddev->sync_thread);
-			sysfs_notify_dirent(mddev->sysfs_action);
+			sysfs_notify_dirent_safe(mddev->sysfs_action);
 			md_new_event(mddev);
 		}
 	unlock:
+		wake_up(&mddev->sb_wait);
+
 		if (!mddev->sync_thread) {
 			clear_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
 			if (test_and_clear_bit(MD_RECOVERY_RECOVER,
 					       &mddev->recovery))
 				if (mddev->sysfs_action)
-					sysfs_notify_dirent(mddev->sysfs_action);
+					sysfs_notify_dirent_safe(mddev->sysfs_action);
 		}
 		mddev_unlock(mddev);
 	}
 }
 
-void md_wait_for_blocked_rdev(mdk_rdev_t *rdev, mddev_t *mddev)
+void md_reap_sync_thread(struct mddev *mddev)
 {
-	sysfs_notify_dirent(rdev->sysfs_state);
+	struct md_rdev *rdev;
+
+	/* resync has finished, collect result */
+	md_unregister_thread(&mddev->sync_thread);
+	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+		/* success...*/
+		/* activate any spares */
+		if (mddev->pers->spare_active(mddev)) {
+			sysfs_notify(&mddev->kobj, NULL,
+				     "degraded");
+			set_bit(MD_CHANGE_DEVS, &mddev->flags);
+		}
+	}
+	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+	    mddev->pers->finish_reshape)
+		mddev->pers->finish_reshape(mddev);
+
+	/* If array is no-longer degraded, then any saved_raid_disk
+	 * information must be scrapped.  Also if any device is now
+	 * In_sync we must scrape the saved_raid_disk for that device
+	 * do the superblock for an incrementally recovered device
+	 * written out.
+	 */
+	rdev_for_each(rdev, mddev)
+		if (!mddev->degraded ||
+		    test_bit(In_sync, &rdev->flags))
+			rdev->saved_raid_disk = -1;
+
+	md_update_sb(mddev, 1);
+	clear_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+	clear_bit(MD_RECOVERY_RESHAPE, &mddev->recovery);
+	clear_bit(MD_RECOVERY_REQUESTED, &mddev->recovery);
+	clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
+	/* flag recovery needed just to double check */
+	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	sysfs_notify_dirent_safe(mddev->sysfs_action);
+	md_new_event(mddev);
+	if (mddev->event_work.func)
+		queue_work(md_misc_wq, &mddev->event_work);
+}
+
+void md_wait_for_blocked_rdev(struct md_rdev *rdev, struct mddev *mddev)
+{
+	sysfs_notify_dirent_safe(rdev->sysfs_state);
 	wait_event_timeout(rdev->blocked_wait,
-			   !test_bit(Blocked, &rdev->flags),
+			   !test_bit(Blocked, &rdev->flags) &&
+			   !test_bit(BlockedBadBlocks, &rdev->flags),
 			   msecs_to_jiffies(5000));
 	rdev_dec_pending(rdev, mddev);
 }
 EXPORT_SYMBOL(md_wait_for_blocked_rdev);
 
+void md_finish_reshape(struct mddev *mddev)
+{
+	/* called be personality module when reshape completes. */
+	struct md_rdev *rdev;
+
+	rdev_for_each(rdev, mddev) {
+		if (rdev->data_offset > rdev->new_data_offset)
+			rdev->sectors += rdev->data_offset - rdev->new_data_offset;
+		else
+			rdev->sectors -= rdev->new_data_offset - rdev->data_offset;
+		rdev->data_offset = rdev->new_data_offset;
+	}
+}
+EXPORT_SYMBOL(md_finish_reshape);
+
+/* Bad block management.
+ * We can record which blocks on each device are 'bad' and so just
+ * fail those blocks, or that stripe, rather than the whole device.
+ * Entries in the bad-block table are 64bits wide.  This comprises:
+ * Length of bad-range, in sectors: 0-511 for lengths 1-512
+ * Start of bad-range, sector offset, 54 bits (allows 8 exbibytes)
+ *  A 'shift' can be set so that larger blocks are tracked and
+ *  consequently larger devices can be covered.
+ * 'Acknowledged' flag - 1 bit. - the most significant bit.
+ *
+ * Locking of the bad-block table uses a seqlock so md_is_badblock
+ * might need to retry if it is very unlucky.
+ * We will sometimes want to check for bad blocks in a bi_end_io function,
+ * so we use the write_seqlock_irq variant.
+ *
+ * When looking for a bad block we specify a range and want to
+ * know if any block in the range is bad.  So we binary-search
+ * to the last range that starts at-or-before the given endpoint,
+ * (or "before the sector after the target range")
+ * then see if it ends after the given start.
+ * We return
+ *  0 if there are no known bad blocks in the range
+ *  1 if there are known bad block which are all acknowledged
+ * -1 if there are bad blocks which have not yet been acknowledged in metadata.
+ * plus the start/length of the first bad section we overlap.
+ */
+int md_is_badblock(struct badblocks *bb, sector_t s, int sectors,
+		   sector_t *first_bad, int *bad_sectors)
+{
+	int hi;
+	int lo;
+	u64 *p = bb->page;
+	int rv;
+	sector_t target = s + sectors;
+	unsigned seq;
+
+	if (bb->shift > 0) {
+		/* round the start down, and the end up */
+		s >>= bb->shift;
+		target += (1<<bb->shift) - 1;
+		target >>= bb->shift;
+		sectors = target - s;
+	}
+	/* 'target' is now the first block after the bad range */
+
+retry:
+	seq = read_seqbegin(&bb->lock);
+	lo = 0;
+	rv = 0;
+	hi = bb->count;
+
+	/* Binary search between lo and hi for 'target'
+	 * i.e. for the last range that starts before 'target'
+	 */
+	/* INVARIANT: ranges before 'lo' and at-or-after 'hi'
+	 * are known not to be the last range before target.
+	 * VARIANT: hi-lo is the number of possible
+	 * ranges, and decreases until it reaches 1
+	 */
+	while (hi - lo > 1) {
+		int mid = (lo + hi) / 2;
+		sector_t a = BB_OFFSET(p[mid]);
+		if (a < target)
+			/* This could still be the one, earlier ranges
+			 * could not. */
+			lo = mid;
+		else
+			/* This and later ranges are definitely out. */
+			hi = mid;
+	}
+	/* 'lo' might be the last that started before target, but 'hi' isn't */
+	if (hi > lo) {
+		/* need to check all range that end after 's' to see if
+		 * any are unacknowledged.
+		 */
+		while (lo >= 0 &&
+		       BB_OFFSET(p[lo]) + BB_LEN(p[lo]) > s) {
+			if (BB_OFFSET(p[lo]) < target) {
+				/* starts before the end, and finishes after
+				 * the start, so they must overlap
+				 */
+				if (rv != -1 && BB_ACK(p[lo]))
+					rv = 1;
+				else
+					rv = -1;
+				*first_bad = BB_OFFSET(p[lo]);
+				*bad_sectors = BB_LEN(p[lo]);
+			}
+			lo--;
+		}
+	}
+
+	if (read_seqretry(&bb->lock, seq))
+		goto retry;
+
+	return rv;
+}
+EXPORT_SYMBOL_GPL(md_is_badblock);
+
+/*
+ * Add a range of bad blocks to the table.
+ * This might extend the table, or might contract it
+ * if two adjacent ranges can be merged.
+ * We binary-search to find the 'insertion' point, then
+ * decide how best to handle it.
+ */
+static int md_set_badblocks(struct badblocks *bb, sector_t s, int sectors,
+			    int acknowledged)
+{
+	u64 *p;
+	int lo, hi;
+	int rv = 1;
+
+	if (bb->shift < 0)
+		/* badblocks are disabled */
+		return 0;
+
+	if (bb->shift) {
+		/* round the start down, and the end up */
+		sector_t next = s + sectors;
+		s >>= bb->shift;
+		next += (1<<bb->shift) - 1;
+		next >>= bb->shift;
+		sectors = next - s;
+	}
+
+	write_seqlock_irq(&bb->lock);
+
+	p = bb->page;
+	lo = 0;
+	hi = bb->count;
+	/* Find the last range that starts at-or-before 's' */
+	while (hi - lo > 1) {
+		int mid = (lo + hi) / 2;
+		sector_t a = BB_OFFSET(p[mid]);
+		if (a <= s)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	if (hi > lo && BB_OFFSET(p[lo]) > s)
+		hi = lo;
+
+	if (hi > lo) {
+		/* we found a range that might merge with the start
+		 * of our new range
+		 */
+		sector_t a = BB_OFFSET(p[lo]);
+		sector_t e = a + BB_LEN(p[lo]);
+		int ack = BB_ACK(p[lo]);
+		if (e >= s) {
+			/* Yes, we can merge with a previous range */
+			if (s == a && s + sectors >= e)
+				/* new range covers old */
+				ack = acknowledged;
+			else
+				ack = ack && acknowledged;
+
+			if (e < s + sectors)
+				e = s + sectors;
+			if (e - a <= BB_MAX_LEN) {
+				p[lo] = BB_MAKE(a, e-a, ack);
+				s = e;
+			} else {
+				/* does not all fit in one range,
+				 * make p[lo] maximal
+				 */
+				if (BB_LEN(p[lo]) != BB_MAX_LEN)
+					p[lo] = BB_MAKE(a, BB_MAX_LEN, ack);
+				s = a + BB_MAX_LEN;
+			}
+			sectors = e - s;
+		}
+	}
+	if (sectors && hi < bb->count) {
+		/* 'hi' points to the first range that starts after 's'.
+		 * Maybe we can merge with the start of that range */
+		sector_t a = BB_OFFSET(p[hi]);
+		sector_t e = a + BB_LEN(p[hi]);
+		int ack = BB_ACK(p[hi]);
+		if (a <= s + sectors) {
+			/* merging is possible */
+			if (e <= s + sectors) {
+				/* full overlap */
+				e = s + sectors;
+				ack = acknowledged;
+			} else
+				ack = ack && acknowledged;
+
+			a = s;
+			if (e - a <= BB_MAX_LEN) {
+				p[hi] = BB_MAKE(a, e-a, ack);
+				s = e;
+			} else {
+				p[hi] = BB_MAKE(a, BB_MAX_LEN, ack);
+				s = a + BB_MAX_LEN;
+			}
+			sectors = e - s;
+			lo = hi;
+			hi++;
+		}
+	}
+	if (sectors == 0 && hi < bb->count) {
+		/* we might be able to combine lo and hi */
+		/* Note: 's' is at the end of 'lo' */
+		sector_t a = BB_OFFSET(p[hi]);
+		int lolen = BB_LEN(p[lo]);
+		int hilen = BB_LEN(p[hi]);
+		int newlen = lolen + hilen - (s - a);
+		if (s >= a && newlen < BB_MAX_LEN) {
+			/* yes, we can combine them */
+			int ack = BB_ACK(p[lo]) && BB_ACK(p[hi]);
+			p[lo] = BB_MAKE(BB_OFFSET(p[lo]), newlen, ack);
+			memmove(p + hi, p + hi + 1,
+				(bb->count - hi - 1) * 8);
+			bb->count--;
+		}
+	}
+	while (sectors) {
+		/* didn't merge (it all).
+		 * Need to add a range just before 'hi' */
+		if (bb->count >= MD_MAX_BADBLOCKS) {
+			/* No room for more */
+			rv = 0;
+			break;
+		} else {
+			int this_sectors = sectors;
+			memmove(p + hi + 1, p + hi,
+				(bb->count - hi) * 8);
+			bb->count++;
+
+			if (this_sectors > BB_MAX_LEN)
+				this_sectors = BB_MAX_LEN;
+			p[hi] = BB_MAKE(s, this_sectors, acknowledged);
+			sectors -= this_sectors;
+			s += this_sectors;
+		}
+	}
+
+	bb->changed = 1;
+	if (!acknowledged)
+		bb->unacked_exist = 1;
+	write_sequnlock_irq(&bb->lock);
+
+	return rv;
+}
+
+int rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+		       int is_new)
+{
+	int rv;
+	if (is_new)
+		s += rdev->new_data_offset;
+	else
+		s += rdev->data_offset;
+	rv = md_set_badblocks(&rdev->badblocks,
+			      s, sectors, 0);
+	if (rv) {
+		/* Make sure they get written out promptly */
+		sysfs_notify_dirent_safe(rdev->sysfs_state);
+		set_bit(MD_CHANGE_CLEAN, &rdev->mddev->flags);
+		md_wakeup_thread(rdev->mddev->thread);
+	}
+	return rv;
+}
+EXPORT_SYMBOL_GPL(rdev_set_badblocks);
+
+/*
+ * Remove a range of bad blocks from the table.
+ * This may involve extending the table if we spilt a region,
+ * but it must not fail.  So if the table becomes full, we just
+ * drop the remove request.
+ */
+static int md_clear_badblocks(struct badblocks *bb, sector_t s, int sectors)
+{
+	u64 *p;
+	int lo, hi;
+	sector_t target = s + sectors;
+	int rv = 0;
+
+	if (bb->shift > 0) {
+		/* When clearing we round the start up and the end down.
+		 * This should not matter as the shift should align with
+		 * the block size and no rounding should ever be needed.
+		 * However it is better the think a block is bad when it
+		 * isn't than to think a block is not bad when it is.
+		 */
+		s += (1<<bb->shift) - 1;
+		s >>= bb->shift;
+		target >>= bb->shift;
+		sectors = target - s;
+	}
+
+	write_seqlock_irq(&bb->lock);
+
+	p = bb->page;
+	lo = 0;
+	hi = bb->count;
+	/* Find the last range that starts before 'target' */
+	while (hi - lo > 1) {
+		int mid = (lo + hi) / 2;
+		sector_t a = BB_OFFSET(p[mid]);
+		if (a < target)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	if (hi > lo) {
+		/* p[lo] is the last range that could overlap the
+		 * current range.  Earlier ranges could also overlap,
+		 * but only this one can overlap the end of the range.
+		 */
+		if (BB_OFFSET(p[lo]) + BB_LEN(p[lo]) > target) {
+			/* Partial overlap, leave the tail of this range */
+			int ack = BB_ACK(p[lo]);
+			sector_t a = BB_OFFSET(p[lo]);
+			sector_t end = a + BB_LEN(p[lo]);
+
+			if (a < s) {
+				/* we need to split this range */
+				if (bb->count >= MD_MAX_BADBLOCKS) {
+					rv = 0;
+					goto out;
+				}
+				memmove(p+lo+1, p+lo, (bb->count - lo) * 8);
+				bb->count++;
+				p[lo] = BB_MAKE(a, s-a, ack);
+				lo++;
+			}
+			p[lo] = BB_MAKE(target, end - target, ack);
+			/* there is no longer an overlap */
+			hi = lo;
+			lo--;
+		}
+		while (lo >= 0 &&
+		       BB_OFFSET(p[lo]) + BB_LEN(p[lo]) > s) {
+			/* This range does overlap */
+			if (BB_OFFSET(p[lo]) < s) {
+				/* Keep the early parts of this range. */
+				int ack = BB_ACK(p[lo]);
+				sector_t start = BB_OFFSET(p[lo]);
+				p[lo] = BB_MAKE(start, s - start, ack);
+				/* now low doesn't overlap, so.. */
+				break;
+			}
+			lo--;
+		}
+		/* 'lo' is strictly before, 'hi' is strictly after,
+		 * anything between needs to be discarded
+		 */
+		if (hi - lo > 1) {
+			memmove(p+lo+1, p+hi, (bb->count - hi) * 8);
+			bb->count -= (hi - lo - 1);
+		}
+	}
+
+	bb->changed = 1;
+out:
+	write_sequnlock_irq(&bb->lock);
+	return rv;
+}
+
+int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+			 int is_new)
+{
+	if (is_new)
+		s += rdev->new_data_offset;
+	else
+		s += rdev->data_offset;
+	return md_clear_badblocks(&rdev->badblocks,
+				  s, sectors);
+}
+EXPORT_SYMBOL_GPL(rdev_clear_badblocks);
+
+/*
+ * Acknowledge all bad blocks in a list.
+ * This only succeeds if ->changed is clear.  It is used by
+ * in-kernel metadata updates
+ */
+void md_ack_all_badblocks(struct badblocks *bb)
+{
+	if (bb->page == NULL || bb->changed)
+		/* no point even trying */
+		return;
+	write_seqlock_irq(&bb->lock);
+
+	if (bb->changed == 0 && bb->unacked_exist) {
+		u64 *p = bb->page;
+		int i;
+		for (i = 0; i < bb->count ; i++) {
+			if (!BB_ACK(p[i])) {
+				sector_t start = BB_OFFSET(p[i]);
+				int len = BB_LEN(p[i]);
+				p[i] = BB_MAKE(start, len, 1);
+			}
+		}
+		bb->unacked_exist = 0;
+	}
+	write_sequnlock_irq(&bb->lock);
+}
+EXPORT_SYMBOL_GPL(md_ack_all_badblocks);
+
+/* sysfs access to bad-blocks list.
+ * We present two files.
+ * 'bad-blocks' lists sector numbers and lengths of ranges that
+ *    are recorded as bad.  The list is truncated to fit within
+ *    the one-page limit of sysfs.
+ *    Writing "sector length" to this file adds an acknowledged
+ *    bad block list.
+ * 'unacknowledged-bad-blocks' lists bad blocks that have not yet
+ *    been acknowledged.  Writing to this file adds bad blocks
+ *    without acknowledging them.  This is largely for testing.
+ */
+
+static ssize_t
+badblocks_show(struct badblocks *bb, char *page, int unack)
+{
+	size_t len;
+	int i;
+	u64 *p = bb->page;
+	unsigned seq;
+
+	if (bb->shift < 0)
+		return 0;
+
+retry:
+	seq = read_seqbegin(&bb->lock);
+
+	len = 0;
+	i = 0;
+
+	while (len < PAGE_SIZE && i < bb->count) {
+		sector_t s = BB_OFFSET(p[i]);
+		unsigned int length = BB_LEN(p[i]);
+		int ack = BB_ACK(p[i]);
+		i++;
+
+		if (unack && ack)
+			continue;
+
+		len += snprintf(page+len, PAGE_SIZE-len, "%llu %u\n",
+				(unsigned long long)s << bb->shift,
+				length << bb->shift);
+	}
+	if (unack && len == 0)
+		bb->unacked_exist = 0;
+
+	if (read_seqretry(&bb->lock, seq))
+		goto retry;
+
+	return len;
+}
+
+#define DO_DEBUG 1
+
+static ssize_t
+badblocks_store(struct badblocks *bb, const char *page, size_t len, int unack)
+{
+	unsigned long long sector;
+	int length;
+	char newline;
+#ifdef DO_DEBUG
+	/* Allow clearing via sysfs *only* for testing/debugging.
+	 * Normally only a successful write may clear a badblock
+	 */
+	int clear = 0;
+	if (page[0] == '-') {
+		clear = 1;
+		page++;
+	}
+#endif /* DO_DEBUG */
+
+	switch (sscanf(page, "%llu %d%c", &sector, &length, &newline)) {
+	case 3:
+		if (newline != '\n')
+			return -EINVAL;
+	case 2:
+		if (length <= 0)
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+#ifdef DO_DEBUG
+	if (clear) {
+		md_clear_badblocks(bb, sector, length);
+		return len;
+	}
+#endif /* DO_DEBUG */
+	if (md_set_badblocks(bb, sector, length, !unack))
+		return len;
+	else
+		return -ENOSPC;
+}
+
 static int md_notify_reboot(struct notifier_block *this,
 			    unsigned long code, void *x)
 {
 	struct list_head *tmp;
-	mddev_t *mddev;
+	struct mddev *mddev;
+	int need_delay = 0;
 
-	if ((code == SYS_DOWN) || (code == SYS_HALT) || (code == SYS_POWER_OFF)) {
-
-		printk(KERN_INFO "md: stopping all md devices.\n");
-
-		for_each_mddev(mddev, tmp)
-			if (mddev_trylock(mddev)) {
-				/* Force a switch to readonly even array
-				 * appears to still be in use.  Hence
-				 * the '100'.
-				 */
-				do_md_stop(mddev, 1, 100);
-				mddev_unlock(mddev);
-			}
-		/*
-		 * certain more exotic SCSI devices are known to be
-		 * volatile wrt too early system reboots. While the
-		 * right place to handle this issue is the given
-		 * driver, we do want to have a safe RAID driver ...
-		 */
-		mdelay(1000*1);
+	for_each_mddev(mddev, tmp) {
+		if (mddev_trylock(mddev)) {
+			if (mddev->pers)
+				__md_stop_writes(mddev);
+			mddev->safemode = 2;
+			mddev_unlock(mddev);
+		}
+		need_delay = 1;
 	}
+	/*
+	 * certain more exotic SCSI devices are known to be
+	 * volatile wrt too early system reboots. While the
+	 * right place to handle this issue is the given
+	 * driver, we do want to have a safe RAID driver ...
+	 */
+	if (need_delay)
+		mdelay(1000*1);
+
 	return NOTIFY_DONE;
 }
 
@@ -6907,19 +8640,30 @@ static struct notifier_block md_notifier = {
 
 static void md_geninit(void)
 {
-	dprintk("md: sizeof(mdp_super_t) = %d\n", (int)sizeof(mdp_super_t));
+	pr_debug("md: sizeof(mdp_super_t) = %d\n", (int)sizeof(mdp_super_t));
 
 	proc_create("mdstat", S_IRUGO, NULL, &md_seq_fops);
 }
 
 static int __init md_init(void)
 {
-	if (register_blkdev(MD_MAJOR, "md"))
-		return -1;
-	if ((mdp_major=register_blkdev(0, "mdp"))<=0) {
-		unregister_blkdev(MD_MAJOR, "md");
-		return -1;
-	}
+	int ret = -ENOMEM;
+
+	md_wq = create_workqueue("md");
+	if (!md_wq)
+		goto err_wq;
+
+	md_misc_wq = create_workqueue("md_misc");
+	if (!md_misc_wq)
+		goto err_misc_wq;
+
+	if ((ret = register_blkdev(MD_MAJOR, "md")) < 0)
+		goto err_md;
+
+	if ((ret = register_blkdev(0, "mdp")) < 0)
+		goto err_mdp;
+	mdp_major = ret;
+
 	blk_register_region(MKDEV(MD_MAJOR, 0), 1UL<<MINORBITS, THIS_MODULE,
 			    md_probe, NULL, NULL);
 	blk_register_region(MKDEV(mdp_major, 0), 1UL<<MINORBITS, THIS_MODULE,
@@ -6930,8 +8674,16 @@ static int __init md_init(void)
 
 	md_geninit();
 	return 0;
-}
 
+err_mdp:
+	unregister_blkdev(MD_MAJOR, "md");
+err_md:
+	destroy_workqueue(md_misc_wq);
+err_misc_wq:
+	destroy_workqueue(md_wq);
+err_wq:
+	return ret;
+}
 
 #ifndef MODULE
 
@@ -6963,7 +8715,7 @@ void md_autodetect_dev(dev_t dev)
 
 static void autostart_arrays(int part)
 {
-	mdk_rdev_t *rdev;
+	struct md_rdev *rdev;
 	struct detected_devices_node *node_detected_dev;
 	dev_t dev;
 	int i_scanned, i_passed;
@@ -7003,7 +8755,7 @@ static void autostart_arrays(int part)
 
 static __exit void md_exit(void)
 {
-	mddev_t *mddev;
+	struct mddev *mddev;
 	struct list_head *tmp;
 
 	blk_unregister_region(MKDEV(MD_MAJOR,0), 1U << MINORBITS);
@@ -7018,6 +8770,8 @@ static __exit void md_exit(void)
 		export_array(mddev);
 		mddev->hold_active = 0;
 	}
+	destroy_workqueue(md_misc_wq);
+	destroy_workqueue(md_wq);
 }
 
 subsys_initcall(md_init);
@@ -7053,6 +8807,8 @@ EXPORT_SYMBOL(md_register_thread);
 EXPORT_SYMBOL(md_unregister_thread);
 EXPORT_SYMBOL(md_wakeup_thread);
 EXPORT_SYMBOL(md_check_recovery);
+EXPORT_SYMBOL(md_reap_sync_thread);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("MD RAID framework");
 MODULE_ALIAS("md");
 MODULE_ALIAS_BLOCKDEV_MAJOR(MD_MAJOR);

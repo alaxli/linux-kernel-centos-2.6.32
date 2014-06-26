@@ -33,6 +33,8 @@ MODULE_LICENSE("GPL v2");
 #define UCODE_EQUIV_CPU_TABLE_TYPE 0x00000000
 #define UCODE_UCODE_TYPE           0x00000001
 
+const struct firmware *firmware;
+
 struct equiv_cpu_entry {
 	u32	installed_cpu;
 	u32	fixed_errata_mask;
@@ -102,11 +104,8 @@ static int get_matching_microcode(int cpu, void *mc, int rev)
 		i++;
 	}
 
-	if (!equiv_cpu_id) {
-		printk(KERN_WARNING "microcode: CPU%d: cpu revision "
-		       "not listed in equivalent cpu table\n", cpu);
+	if (!equiv_cpu_id)
 		return 0;
-	}
 
 	if (mc_header->processor_rev_id != equiv_cpu_id)
 		return 0;
@@ -176,6 +175,7 @@ static int apply_microcode_amd(int cpu)
 	if (rev != mc_amd->hdr.patch_id) {
 		printk(KERN_ERR "microcode: CPU%d: update failed "
 		       "(for patch_level=0x%x)\n", cpu, mc_amd->hdr.patch_id);
+		uci->cpu_sig.rev = rev;
 		return -1;
 	}
 
@@ -326,14 +326,10 @@ generic_load_microcode(int cpu, const u8 *data, size_t size)
 
 static enum ucode_state request_microcode_fw(int cpu, struct device *device)
 {
-	const char *fw_name = "amd-ucode/microcode_amd.bin";
-	const struct firmware *firmware;
 	enum ucode_state ret;
 
-	if (request_firmware(&firmware, fw_name, device)) {
-		printk(KERN_ERR "microcode: failed to load file %s\n", fw_name);
+	if (firmware == NULL)
 		return UCODE_NFOUND;
-	}
 
 	if (*(u32 *)firmware->data != UCODE_MAGIC) {
 		printk(KERN_ERR "microcode: invalid UCODE_MAGIC (0x%08x)\n",
@@ -343,16 +339,12 @@ static enum ucode_state request_microcode_fw(int cpu, struct device *device)
 
 	ret = generic_load_microcode(cpu, firmware->data, firmware->size);
 
-	release_firmware(firmware);
-
 	return ret;
 }
 
 static enum ucode_state
 request_microcode_user(int cpu, const void __user *buf, size_t size)
 {
-	printk(KERN_INFO "microcode: AMD microcode update via "
-	       "/dev/cpu/microcode not supported\n");
 	return UCODE_ERROR;
 }
 
@@ -364,7 +356,43 @@ static void microcode_fini_cpu_amd(int cpu)
 	uci->mc = NULL;
 }
 
+/*
+ * AMD microcode firmware naming convention, up to family 15h they are in
+ * the legacy file:
+ *
+ *    amd-ucode/microcode_amd.bin
+ *
+ * This legacy file is always smaller than 2K in size.
+ *
+ * Starting at family 15h they are in family specific firmware files:
+ *
+ *    amd-ucode/microcode_amd_fam15h.bin
+ *    amd-ucode/microcode_amd_fam16h.bin
+ *    ...
+ *
+ * These might be larger than 2K.
+ */
+void init_microcode_amd(struct device *device)
+{
+	char fw_name[36] = "amd-ucode/microcode_amd.bin";
+
+	if (boot_cpu_data.x86 >= 0x15)
+		snprintf(fw_name, sizeof(fw_name),
+			 "amd-ucode/microcode_amd_fam%.2xh.bin",
+			 boot_cpu_data.x86);
+
+	if (request_firmware(&firmware, (const char *)fw_name, device))
+		printk(KERN_ERR "microcode: failed to load file %s\n", fw_name);
+}
+
+void fini_microcode_amd(void)
+{
+	release_firmware(firmware);
+}
+
 static struct microcode_ops microcode_amd_ops = {
+	.init				  = init_microcode_amd,
+	.fini				  = fini_microcode_amd,
 	.request_microcode_user           = request_microcode_user,
 	.request_microcode_fw             = request_microcode_fw,
 	.collect_cpu_info                 = collect_cpu_info_amd,

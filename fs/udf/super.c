@@ -54,6 +54,7 @@
 #include <linux/vmalloc.h>
 #include <linux/errno.h>
 #include <linux/mount.h>
+#include <linux/quotaops.h>
 #include <linux/seq_file.h>
 #include <linux/bitmap.h>
 #include <linux/crc-itu-t.h>
@@ -120,7 +121,7 @@ static struct file_system_type udf_fstype = {
 	.name		= "udf",
 	.get_sb		= udf_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HANDLE_QUOTA,
 };
 
 static struct kmem_cache *udf_inode_cachep;
@@ -558,6 +559,7 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
 {
 	struct udf_options uopt;
 	struct udf_sb_info *sbi = UDF_SB(sb);
+	int error = 0;
 
 	uopt.flags = sbi->s_flags;
 	uopt.uid   = sbi->s_uid;
@@ -583,17 +585,26 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
 			*flags |= MS_RDONLY;
 	}
 
-	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY)) {
-		unlock_kernel();
-		return 0;
-	}
-	if (*flags & MS_RDONLY)
+	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY))
+		goto out_unlock;
+
+	if (*flags & MS_RDONLY) {
 		udf_close_lvid(sb);
-	else
+
+		error = vfs_dq_off(sb, 1);
+		if (error < 0 && error != -ENOSYS)
+			error = -EBUSY;
+	} else {
 		udf_open_lvid(sb);
 
+		/* mark the fs r/w for quota activity */
+		sb->s_flags &= ~MS_RDONLY;
+		vfs_dq_quota_on_remount(sb);
+	}
+
+out_unlock:
 	unlock_kernel();
-	return 0;
+	return error;
 }
 
 /* Check Volume Structure Descriptors (ECMA 167 2/9.1) */
@@ -1255,14 +1266,14 @@ static int udf_load_sparable_map(struct super_block *sb,
 	sdata->s_packet_len = le16_to_cpu(spm->packetLength);
 	if (!is_power_of_2(sdata->s_packet_len)) {
 		udf_error(sb, __func__, "error loading logical volume descriptor: "
-			"Invalid packet length %u\n",
-			(unsigned)sdata->s_packet_len);
+			  "Invalid packet length %u\n",
+			  (unsigned)sdata->s_packet_len);
 		return -EIO;
 	}
 	if (spm->numSparingTables > 4) {
 		udf_error(sb, __func__, "error loading logical volume descriptor: "
-			"Too many sparing tables (%d)\n",
-			(int)spm->numSparingTables);
+			  "Too many sparing tables (%d)\n",
+			  (int)spm->numSparingTables);
 		return -EIO;
 	}
 
@@ -1306,21 +1317,18 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
 		return 1;
 	BUG_ON(ident != TAG_IDENT_LVD);
 	lvd = (struct logicalVolDesc *)bh->b_data;
-
 	table_len = le32_to_cpu(lvd->mapTableLength);
 	if (table_len > sb->s_blocksize - sizeof(*lvd)) {
 		udf_error(sb, __func__, "error loading logical volume descriptor: "
-		          "Partition table too long (%u > %lu)\n", table_len,
-		          sb->s_blocksize - sizeof(*lvd));
+			  "Partition table too long (%u > %lu)\n", table_len,
+			  sb->s_blocksize - sizeof(*lvd));
 		ret = 1;
 		goto out_bh;
 	}
 
-	i = udf_sb_alloc_partition_maps(sb, le32_to_cpu(lvd->numPartitionMaps));
-	if (i != 0) {
-		ret = i;
+	ret = udf_sb_alloc_partition_maps(sb, le32_to_cpu(lvd->numPartitionMaps));
+	if (ret)
 		goto out_bh;
-	}
 
 	for (i = 0, offset = 0;
 	     i < sbi->s_partitions && offset < table_len;
@@ -1823,12 +1831,6 @@ static void udf_open_lvid(struct super_block *sb)
 			le16_to_cpu(lvid->descTag.descCRCLength)));
 
 	lvid->descTag.tagChecksum = udf_tag_checksum(&lvid->descTag);
-	/*
-	 * We set buffer uptodate unconditionally here to avoid spurious
-	 * warnings from mark_buffer_dirty() when previous EIO has marked
-	 * the buffer as !uptodate
-	 */
-	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 	sbi->s_lvid_dirty = 0;
 }

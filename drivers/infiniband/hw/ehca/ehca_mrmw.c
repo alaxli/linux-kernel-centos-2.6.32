@@ -111,7 +111,7 @@ static u32 ehca_encode_hwpage_size(u32 pgsize)
 
 static u64 ehca_get_max_hwpage_size(struct ehca_shca *shca)
 {
-	return 1UL << ilog2(shca->hca_cap_mr_pgsize);
+	return rounddown_pow_of_two(shca->hca_cap_mr_pgsize);
 }
 
 static struct ehca_mr *ehca_mr_new(void)
@@ -170,7 +170,7 @@ struct ib_mr *ehca_get_dma_mr(struct ib_pd *pd, int mr_access_flags)
 		}
 
 		ret = ehca_reg_maxmr(shca, e_maxmr,
-				     (void *)ehca_map_vaddr((void *)KERNELBASE),
+				     (void *)ehca_map_vaddr((void *)(KERNELBASE + PHYSICAL_START)),
 				     mr_access_flags, e_pd,
 				     &e_maxmr->ib.ib_mr.lkey,
 				     &e_maxmr->ib.ib_mr.rkey);
@@ -687,7 +687,7 @@ dereg_mr_exit0:
 
 /*----------------------------------------------------------------------*/
 
-struct ib_mw *ehca_alloc_mw(struct ib_pd *pd)
+struct ib_mw *ehca_alloc_mw(struct ib_pd *pd, enum ib_mw_type type)
 {
 	struct ib_mw *ib_mw;
 	u64 h_ret;
@@ -696,6 +696,9 @@ struct ib_mw *ehca_alloc_mw(struct ib_pd *pd)
 	struct ehca_shca *shca =
 		container_of(pd->device, struct ehca_shca, ib_device);
 	struct ehca_mw_hipzout_parms hipzout;
+
+	if (type != IB_MW_TYPE_1)
+		return ERR_PTR(-EINVAL);
 
 	e_mw = ehca_mw_new();
 	if (!e_mw) {
@@ -932,11 +935,6 @@ int ehca_unmap_fmr(struct list_head *fmr_list)
 	/* check all FMR belong to same SHCA, and check internal flag */
 	list_for_each_entry(ib_fmr, fmr_list, list) {
 		prev_shca = shca;
-		if (!ib_fmr) {
-			ehca_gen_err("bad fmr=%p in list", ib_fmr);
-			ret = -EINVAL;
-			goto unmap_fmr_exit0;
-		}
 		shca = container_of(ib_fmr->device, struct ehca_shca,
 				    ib_device);
 		e_fmr = container_of(ib_fmr, struct ehca_mr, ib.ib_fmr);
@@ -1640,7 +1638,7 @@ int ehca_reg_internal_maxmr(
 
 	/* register internal max-MR on HCA */
 	size_maxmr = ehca_mr_len;
-	iova_start = (u64 *)ehca_map_vaddr((void *)KERNELBASE);
+	iova_start = (u64 *)ehca_map_vaddr((void *)(KERNELBASE + PHYSICAL_START));
 	ib_pbuf.addr = 0;
 	ib_pbuf.size = size_maxmr;
 	num_kpages = NUM_CHUNKS(((u64)iova_start % PAGE_SIZE) + size_maxmr,
@@ -2213,7 +2211,7 @@ int ehca_mr_is_maxmr(u64 size,
 {
 	/* a MR is treated as max-MR only if it fits following: */
 	if ((size == ehca_mr_len) &&
-	    (iova_start == (void *)ehca_map_vaddr((void *)KERNELBASE))) {
+	    (iova_start == (void *)ehca_map_vaddr((void *)(KERNELBASE + PHYSICAL_START)))) {
 		ehca_gen_dbg("this is a max-MR");
 		return 1;
 	} else

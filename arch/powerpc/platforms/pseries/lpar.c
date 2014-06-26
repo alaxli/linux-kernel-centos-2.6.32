@@ -247,6 +247,8 @@ void vpa_init(int cpu)
 	int hwcpu = get_hard_smp_processor_id(cpu);
 	unsigned long addr;
 	long ret;
+	struct paca_struct *pp;
+	struct dtl_entry *dtl;
 
 	if (cpu_has_feature(CPU_FTR_ALTIVEC))
 		lppaca[cpu].vmxregs_in_use = 1;
@@ -272,6 +274,25 @@ void vpa_init(int cpu)
 			       "WARNING: vpa_init: SLB shadow buffer "
 			       "registration for cpu %d (hw %d) of area %lx "
 			       "returns %ld\n", cpu, hwcpu, addr, ret);
+	}
+
+	/*
+	 * Register dispatch trace log, if one has been allocated.
+	 */
+	pp = &paca[cpu];
+	dtl = pp->dispatch_log;
+	if (dtl) {
+		pp->dtl_ridx = 0;
+		pp->dtl_curr = dtl;
+		lppaca[cpu].dtl_idx = 0;
+
+		/* hypervisor reads buffer length from this field */
+		dtl->enqueue_to_dispatch_time = DISPATCH_LOG_BYTES;
+		ret = register_dtl(hwcpu, __pa(dtl));
+		if (ret)
+			pr_warning("DTL registration failed for cpu %d (%ld)\n",
+				   cpu, ret);
+		lppaca[cpu].dtl_enable_mask = 2;
 	}
 }
 
@@ -307,6 +328,8 @@ static long pSeries_lpar_hpte_insert(unsigned long hpte_group,
 	/* Make pHyp happy */
 	if ((rflags & _PAGE_NO_CACHE) & !(rflags & _PAGE_WRITETHRU))
 		hpte_r &= ~_PAGE_COHERENT;
+	if (firmware_has_feature(FW_FEATURE_XCMO) && !(hpte_r & HPTE_R_N))
+		flags |= H_COALESCE_CAND;
 
 	lpar_rc = plpar_pte_enter(flags, hpte_group, hpte_v, hpte_r, &slot);
 	if (unlikely(lpar_rc == H_PTEG_FULL)) {
@@ -353,7 +376,13 @@ static long pSeries_lpar_hpte_remove(unsigned long hpte_group)
 					   (0x1UL << 4), &dummy1, &dummy2);
 		if (lpar_rc == H_SUCCESS)
 			return i;
-		BUG_ON(lpar_rc != H_NOT_FOUND);
+
+		/*
+		 * The test for adjunct partition is performed before the
+		 * ANDCOND test.  H_RESOURCE may be returned, so we need to
+		 * check for that as well.
+		 */
+		BUG_ON(lpar_rc != H_NOT_FOUND && lpar_rc != H_RESOURCE);
 
 		slot_offset++;
 		slot_offset &= 0x7;
@@ -366,28 +395,21 @@ static void pSeries_lpar_hptab_clear(void)
 {
 	unsigned long size_bytes = 1UL << ppc64_pft_size;
 	unsigned long hpte_count = size_bytes >> 4;
-	struct {
-		unsigned long pteh;
-		unsigned long ptel;
-	} ptes[4];
+	unsigned long dummy1, dummy2, dword0;
 	long lpar_rc;
-	unsigned long i, j;
+	unsigned long i;
 
-	/* Read in batches of 4,
-	 * invalidate only valid entries not in the VRMA
-	 * hpte_count will be a multiple of 4
-         */
-	for (i = 0; i < hpte_count; i += 4) {
-		lpar_rc = plpar_pte_read_4_raw(0, i, (void *)ptes);
-		if (lpar_rc != H_SUCCESS)
-			continue;
-		for (j = 0; j < 4; j++){
-			if ((ptes[j].pteh & HPTE_V_VRMA_MASK) ==
-				HPTE_V_VRMA_MASK)
-				continue;
-			if (ptes[j].pteh & HPTE_V_VALID)
-				plpar_pte_remove_raw(0, i + j, 0,
-					&(ptes[j].pteh), &(ptes[j].ptel));
+	/* TODO: Use bulk call */
+	for (i = 0; i < hpte_count; i++) {
+		/* dont remove HPTEs with VRMA mappings */
+		lpar_rc = plpar_pte_remove_raw(H_ANDCOND, i, HPTE_V_1TB_SEG,
+						&dummy1, &dummy2);
+		if (lpar_rc == H_NOT_FOUND) {
+			lpar_rc = plpar_pte_read_raw(0, i, &dword0, &dummy1);
+			if (!lpar_rc && ((dword0 & HPTE_V_VRMA_MASK)
+				!= HPTE_V_VRMA_MASK))
+				/* Can be hpte for 1TB Seg. So remove it */
+				plpar_pte_remove_raw(0, i, 0, &dummy1, &dummy2);
 		}
 	}
 }
@@ -668,3 +690,47 @@ void arch_free_page(struct page *page, int order)
 EXPORT_SYMBOL(arch_free_page);
 
 #endif
+
+/**
+ * h_get_mpp
+ * H_GET_MPP hcall returns info in 7 parms
+ */
+int h_get_mpp(struct hvcall_mpp_data *mpp_data)
+{
+	int rc;
+	unsigned long retbuf[PLPAR_HCALL9_BUFSIZE];
+
+	rc = plpar_hcall9(H_GET_MPP, retbuf);
+
+	mpp_data->entitled_mem = retbuf[0];
+	mpp_data->mapped_mem = retbuf[1];
+
+	mpp_data->group_num = (retbuf[2] >> 2 * 8) & 0xffff;
+	mpp_data->pool_num = retbuf[2] & 0xffff;
+
+	mpp_data->mem_weight = (retbuf[3] >> 7 * 8) & 0xff;
+	mpp_data->unallocated_mem_weight = (retbuf[3] >> 6 * 8) & 0xff;
+	mpp_data->unallocated_entitlement = retbuf[3] & 0xffffffffffff;
+
+	mpp_data->pool_size = retbuf[4];
+	mpp_data->loan_request = retbuf[5];
+	mpp_data->backing_mem = retbuf[6];
+
+	return rc;
+}
+EXPORT_SYMBOL(h_get_mpp);
+
+int h_get_mpp_x(struct hvcall_mpp_x_data *mpp_x_data)
+{
+	int rc;
+	unsigned long retbuf[PLPAR_HCALL9_BUFSIZE] = { 0 };
+
+	rc = plpar_hcall9(H_GET_MPP_X, retbuf);
+
+	mpp_x_data->coalesced_bytes = retbuf[0];
+	mpp_x_data->pool_coalesced_bytes = retbuf[1];
+	mpp_x_data->pool_purr_cycles = retbuf[2];
+	mpp_x_data->pool_spurr_cycles = retbuf[3];
+
+	return rc;
+}

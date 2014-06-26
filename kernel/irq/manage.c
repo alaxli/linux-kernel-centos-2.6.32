@@ -133,10 +133,103 @@ int irq_set_affinity(unsigned int irq, const struct cpumask *cpumask)
 		irq_set_thread_affinity(desc);
 	}
 #endif
+	if (desc->affinity_notify) {
+		kref_get(&desc->affinity_notify->kref);
+		schedule_work(&desc->affinity_notify->work);
+	}
 	desc->status |= IRQ_AFFINITY_SET;
 	spin_unlock_irqrestore(&desc->lock, flags);
 	return 0;
 }
+
+int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	unsigned long flags;
+
+	if (!desc)
+		return -EINVAL;
+
+	spin_lock_irqsave(&desc->lock, flags);
+	desc->affinity_hint = m;
+	spin_unlock_irqrestore(&desc->lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(irq_set_affinity_hint);
+
+static void irq_affinity_notify(struct work_struct *work)
+{
+	struct irq_affinity_notify *notify =
+		container_of(work, struct irq_affinity_notify, work);
+	struct irq_desc *desc = irq_to_desc(notify->irq);
+	cpumask_var_t cpumask;
+	unsigned long flags;
+
+	if (!desc)
+		goto out;
+
+	if (!alloc_cpumask_var(&cpumask, GFP_KERNEL))
+		goto out;
+
+	spin_lock_irqsave(&desc->lock, flags);
+#ifdef CONFIG_GENERIC_PENDING_IRQ
+	if (desc->status & IRQ_MOVE_PENDING)
+		cpumask_copy(cpumask, desc->pending_mask);
+	else
+#endif
+		cpumask_copy(cpumask, desc->affinity);
+	spin_unlock_irqrestore(&desc->lock, flags);
+
+	notify->notify(notify, cpumask);
+
+	free_cpumask_var(cpumask);
+out:
+	kref_put(&notify->kref, notify->release);
+}
+
+/**
+ *	irq_set_affinity_notifier - control notification of IRQ affinity changes
+ *	@irq:		Interrupt for which to enable/disable notification
+ *	@notify:	Context for notification, or %NULL to disable
+ *			notification.  Function pointers must be initialised;
+ *			the other fields will be initialised by this function.
+ *
+ *	Must be called in process context.  Notification may only be enabled
+ *	after the IRQ is allocated and must be disabled before the IRQ is
+ *	freed using free_irq().
+ */
+int
+irq_set_affinity_notifier(unsigned int irq, struct irq_affinity_notify *notify)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	struct irq_affinity_notify *old_notify;
+	unsigned long flags;
+
+	/* The release function is promised process context */
+	might_sleep();
+
+	if (!desc)
+		return -EINVAL;
+
+	/* Complete initialisation of *notify */
+	if (notify) {
+		notify->irq = irq;
+		kref_init(&notify->kref);
+		INIT_WORK(&notify->work, irq_affinity_notify);
+	}
+
+	spin_lock_irqsave(&desc->lock, flags);
+	old_notify = desc->affinity_notify;
+	desc->affinity_notify = notify;
+	spin_unlock_irqrestore(&desc->lock, flags);
+
+	if (old_notify)
+		kref_put(&old_notify->kref, old_notify->release);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(irq_set_affinity_notifier);
 
 #ifndef CONFIG_AUTO_IRQ_AFFINITY
 /*
@@ -160,6 +253,13 @@ static int setup_affinity(unsigned int irq, struct irq_desc *desc)
 	}
 
 	cpumask_and(desc->affinity, cpu_online_mask, irq_default_affinity);
+	if (desc->node != NUMA_NO_NODE) {
+		const struct cpumask *nodemask = cpumask_of_node(desc->node);
+		/* make sure at least one of the cpus in nodemask is online */
+		if (cpumask_intersects(desc->affinity, nodemask))
+				cpumask_and(desc->affinity, desc->affinity,
+					    nodemask);
+	}
 set_affinity:
 	desc->chip->set_affinity(irq, desc->affinity);
 
@@ -200,7 +300,10 @@ static inline int setup_affinity(unsigned int irq, struct irq_desc *desc)
 void __disable_irq(struct irq_desc *desc, unsigned int irq, bool suspend)
 {
 	if (suspend) {
-		if (!desc->action || (desc->action->flags & IRQF_NO_SUSPEND))
+		/* kABI WARNING! We cannot change IRQF_TIMER to include
+		   IRQF_NO_SUSPEND. So test for both bits here. */
+		if (!desc->action ||
+		    (desc->action->flags & (IRQF_TIMER|IRQF_NO_SUSPEND)))
 			return;
 		desc->status |= IRQ_SUSPENDED;
 	}
@@ -265,17 +368,8 @@ EXPORT_SYMBOL(disable_irq);
 
 void __enable_irq(struct irq_desc *desc, unsigned int irq, bool resume)
 {
-	if (resume) {
-		if (!(desc->status & IRQ_SUSPENDED)) {
-			if (!desc->action)
-				return;
-			if (!(desc->action->flags & IRQF_FORCE_RESUME))
-				return;
-			/* Pretend that it got disabled ! */
-			desc->depth++;
-		}
+	if (resume)
 		desc->status &= ~IRQ_SUSPENDED;
-	}
 
 	switch (desc->depth) {
 	case 0:
@@ -445,9 +539,6 @@ int __irq_set_trigger(struct irq_desc *desc, unsigned int irq,
 		/* note that IRQF_TRIGGER_MASK == IRQ_TYPE_SENSE_MASK */
 		desc->status &= ~(IRQ_LEVEL | IRQ_TYPE_SENSE_MASK);
 		desc->status |= flags;
-
-		if (chip != desc->chip)
-			irq_chip_set_defaults(desc->chip);
 	}
 
 	return ret;
@@ -475,9 +566,8 @@ static irqreturn_t irq_nested_primary_handler(int irq, void *dev_id)
 
 static int irq_wait_for_interrupt(struct irqaction *action)
 {
-	set_current_state(TASK_INTERRUPTIBLE);
-
 	while (!kthread_should_stop()) {
+		set_current_state(TASK_INTERRUPTIBLE);
 
 		if (test_and_clear_bit(IRQTF_RUNTHREAD,
 				       &action->thread_flags)) {
@@ -485,9 +575,7 @@ static int irq_wait_for_interrupt(struct irqaction *action)
 			return 0;
 		}
 		schedule();
-		set_current_state(TASK_INTERRUPTIBLE);
 	}
-	__set_current_state(TASK_RUNNING);
 	return -1;
 }
 
@@ -633,6 +721,22 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
 
 	if (desc->chip == &no_irq_chip)
 		return -ENOSYS;
+	/*
+	 * Some drivers like serial.c use request_irq() heavily,
+	 * so we have to be careful not to interfere with a
+	 * running system.
+	 */
+	if (new->flags & IRQF_SAMPLE_RANDOM) {
+		/*
+		 * This function might sleep, we want to call it first,
+		 * outside of the atomic block.
+		 * Yes, this might clear the entropy pool if the wrong
+		 * driver is attempted to be loaded, without actually
+		 * installing a new handler, but is this really a problem,
+		 * only the sysadmin is able to do this.
+		 */
+		rand_initialize_irq(irq);
+	}
 
 	/* Oneshot interrupts are not allowed with shared */
 	if ((new->flags & IRQF_ONESHOT) && (new->flags & IRQF_SHARED))
@@ -893,6 +997,12 @@ static struct irqaction *__free_irq(unsigned int irq, void *dev_id)
 			desc->chip->disable(irq);
 	}
 
+#ifdef CONFIG_SMP
+	/* make sure affinity_hint is cleaned up */
+	if (WARN_ON_ONCE(desc->affinity_hint))
+		desc->affinity_hint = NULL;
+#endif
+
 	spin_unlock_irqrestore(&desc->lock, flags);
 
 	unregister_handler_proc(irq, action);
@@ -959,6 +1069,11 @@ void free_irq(unsigned int irq, void *dev_id)
 	if (!desc)
 		return;
 
+#ifdef CONFIG_SMP
+	if (WARN_ON(desc->affinity_notify))
+		desc->affinity_notify = NULL;
+#endif
+
 	chip_bus_lock(irq, desc);
 	kfree(__free_irq(irq, dev_id));
 	chip_bus_sync_unlock(irq, desc);
@@ -1005,6 +1120,7 @@ EXPORT_SYMBOL(free_irq);
  *
  *	IRQF_SHARED		Interrupt is shared
  *	IRQF_DISABLED	Disable local interrupts while processing
+ *	IRQF_SAMPLE_RANDOM	The interrupt can be used for entropy
  *	IRQF_TRIGGER_*		Specify active edge(s) or level
  *
  */
@@ -1074,7 +1190,7 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
 	if (retval)
 		kfree(action);
 
-#ifdef CONFIG_DEBUG_SHIRQ_FIXME
+#ifdef CONFIG_DEBUG_SHIRQ
 	if (irqflags & IRQF_SHARED) {
 		/*
 		 * It's a shared IRQ -- the driver ought to be prepared for it

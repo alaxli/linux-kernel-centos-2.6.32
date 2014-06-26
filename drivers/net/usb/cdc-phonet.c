@@ -160,12 +160,14 @@ static void rx_complete(struct urb *req)
 				/* Can't use pskb_pull() on page in IRQ */
 				memcpy(skb_put(skb, 1), page_address(page), 1);
 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
-						page, 1, req->actual_length);
+						page, 1, req->actual_length,
+						req->actual_length);
 				page = NULL;
 			}
 		} else {
 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
-					page, 0, req->actual_length);
+					page, 0, req->actual_length,
+					req->actual_length);
 			page = NULL;
 		}
 		if (req->actual_length < PAGE_SIZE)
@@ -325,13 +327,13 @@ int usbpn_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	static const char ifname[] = "usbpn%d";
 	const struct usb_cdc_union_desc *union_header = NULL;
+	const struct usb_cdc_header_desc *phonet_header = NULL;
 	const struct usb_host_interface *data_desc;
 	struct usb_interface *data_intf;
 	struct usb_device *usbdev = interface_to_usbdev(intf);
 	struct net_device *dev;
 	struct usbpn_dev *pnd;
 	u8 *data;
-	int phonet = 0;
 	int len, err;
 
 	data = intf->altsetting->extra;
@@ -352,7 +354,10 @@ int usbpn_probe(struct usb_interface *intf, const struct usb_device_id *id)
 					(struct usb_cdc_union_desc *)data;
 				break;
 			case 0xAB:
-				phonet = 1;
+				if (phonet_header || dlen < 5)
+					break;
+				phonet_header =
+					(struct usb_cdc_header_desc *)data;
 				break;
 			}
 		}
@@ -360,7 +365,7 @@ int usbpn_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		len -= dlen;
 	}
 
-	if (!union_header || !phonet)
+	if (!union_header || !phonet_header)
 		return -EINVAL;
 
 	data_intf = usb_ifnum_to_if(usbdev, union_header->bSlaveInterface0);
@@ -452,6 +457,7 @@ static struct usb_driver usbpn_driver = {
 	.probe =	usbpn_probe,
 	.disconnect =	usbpn_disconnect,
 	.id_table =	usbpn_ids,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init usbpn_init(void)

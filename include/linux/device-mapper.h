@@ -10,6 +10,7 @@
 
 #include <linux/bio.h>
 #include <linux/blkdev.h>
+#include <linux/ratelimit.h>
 
 struct dm_dev;
 struct dm_target;
@@ -22,7 +23,7 @@ typedef enum { STATUSTYPE_INFO, STATUSTYPE_TABLE } status_type_t;
 union map_info {
 	void *ptr;
 	unsigned long long ll;
-	unsigned flush_request;
+	unsigned target_request_nr;
 };
 
 /*
@@ -74,6 +75,18 @@ typedef void (*dm_resume_fn) (struct dm_target *ti);
 typedef int (*dm_status_fn) (struct dm_target *ti, status_type_t status_type,
 			     char *result, unsigned int maxlen);
 
+/*
+ * DM targets that would like to work with old RHEL kernels (< 6.4) but also
+ * take advantage of the ability to pass status flags to the status method in
+ * new kernels (>= 6.4) must implement both .status and .status_with_flags
+ * - care must also be taken to set DM_TARGET_STATUS_WITH_FLAGS in the
+ *   target's .features
+ */
+typedef int (*dm_status_with_flags_fn) (struct dm_target *ti,
+					status_type_t status_type,
+					unsigned status_flags, char *result,
+					unsigned maxlen);
+
 typedef int (*dm_message_fn) (struct dm_target *ti, unsigned argc, char **argv);
 
 typedef int (*dm_ioctl_fn) (struct dm_target *ti, unsigned int cmd,
@@ -118,21 +131,20 @@ struct dm_dev {
 /*
  * Constructors should call these functions to ensure destination devices
  * are opened/closed correctly.
- * FIXME: too many arguments.
  */
-int dm_get_device(struct dm_target *ti, const char *path, sector_t start,
-		  sector_t len, fmode_t mode, struct dm_dev **result);
+int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
+						 struct dm_dev **result);
 void dm_put_device(struct dm_target *ti, struct dm_dev *d);
 
 /*
  * Information about a target type
  */
 
-/*
- * Target features
- */
-
 struct target_type {
+	/*
+	 * 3rd party driver must initialize 'features' to zero or
+	 * set to any of the Target features listed below.
+	 */
 	uint64_t features;
 	const char *name;
 	struct module *module;
@@ -158,9 +170,42 @@ struct target_type {
 
 	/* For internal device-mapper use. */
 	struct list_head list;
+
+#ifndef __GENKSYMS__
+	dm_status_with_flags_fn status_with_flags;
+#endif
 };
 
+/*
+ * Target features
+ */
+
+/*
+ * Any table that contains an instance of this target must have only one.
+ */
+#define DM_TARGET_SINGLETON		0x00000001
+#define dm_target_needs_singleton(type)	((type)->features & DM_TARGET_SINGLETON)
+
+#define DM_TARGET_ALWAYS_WRITEABLE	0x00000002
+#define dm_target_always_writeable(type) \
+		((type)->features & DM_TARGET_ALWAYS_WRITEABLE)
+
+/*
+ * Any device that contains a table with an instance of this target may never
+ * have tables containing any different target type.
+ */
+#define DM_TARGET_IMMUTABLE		0x00000004
+#define dm_target_is_immutable(type)	((type)->features & DM_TARGET_IMMUTABLE)
+
+/*
+ * Target provides the .status_with_flags method (which is RHEL-specific)
+ */
+#define DM_TARGET_STATUS_WITH_FLAGS	0x00000008
+#define dm_target_provides_status_with_flags(type) \
+		((type)->features & DM_TARGET_STATUS_WITH_FLAGS)
+
 struct dm_target {
+	uint64_t features;	/* 3rd party driver must initialize to zero */
 	struct dm_table *table;
 	struct target_type *type;
 
@@ -168,28 +213,122 @@ struct dm_target {
 	sector_t begin;
 	sector_t len;
 
-	/* Always a power of 2 */
+	/*
+	 * If non-zero, maximum size of I/O submitted to a target.
+	 *
+	 * To preserve kABI, retain 'split_io' name rather than use upstream's
+	 * 'max_io_len'.  Also retain the sector_t type rather than use uint32_t.
+	 * In practice no target should be exceeding UINT_MAX for split_io.  All
+	 * targets should be updated to use dm_set_target_max_io_len() to set
+	 * split_io.
+	 */
 	sector_t split_io;
 
 	/*
 	 * A number of zero-length barrier requests that will be submitted
 	 * to the target for the purpose of flushing cache.
 	 *
-	 * The request number will be placed in union map_info->flush_request.
+	 * The request number will be placed in union map_info->target_request_nr.
 	 * It is a responsibility of the target driver to remap these requests
 	 * to the real underlying devices.
 	 */
 	unsigned num_flush_requests;
+
+	/*
+	 * The number of discard requests that will be submitted to the
+	 * target.  map_info->request_nr is used just like num_flush_requests.
+	 */
+	unsigned num_discard_requests;
 
 	/* target specific data */
 	void *private;
 
 	/* Used to provide an error string from the ctr */
 	char *error;
+
+	/*
+	 * Set if this target needs to receive discards regardless of
+	 * whether or not its underlying devices have support.
+	 */
+	unsigned discards_supported:1;
+
+#ifndef __GENKSYMS__
+	/*
+	 * RHEL6ism: continuing to use 'unsigned foo:1' because
+	 * discards_supported cannot change (to bool) due to kABI
+	 */
+
+	/*
+	 * Set if this target needs to receive flushes regardless of
+	 * whether or not its underlying devices have support.
+	 */
+	unsigned flush_supported:1;
+
+	/*
+	 * Set if the target required discard request to be split
+	 * on max_io_len boundary.
+	 */
+	unsigned split_discard_requests:1;
+
+	/*
+	 * Set if this target does not return zeroes on discarded blocks.
+	 */
+	unsigned discard_zeroes_data_unsupported:1;
+#endif
+};
+
+/* Each target can link one of these into the table */
+struct dm_target_callbacks {
+	struct list_head list;
+	int (*congested_fn) (struct dm_target_callbacks *, int);
+	void (*unplug_fn)(struct dm_target_callbacks *);
 };
 
 int dm_register_target(struct target_type *t);
 void dm_unregister_target(struct target_type *t);
+
+/*
+ * Target argument parsing.
+ */
+struct dm_arg_set {
+	unsigned argc;
+	char **argv;
+};
+
+/*
+ * The minimum and maximum value of a numeric argument, together with
+ * the error message to use if the number is found to be outside that range.
+ */
+struct dm_arg {
+	unsigned min;
+	unsigned max;
+	char *error;
+};
+
+/*
+ * Validate the next argument, either returning it as *value or, if invalid,
+ * returning -EINVAL and setting *error.
+ */
+int dm_read_arg(struct dm_arg *arg, struct dm_arg_set *arg_set,
+		unsigned *value, char **error);
+
+/*
+ * Process the next argument as the start of a group containing between
+ * arg->min and arg->max further arguments. Either return the size as
+ * *num_args or, if invalid, return -EINVAL and set *error.
+ */
+int dm_read_arg_group(struct dm_arg *arg, struct dm_arg_set *arg_set,
+		      unsigned *num_args, char **error);
+
+/*
+ * Return the current argument and shift to the next.
+ */
+const char *dm_shift_arg(struct dm_arg_set *as);
+
+/*
+ * Move through num_args arguments.
+ */
+void dm_consume_args(struct dm_arg_set *as, unsigned num_args);
 
 /*-----------------------------------------------------------------
  * Functions for creating and manipulating mapped devices.
@@ -235,7 +374,7 @@ void dm_uevent_add(struct mapped_device *md, struct list_head *elist);
 const char *dm_device_name(struct mapped_device *md);
 int dm_copy_name_and_uuid(struct mapped_device *md, char *name, char *uuid);
 struct gendisk *dm_disk(struct mapped_device *md);
-int dm_suspended(struct mapped_device *md);
+int dm_suspended(struct dm_target *ti);
 int dm_noflush_suspending(struct dm_target *ti);
 union map_info *dm_get_mapinfo(struct bio *bio);
 union map_info *dm_get_rq_mapinfo(struct request *rq);
@@ -264,6 +403,11 @@ int dm_table_add_target(struct dm_table *t, const char *type,
 			sector_t start, sector_t len, char *params);
 
 /*
+ * Target_ctr should call this if it needs to add any callbacks.
+ */
+void dm_table_add_target_callbacks(struct dm_table *t, struct dm_target_callbacks *cb);
+
+/*
  * Finally call this to make the table ready for use.
  */
 int dm_table_complete(struct dm_table *t);
@@ -274,9 +418,14 @@ int dm_table_complete(struct dm_table *t);
 void dm_table_unplug_all(struct dm_table *t);
 
 /*
+ * Target may require that it is never sent I/O larger than len.
+ */
+int __must_check dm_set_target_max_io_len(struct dm_target *ti, sector_t len);
+
+/*
  * Table reference counting.
  */
-struct dm_table *dm_get_table(struct mapped_device *md);
+struct dm_table *dm_get_live_table(struct mapped_device *md);
 void dm_table_get(struct dm_table *t);
 void dm_table_put(struct dm_table *t);
 
@@ -295,8 +444,10 @@ void dm_table_event(struct dm_table *t);
 
 /*
  * The device must be suspended before calling this method.
+ * Returns the previous table, which the caller must destroy.
  */
-int dm_swap_table(struct mapped_device *md, struct dm_table *t);
+struct dm_table *dm_swap_table(struct mapped_device *md,
+			       struct dm_table *t);
 
 /*
  * A wrapper around vmalloc.
@@ -308,6 +459,14 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
  *---------------------------------------------------------------*/
 #define DM_NAME "device-mapper"
 
+#ifdef CONFIG_PRINTK
+extern struct ratelimit_state dm_ratelimit_state;
+
+#define dm_ratelimit()	__ratelimit(&dm_ratelimit_state)
+#else
+#define dm_ratelimit()	0
+#endif
+
 #define DMCRIT(f, arg...) \
 	printk(KERN_CRIT DM_NAME ": " DM_MSG_PREFIX ": " f "\n", ## arg)
 
@@ -315,7 +474,7 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
 	printk(KERN_ERR DM_NAME ": " DM_MSG_PREFIX ": " f "\n", ## arg)
 #define DMERR_LIMIT(f, arg...) \
 	do { \
-		if (printk_ratelimit())	\
+		if (dm_ratelimit())	\
 			printk(KERN_ERR DM_NAME ": " DM_MSG_PREFIX ": " \
 			       f "\n", ## arg); \
 	} while (0)
@@ -324,7 +483,7 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
 	printk(KERN_WARNING DM_NAME ": " DM_MSG_PREFIX ": " f "\n", ## arg)
 #define DMWARN_LIMIT(f, arg...) \
 	do { \
-		if (printk_ratelimit())	\
+		if (dm_ratelimit())	\
 			printk(KERN_WARNING DM_NAME ": " DM_MSG_PREFIX ": " \
 			       f "\n", ## arg); \
 	} while (0)
@@ -333,7 +492,7 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
 	printk(KERN_INFO DM_NAME ": " DM_MSG_PREFIX ": " f "\n", ## arg)
 #define DMINFO_LIMIT(f, arg...) \
 	do { \
-		if (printk_ratelimit())	\
+		if (dm_ratelimit())	\
 			printk(KERN_INFO DM_NAME ": " DM_MSG_PREFIX ": " f \
 			       "\n", ## arg); \
 	} while (0)
@@ -343,7 +502,7 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
 	printk(KERN_DEBUG DM_NAME ": " DM_MSG_PREFIX " DEBUG: " f "\n", ## arg)
 #  define DMDEBUG_LIMIT(f, arg...) \
 	do { \
-		if (printk_ratelimit())	\
+		if (dm_ratelimit())	\
 			printk(KERN_DEBUG DM_NAME ": " DM_MSG_PREFIX ": " f \
 			       "\n", ## arg); \
 	} while (0)
@@ -390,6 +549,12 @@ void *dm_vcalloc(unsigned long nmemb, unsigned long elem_size);
 
 #define dm_array_too_big(fixed, obj, num) \
 	((num) > (UINT_MAX - (fixed)) / (obj))
+
+/*
+ * Sector offset taken relative to the start of the target instead of
+ * relative to the start of the device.
+ */
+#define dm_target_offset(ti, sector) ((sector) - (ti)->begin)
 
 static inline sector_t to_sector(unsigned long n)
 {

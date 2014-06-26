@@ -1,7 +1,7 @@
 /*
  * drivers/input/tablet/wacom_wac.c
  *
- *  USB Wacom Graphire and Wacom Intuos tablet support - Wacom specific code
+ *  USB Wacom tablet support - Wacom specific code
  *
  */
 
@@ -11,6 +11,8 @@
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
  */
+#include <linux/hid.h>
+#include <linux/input/mt.h>
 #include "wacom.h"
 #include "wacom_wac.h"
 
@@ -65,9 +67,8 @@ static int wacom_pl_irq(struct wacom_wac *wacom, void *wcombo)
 
 	prox = data[1] & 0x40;
 
-	wacom->id[0] = ERASER_DEVICE_ID;
 	if (prox) {
-
+		wacom->id[0] = ERASER_DEVICE_ID;
 		pressure = (signed char)((data[7] << 1) | ((data[4] >> 2) & 1));
 		if (wacom->features->pressure_max > 255)
 			pressure = (pressure << 1) | ((data[4] >> 6) & 1);
@@ -148,6 +149,39 @@ static int wacom_ptu_irq(struct wacom_wac *wacom, void *wcombo)
 	wacom_report_abs(wcombo, ABS_PRESSURE, wacom_le16_to_cpu(&data[6]));
 	wacom_report_key(wcombo, BTN_STYLUS, data[1] & 0x02);
 	wacom_report_key(wcombo, BTN_STYLUS2, data[1] & 0x10);
+	return 1;
+}
+
+static int wacom_dtu_irq(struct wacom_wac *wacom, void *wcombo)
+{
+	struct wacom_features *features = wacom->features;
+	char *data = wacom->data;
+	int prox = data[1] & 0x20, pressure;
+
+	dbg("wacom_dtu_irq: received report #%d", data[0]);
+
+	if (prox) {
+		/* Going into proximity select tool */
+		wacom->tool[0] = (data[1] & 0x0c) ? BTN_TOOL_RUBBER : BTN_TOOL_PEN;
+		if (wacom->tool[0] == BTN_TOOL_PEN)
+			wacom->id[0] = STYLUS_DEVICE_ID;
+		else
+			wacom->id[0] = ERASER_DEVICE_ID;
+	}
+	wacom_report_key(wcombo, BTN_STYLUS, data[1] & 0x02);
+	wacom_report_key(wcombo, BTN_STYLUS2, data[1] & 0x10);
+	wacom_report_abs(wcombo, ABS_X, le16_to_cpup((__le16 *)&data[2]));
+	wacom_report_abs(wcombo, ABS_Y, le16_to_cpup((__le16 *)&data[4]));
+	pressure = ((data[7] & 0x01) << 8) | data[6];
+	if (pressure < 0)
+		pressure = features->pressure_max + pressure + 1;
+	wacom_report_abs(wcombo, ABS_PRESSURE, pressure);
+	wacom_report_key(wcombo, BTN_TOUCH, data[1] & 0x05);
+	if (!prox) /* out-prox */
+		wacom->id[0] = 0;
+	wacom_report_key(wcombo, wacom->tool[0], prox);
+	wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
+	wacom_input_sync(wcombo);
 	return 1;
 }
 
@@ -296,8 +330,10 @@ static int wacom_intuos_inout(struct wacom_wac *wacom, void *wcombo)
 			(data[4] << 20) + (data[5] << 12) +
 			(data[6] << 4) + (data[7] >> 4);
 
-		wacom->id[idx] = (data[2] << 4) | (data[3] >> 4);
-		switch (wacom->id[idx]) {
+		wacom->id[idx] = (data[2] << 4) | (data[3] >> 4) |
+			((data[7] & 0x0f) << 20) | ((data[8] & 0xf0) << 12);
+
+		switch (wacom->id[idx] & 0xfffff) {
 			case 0x812: /* Inking pen */
 			case 0x801: /* Intuos3 Inking pen */
 			case 0x20802: /* Intuos4 Classic Pen */
@@ -310,9 +346,9 @@ static int wacom_intuos_inout(struct wacom_wac *wacom, void *wcombo)
 			case 0x823: /* Intuos3 Grip Pen */
 			case 0x813: /* Intuos3 Classic Pen */
 			case 0x885: /* Intuos3 Marker Pen */
-			case 0x802: /* Intuos4 Grip Pen Eraser */
+			case 0x802: /* Intuos4 General Pen Eraser */
 			case 0x804: /* Intuos4 Marker Pen */
-			case 0x40802: /* Intuos4 Classic Pen */
+			case 0x40802: /* Intuos4 Inking Pen */
 			case 0x022:
 				wacom->tool[idx] = BTN_TOOL_PEN;
 				break;
@@ -341,7 +377,7 @@ static int wacom_intuos_inout(struct wacom_wac *wacom, void *wcombo)
 			case 0x81b: /* Intuos3 Classic Pen Eraser */
 			case 0x91b: /* Intuos3 Airbrush Eraser */
 			case 0x80c: /* Intuos4 Marker Pen Eraser */
-			case 0x80a: /* Intuos4 Grip Pen Eraser */
+			case 0x80a: /* Intuos4 General Pen Eraser */
 			case 0x4080a: /* Intuos4 Classic Pen Eraser */
 			case 0x90a: /* Intuos4 Airbrush Eraser */
 				wacom->tool[idx] = BTN_TOOL_RUBBER;
@@ -358,6 +394,12 @@ static int wacom_intuos_inout(struct wacom_wac *wacom, void *wcombo)
 		}
 		return 1;
 	}
+
+	/* older I4 styli don't work with new Cintiqs */
+	if (!((wacom->id[idx] >> 20) & 0x01) &&
+			(wacom->features->type >= WACOM_21UX2 &&
+			 wacom->features->type <= WACOM_24HD))
+		return 1;
 
 	/* Exit report */
 	if ((data[1] & 0xfe) == 0x80) {
@@ -404,8 +446,12 @@ static void wacom_intuos_general(struct wacom_wac *wacom, void *wcombo)
 	/* general pen packet */
 	if ((data[1] & 0xb8) == 0xa0) {
 		t = (data[6] << 2) | ((data[7] >> 6) & 3);
-		if (wacom->features->type >= INTUOS4S && wacom->features->type <= INTUOS4L)
+		if ((wacom->features->type >= INTUOS4S && wacom->features->type <= INTUOS4L) ||
+                    (wacom->features->type >= INTUOS5S && wacom->features->type <= INTUOS5L) ||
+			(wacom->features->type >= WACOM_21UX2 &&
+			wacom->features->type <= WACOM_24HD)) {
 			t = (t << 1) | (data[1] & 1);
+		}
 		wacom_report_abs(wcombo, ABS_PRESSURE, t);
 		wacom_report_abs(wcombo, ABS_TILT_X,
 				((data[7] << 1) & 0x7e) | (data[8] >> 7));
@@ -432,7 +478,7 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 	unsigned int t;
 	int idx = 0, result;
 
-	if (data[0] != 2 && data[0] != 5 && data[0] != 6 && data[0] != 12) {
+	if (data[0] != 2 && data[0] != 3 && data[0] != 5 && data[0] != 6 && data[0] != 12) {
 		dbg("wacom_intuos_irq: received unknown report #%d", data[0]);
                 return 0;
 	}
@@ -442,7 +488,7 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 		idx = data[1] & 0x01;
 
 	/* pad packets. Works as a second tool and is always in prox */
-	if (data[0] == 12) {
+	if (data[0] == 12 || data[0] == 3) {
 		/* initiate the pad as a device */
 		if (wacom->tool[1] != BTN_TOOL_FINGER)
 			wacom->tool[1] = BTN_TOOL_FINGER;
@@ -472,22 +518,128 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 				wacom_report_key(wcombo, wacom->tool[1], 0);
 				wacom_report_abs(wcombo, ABS_MISC, 0);
 			}
+		} else if (wacom->features->type == WACOM_24HD) {
+			wacom_report_key(wcombo, BTN_0, (data[6] & 0x01));
+			wacom_report_key(wcombo, BTN_1, (data[6] & 0x02));
+			wacom_report_key(wcombo, BTN_2, (data[6] & 0x04));
+			wacom_report_key(wcombo, BTN_3, (data[6] & 0x08));
+			wacom_report_key(wcombo, BTN_4, (data[6] & 0x10));
+			wacom_report_key(wcombo, BTN_5, (data[6] & 0x20));
+			wacom_report_key(wcombo, BTN_6, (data[6] & 0x40));
+			wacom_report_key(wcombo, BTN_7, (data[6] & 0x80));
+			wacom_report_key(wcombo, BTN_8, (data[8] & 0x01));
+			wacom_report_key(wcombo, BTN_9, (data[8] & 0x02));
+			wacom_report_key(wcombo, BTN_A, (data[8] & 0x04));
+			wacom_report_key(wcombo, BTN_B, (data[8] & 0x08));
+			wacom_report_key(wcombo, BTN_C, (data[8] & 0x10));
+			wacom_report_key(wcombo, BTN_X, (data[8] & 0x20));
+			wacom_report_key(wcombo, BTN_Y, (data[8] & 0x40));
+			wacom_report_key(wcombo, BTN_Z, (data[8] & 0x80));
+
+			/*
+			 * Three "buttons" are available on the 24HD which are
+			 * physically implemented as a touchstrip. Each button
+			 * is approximately 3 bits wide with a 2 bit spacing.
+			 * The raw touchstrip bits are stored at:
+			 *    ((data[3] & 0x1f) << 8) | data[4])
+			 */
+			wacom_report_key(wcombo, KEY_PROG1, data[4] & 0x07);
+			wacom_report_key(wcombo, KEY_PROG2, data[4] & 0xE0);
+			wacom_report_key(wcombo, KEY_PROG3, data[3] & 0x1C);
+
+			if (data[1] & 0x80) {
+				wacom_report_abs(wcombo, ABS_WHEEL, (data[1] & 0x7f));
+			} else {
+				/* Out of proximity, clear wheel value. */
+				wacom_report_abs(wcombo, ABS_WHEEL, 0);
+			}
+
+			if (data[2] & 0x80) {
+				wacom_report_abs(wcombo, ABS_THROTTLE, (data[2] & 0x7f));
+			} else {
+				/* Out of proximity, clear second wheel value. */
+				wacom_report_abs(wcombo, ABS_THROTTLE, 0);
+			}
+
+			if (data[1] | data[2] | (data[3] & 0x1f) | data[4] | data[6] | data[8]) {
+				wacom_report_key(wcombo, wacom->tool[1], 1);
+				wacom_report_abs(wcombo, ABS_MISC, PAD_DEVICE_ID);
+			} else {
+				wacom_report_key(wcombo, wacom->tool[1], 0);
+				wacom_report_abs(wcombo, ABS_MISC, 0);
+			}
+		} else if (wacom->features->type >= INTUOS5S && wacom->features->type <= INTUOS5L) {
+			int i;
+
+			/* Touch ring mode switch has no capacitive sensor */
+			wacom_report_key(wcombo, BTN_0, (data[3] & 0x01));
+
+			/*
+			 * ExpressKeys on Intuos5 have a capacitive sensor in
+			 * addition to the mechanical switch. Switch data is
+			 * stored in data[4], capacitive data in data[5].
+			 */
+			for (i = 0; i < 8; i++)
+				wacom_report_key(wcombo, BTN_1 + i, data[4] & (1 << i));
+
+			if (data[2] & 0x80) {
+				wacom_report_abs(wcombo, ABS_WHEEL, (data[2] & 0x7f));
+			} else {
+				/* Out of proximity, clear wheel value. */
+				wacom_report_abs(wcombo, ABS_WHEEL, 0);
+			}
+
+			if (data[2] | (data[3] & 0x01) | data[4]) {
+				wacom_report_key(wcombo, wacom->tool[1], 1);
+				wacom_report_abs(wcombo, ABS_MISC, PAD_DEVICE_ID);
+			} else {
+				wacom_report_key(wcombo, wacom->tool[1], 0);
+				wacom_report_abs(wcombo, ABS_MISC, 0);
+			}
 		} else {
-			wacom_report_key(wcombo, BTN_0, (data[5] & 0x01));
-			wacom_report_key(wcombo, BTN_1, (data[5] & 0x02));
-			wacom_report_key(wcombo, BTN_2, (data[5] & 0x04));
-			wacom_report_key(wcombo, BTN_3, (data[5] & 0x08));
-			wacom_report_key(wcombo, BTN_4, (data[6] & 0x01));
-			wacom_report_key(wcombo, BTN_5, (data[6] & 0x02));
-			wacom_report_key(wcombo, BTN_6, (data[6] & 0x04));
-			wacom_report_key(wcombo, BTN_7, (data[6] & 0x08));
-			wacom_report_key(wcombo, BTN_8, (data[5] & 0x10));
-			wacom_report_key(wcombo, BTN_9, (data[6] & 0x10));
+			if (wacom->features->type == WACOM_21UX2 ||
+			    wacom->features->type == WACOM_22HD) {
+				wacom_report_key(wcombo, BTN_0, (data[5] & 0x01));
+				wacom_report_key(wcombo, BTN_1, (data[6] & 0x01));
+				wacom_report_key(wcombo, BTN_2, (data[6] & 0x02));
+				wacom_report_key(wcombo, BTN_3, (data[6] & 0x04));
+				wacom_report_key(wcombo, BTN_4, (data[6] & 0x08));
+				wacom_report_key(wcombo, BTN_5, (data[6] & 0x10));
+				wacom_report_key(wcombo, BTN_6, (data[6] & 0x20));
+				wacom_report_key(wcombo, BTN_7, (data[6] & 0x40));
+				wacom_report_key(wcombo, BTN_8, (data[6] & 0x80));
+				wacom_report_key(wcombo, BTN_9, (data[7] & 0x01));
+				wacom_report_key(wcombo, BTN_A, (data[8] & 0x01));
+				wacom_report_key(wcombo, BTN_B, (data[8] & 0x02));
+				wacom_report_key(wcombo, BTN_C, (data[8] & 0x04));
+				wacom_report_key(wcombo, BTN_X, (data[8] & 0x08));
+				wacom_report_key(wcombo, BTN_Y, (data[8] & 0x10));
+				wacom_report_key(wcombo, BTN_Z, (data[8] & 0x20));
+				wacom_report_key(wcombo, BTN_BASE, (data[8] & 0x40));
+				wacom_report_key(wcombo, BTN_BASE2, (data[8] & 0x80));
+				if (wacom->features->type == WACOM_22HD) {
+					wacom_report_key(wcombo, KEY_PROG1, data[9] & 0x01);
+					wacom_report_key(wcombo, KEY_PROG2, data[9] & 0x02);
+					wacom_report_key(wcombo, KEY_PROG3, data[9] & 0x04);
+				}
+			} else {
+				wacom_report_key(wcombo, BTN_0, (data[5] & 0x01));
+				wacom_report_key(wcombo, BTN_1, (data[5] & 0x02));
+				wacom_report_key(wcombo, BTN_2, (data[5] & 0x04));
+				wacom_report_key(wcombo, BTN_3, (data[5] & 0x08));
+				wacom_report_key(wcombo, BTN_4, (data[6] & 0x01));
+				wacom_report_key(wcombo, BTN_5, (data[6] & 0x02));
+				wacom_report_key(wcombo, BTN_6, (data[6] & 0x04));
+				wacom_report_key(wcombo, BTN_7, (data[6] & 0x08));
+				wacom_report_key(wcombo, BTN_8, (data[5] & 0x10));
+				wacom_report_key(wcombo, BTN_9, (data[6] & 0x10));
+			}
 			wacom_report_abs(wcombo, ABS_RX, ((data[1] & 0x1f) << 8) | data[2]);
 			wacom_report_abs(wcombo, ABS_RY, ((data[3] & 0x1f) << 8) | data[4]);
 
-			if ((data[5] & 0x1f) | (data[6] & 0x1f) | (data[1] & 0x1f) |
-				data[2] | (data[3] & 0x1f) | data[4]) {
+			if ((data[5] & 0x1f) | data[6] | (data[1] & 0x1f) |
+				data[2] | (data[3] & 0x1f) | data[4] | data[8] |
+				(data[7] & 0x01)) {
 				wacom_report_key(wcombo, wacom->tool[1], 1);
 				wacom_report_abs(wcombo, ABS_MISC, PAD_DEVICE_ID);
 			} else {
@@ -513,7 +665,9 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 			&& ((wacom->features->type == INTUOS3)
 			|| (wacom->features->type == INTUOS3S)
 			|| (wacom->features->type == INTUOS4)
-			|| (wacom->features->type == INTUOS4S)))
+			|| (wacom->features->type == INTUOS4S)
+			|| (wacom->features->type == INTUOS5)
+			|| (wacom->features->type == INTUOS5S)))
 		return 0;
 
 	/* Cintiq doesn't send data when RDY bit isn't set */
@@ -564,7 +718,8 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 
 		} else if (wacom->tool[idx] == BTN_TOOL_MOUSE) {
 			/* I4 mouse */
-			if (wacom->features->type >= INTUOS4S && wacom->features->type <= INTUOS4L) {
+			if ((wacom->features->type >= INTUOS4S && wacom->features->type <= INTUOS4L) ||
+			    (wacom->features->type >= INTUOS5S && wacom->features->type <= INTUOS5L)) {
 				wacom_report_key(wcombo, BTN_LEFT,   data[6] & 0x01);
 				wacom_report_key(wcombo, BTN_MIDDLE, data[6] & 0x02);
 				wacom_report_key(wcombo, BTN_RIGHT,  data[6] & 0x04);
@@ -591,7 +746,7 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 				}
 			}
 		} else if ((wacom->features->type < INTUOS3S || wacom->features->type == INTUOS3L ||
-				wacom->features->type == INTUOS4L) &&
+			   wacom->features->type == INTUOS4L || wacom->features->type == INTUOS5L) &&
 			   wacom->tool[idx] == BTN_TOOL_LENS) {
 			/* Lens cursor packets */
 			wacom_report_key(wcombo, BTN_LEFT,   data[8] & 0x01);
@@ -608,118 +763,194 @@ static int wacom_intuos_irq(struct wacom_wac *wacom, void *wcombo)
 	return 1;
 }
 
+static int wacom_tpc_mt_touch(struct wacom_wac *wacom, void *wcombo)
+{
+	unsigned char *data = wacom->data;
+	int contact_with_no_pen_down_count = 0;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		int p = data[1] & (1 << i);
+		bool touch = p && !wacom->shared->stylus_in_proximity;
+
+		wacom_mt_slot(wcombo, i);
+		wacom_mt_report_slot_state(wcombo, MT_TOOL_FINGER, touch);
+		if (touch) {
+			int x = le16_to_cpup((__le16 *)&data[i * 2 + 2]) & 0x7fff;
+			int y = le16_to_cpup((__le16 *)&data[i * 2 + 6]) & 0x7fff;
+
+			wacom_report_abs(wcombo, ABS_MT_POSITION_X, x);
+			wacom_report_abs(wcombo, ABS_MT_POSITION_Y, y);
+			contact_with_no_pen_down_count++;
+		}
+	}
+
+	/* keep touch state for pen event */
+	wacom->shared->touch_down = (contact_with_no_pen_down_count > 0);
+
+	wacom_mt_report_pointer_emulation(wcombo, true);
+
+	return 1;
+}
+
+static int wacom_tpc_single_touch(struct wacom_wac *wacom, void *wcombo, size_t len)
+{
+	char *data = wacom->data;
+	bool prox;
+	int x = 0, y = 0;
+
+	if (!wacom->shared->stylus_in_proximity) {
+		if (len == WACOM_PKGLEN_TPC1FG) {
+			prox = data[0] & 0x01;
+			x = get_unaligned_le16(&data[1]);
+			y = get_unaligned_le16(&data[3]);
+		} else { /* with capacity */
+			prox = data[1] & 0x01;
+			x = le16_to_cpup((__le16 *)&data[2]);
+			y = le16_to_cpup((__le16 *)&data[4]);
+		}
+	} else
+		/* force touch out when pen is in prox */
+		prox = 0;
+
+	if (prox) {
+		wacom_report_abs(wcombo, ABS_X, x);
+		wacom_report_abs(wcombo, ABS_Y, y);
+	}
+	wacom_report_key(wcombo, BTN_TOUCH, prox);
+
+	/* keep touch state for pen events */
+	wacom->shared->touch_down = prox;
+
+	return 1;
+}
+
+static int wacom_tpc_pen(struct wacom_wac *wacom, void *wcombo)
+{
+	struct wacom_features *features = wacom->features;
+	char *data = wacom->data;
+	int pressure;
+	bool prox = data[1] & 0x20;
+
+	if (!wacom->shared->stylus_in_proximity) /* first in prox */
+		/* Going into proximity select tool */
+		wacom->tool[0] = (data[1] & 0x0c) ? BTN_TOOL_RUBBER : BTN_TOOL_PEN;
+
+	/* keep pen state for touch events */
+	wacom->shared->stylus_in_proximity = prox;
+
+	/* send pen events only when touch is up or forced out */
+	if (!wacom->shared->touch_down) {
+		wacom_report_key(wcombo, BTN_STYLUS, data[1] & 0x02);
+		wacom_report_key(wcombo, BTN_STYLUS2, data[1] & 0x10);
+		wacom_report_abs(wcombo, ABS_X, le16_to_cpup((__le16 *)&data[2]));
+		wacom_report_abs(wcombo, ABS_Y, le16_to_cpup((__le16 *)&data[4]));
+		pressure = ((data[7] & 0x01) << 8) | data[6];
+		if (pressure < 0)
+			pressure = features->pressure_max + pressure + 1;
+		wacom_report_abs(wcombo, ABS_PRESSURE, pressure);
+		wacom_report_key(wcombo, BTN_TOUCH, data[1] & 0x05);
+		wacom_report_key(wcombo, wacom->tool[0], prox);
+		wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
+		return 1;
+	}
+
+	return 0;
+}
+
 static int wacom_tpc_irq(struct wacom_wac *wacom, void *wcombo)
 {
 	char *data = wacom->data;
-	int prox = 0, pressure;
-	static int stylusInProx, touchInProx = 1, touchOut;
 	struct urb *urb = ((struct wacom_combo *)wcombo)->urb;
 
 	dbg("wacom_tpc_irq: received report #%d", data[0]);
 
-	if (urb->actual_length == 5 || data[0] == 6) { /* Touch data */
-		if (urb->actual_length == 5) {  /* with touch */
-			prox = data[0] & 0x03;
-		} else {  /* with capacity */
-			prox = data[1] & 0x03;
-		}
+	if (urb->actual_length == WACOM_PKGLEN_TPC1FG || data[0] == 6) /* Touch data */
+		return wacom_tpc_single_touch(wacom, wcombo, urb->actual_length);
+	else if (data[0] == 13)
+		return wacom_tpc_mt_touch(wacom, wcombo);
+	else if (data[0] == 2)
+		return wacom_tpc_pen(wacom, wcombo);
 
-		if (!stylusInProx) { /* stylus not in prox */
-			if (prox) {
-				if (touchInProx) {
-					wacom->tool[1] = BTN_TOOL_DOUBLETAP;
-					wacom->id[0] = TOUCH_DEVICE_ID;
-					if (urb->actual_length != 5) {
-						wacom_report_abs(wcombo, ABS_X, wacom_le16_to_cpu(&data[2]));
-						wacom_report_abs(wcombo, ABS_Y, wacom_le16_to_cpu(&data[4]));
-						wacom_report_abs(wcombo, ABS_PRESSURE, wacom_le16_to_cpu(&data[6]));
-						wacom_report_key(wcombo, BTN_TOUCH, wacom_le16_to_cpu(&data[6]));
-					} else {
-						wacom_report_abs(wcombo, ABS_X, wacom_le16_to_cpu(&data[1]));
-						wacom_report_abs(wcombo, ABS_Y, wacom_le16_to_cpu(&data[3]));
-						wacom_report_key(wcombo, BTN_TOUCH, 1);
-					}
-					wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
-					wacom_report_key(wcombo, wacom->tool[1], prox & 0x01);
-					touchOut = 1;
-					return 1;
-				}
-			} else {
-				wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
-				wacom_report_key(wcombo, wacom->tool[1], prox & 0x01);
-				wacom_report_key(wcombo, BTN_TOUCH, 0);
-				touchOut = 0;
-				touchInProx = 1;
-				return 1;
-			}
-		} else if (touchOut || !prox) { /* force touch out-prox */
-			wacom_report_abs(wcombo, ABS_MISC, TOUCH_DEVICE_ID);
-			wacom_report_key(wcombo, wacom->tool[1], 0);
-			wacom_report_key(wcombo, BTN_TOUCH, 0);
-			touchOut = 0;
-			touchInProx = 1;
-			return 1;
-		}
-	} else if (data[0] == 2) { /* Penabled */
-		prox = data[1] & 0x20;
-
-		touchInProx = 0;
-
-		wacom->id[0] = ERASER_DEVICE_ID;
-
-		/*
-		 * if going from out of proximity into proximity select between the eraser
-		 * and the pen based on the state of the stylus2 button, choose eraser if
-		 * pressed else choose pen. if not a proximity change from out to in, send
-		 * an out of proximity for previous tool then a in for new tool.
-		 */
-		if (prox) { /* in prox */
-			if (!wacom->tool[0]) {
-				/* Going into proximity select tool */
-				wacom->tool[1] = (data[1] & 0x08) ? BTN_TOOL_RUBBER : BTN_TOOL_PEN;
-				if (wacom->tool[1] == BTN_TOOL_PEN)
-					wacom->id[0] = STYLUS_DEVICE_ID;
-			} else if (wacom->tool[1] == BTN_TOOL_RUBBER && !(data[1] & 0x08)) {
-				/*
-				 * was entered with stylus2 pressed
-				 * report out proximity for previous tool
-				*/
-				wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
-				wacom_report_key(wcombo, wacom->tool[1], 0);
-				wacom_input_sync(wcombo);
-
-				/* set new tool */
-				wacom->tool[1] = BTN_TOOL_PEN;
-				wacom->id[0] = STYLUS_DEVICE_ID;
-				return 0;
-			}
-			if (wacom->tool[1] != BTN_TOOL_RUBBER) {
-				/* Unknown tool selected default to pen tool */
-				wacom->tool[1] = BTN_TOOL_PEN;
-				wacom->id[0] = STYLUS_DEVICE_ID;
-			}
-			wacom_report_key(wcombo, BTN_STYLUS, data[1] & 0x02);
-			wacom_report_key(wcombo, BTN_STYLUS2, data[1] & 0x10);
-			wacom_report_abs(wcombo, ABS_X, wacom_le16_to_cpu(&data[2]));
-			wacom_report_abs(wcombo, ABS_Y, wacom_le16_to_cpu(&data[4]));
-			pressure = ((data[7] & 0x01) << 8) | data[6];
-			if (pressure < 0)
-				pressure = wacom->features->pressure_max + pressure + 1;
-			wacom_report_abs(wcombo, ABS_PRESSURE, pressure);
-			wacom_report_key(wcombo, BTN_TOUCH, pressure);
-		} else {
-			wacom_report_abs(wcombo, ABS_PRESSURE, 0);
-			wacom_report_key(wcombo, BTN_STYLUS, 0);
-			wacom_report_key(wcombo, BTN_STYLUS2, 0);
-			wacom_report_key(wcombo, BTN_TOUCH, 0);
-		}
-		wacom_report_key(wcombo, wacom->tool[1], prox);
-		wacom_report_abs(wcombo, ABS_MISC, wacom->id[0]);
-		stylusInProx = prox;
-		wacom->tool[0] = prox;
-		return 1;
-	}
 	return 0;
+}
+
+static int wacom_bpt_pen(struct wacom_wac *wacom, struct wacom_combo *wcombo)
+{
+	struct input_dev *input = wcombo->wacom->dev;
+	unsigned char *data = wacom->data;
+	int prox = 0, x = 0, y = 0, p = 0, d = 0, pen = 0, btn1 = 0, btn2 = 0;
+
+	if (data[0] != 0x02)
+	    return 0;
+
+	prox = (data[1] & 0x20) == 0x20;
+
+	/*
+	 * All reports shared between PEN and RUBBER tool must be
+	 * forced to a known starting value (zero) when transitioning to
+	 * out-of-prox.
+	 *
+	 * If not reset then, to userspace, it will look like lost events
+	 * if new tool comes in-prox with same values as previous tool sent.
+	 *
+	 * Hardware does report zero in most out-of-prox cases but not all.
+	 */
+	if (prox) {
+		if (!wacom->tool[0]) {
+			if (data[1] & 0x08) {
+				wacom->tool[0] = BTN_TOOL_RUBBER;
+				wacom->id[0] = ERASER_DEVICE_ID;
+			} else {
+				wacom->tool[0] = BTN_TOOL_PEN;
+				wacom->id[0] = STYLUS_DEVICE_ID;
+			}
+		}
+		x = le16_to_cpup((__le16 *)&data[2]);
+		y = le16_to_cpup((__le16 *)&data[4]);
+		p = le16_to_cpup((__le16 *)&data[6]);
+		/*
+		 * Convert distance from out prox to distance from tablet.
+		 * distance will be greater than distance_max once
+		 * touching and applying pressure; do not report negative
+		 * distance.
+		 */
+		if (data[8] <= wacom->features->distance_max)
+			d = wacom->features->distance_max - data[8];
+
+		pen = data[1] & 0x01;
+		btn1 = data[1] & 0x02;
+		btn2 = data[1] & 0x04;
+	}
+
+	input_report_key(input, BTN_TOUCH, pen);
+	input_report_key(input, BTN_STYLUS, btn1);
+	input_report_key(input, BTN_STYLUS2, btn2);
+
+	input_report_abs(input, ABS_X, x);
+	input_report_abs(input, ABS_Y, y);
+	input_report_abs(input, ABS_PRESSURE, p);
+	input_report_abs(input, ABS_DISTANCE, d);
+
+	if (!prox)
+		wacom->id[0] = 0;
+
+	input_report_key(input, wacom->tool[0], prox); /* PEN or RUBBER */
+	input_report_abs(input, ABS_MISC, wacom->id[0]); /* TOOL ID */
+
+	if (!prox)
+		wacom->tool[0] = 0;
+
+	return 1;
+
+}
+
+static int wacom_bpt_irq(struct wacom_wac *wacom, void *wcombo)
+{
+	struct wacom_combo *wc = wcombo;
+
+	/* currently only CTL-460 (Bamboo pen) is supported */
+	return wacom_bpt_pen(wacom, wc);
 }
 
 int wacom_wac_irq(struct wacom_wac *wacom_wac, void *wcombo)
@@ -739,6 +970,9 @@ int wacom_wac_irq(struct wacom_wac *wacom_wac, void *wcombo)
 		case PTU:
 			return wacom_ptu_irq(wacom_wac, wcombo);
 
+		case DTU:
+			return wacom_dtu_irq(wacom_wac, wcombo);
+
 		case INTUOS:
 		case INTUOS3S:
 		case INTUOS3:
@@ -746,12 +980,21 @@ int wacom_wac_irq(struct wacom_wac *wacom_wac, void *wcombo)
 		case INTUOS4S:
 		case INTUOS4:
 		case INTUOS4L:
+		case INTUOS5S:
+		case INTUOS5:
+		case INTUOS5L:
 		case CINTIQ:
 		case WACOM_BEE:
+		case WACOM_21UX2:
+		case WACOM_22HD:
+		case WACOM_24HD:
 			return wacom_intuos_irq(wacom_wac, wcombo);
 
 		case TABLETPC:
+		case TABLETPC2FG:
 			return wacom_tpc_irq(wacom_wac, wcombo);
+		case BAMBOO_PT:
+			return wacom_bpt_irq(wacom_wac, wcombo);
 
 		default:
 			return 0;
@@ -770,11 +1013,20 @@ void wacom_init_input_dev(struct input_dev *input_dev, struct wacom_wac *wacom_w
 		case GRAPHIRE:
 			input_dev_g(input_dev, wacom_wac);
 			break;
+		case WACOM_24HD:
+			input_dev_24hd(input_dev, wacom_wac);
+			break;
+		case WACOM_22HD:
+			input_dev_c22hd(input_dev, wacom_wac);
+			/* fall through */
+		case WACOM_21UX2:
+			input_dev_c21ux2(input_dev, wacom_wac);
+			/* fall through */
 		case WACOM_BEE:
 			input_dev_bee(input_dev, wacom_wac);
+                        /* fall through */
 		case INTUOS3:
 		case INTUOS3L:
-		case CINTIQ:
 			input_dev_i3(input_dev, wacom_wac);
 			/* fall through */
 		case INTUOS3S:
@@ -783,90 +1035,124 @@ void wacom_init_input_dev(struct input_dev *input_dev, struct wacom_wac *wacom_w
 		case INTUOS:
 			input_dev_i(input_dev, wacom_wac);
 			break;
+		case INTUOS5:
+		case INTUOS5L:
 		case INTUOS4:
 		case INTUOS4L:
 			input_dev_i4(input_dev, wacom_wac);
 			/* fall through */
+		case INTUOS5S:
 		case INTUOS4S:
 			input_dev_i4s(input_dev, wacom_wac);
 			input_dev_i(input_dev, wacom_wac);
 			break;
+		case TABLETPC2FG:
+			input_dev_tpc2fg(input_dev, wacom_wac);
+			/* fall through */
+		case TABLETPC:
+			input_dev_tpc(input_dev, wacom_wac);
+			if (wacom_wac->features->device_type != BTN_TOOL_PEN)
+				break;  /* no need to process stylus stuff */
+
+			/* fall through */
 		case PL:
 		case PTU:
-		case TABLETPC:
+		case DTU:
 			input_dev_pl(input_dev, wacom_wac);
 			/* fall through */
 		case PENPARTNER:
 			input_dev_pt(input_dev, wacom_wac);
+			break;
+                case CINTIQ:
+                        input_dev_cintiq(input_dev, wacom_wac);
+                        break;
+		case BAMBOO_PT:
+			input_dev_bamboo_pt(input_dev, wacom_wac);
 			break;
 	}
 	return;
 }
 
 static struct wacom_features wacom_features[] = {
-	{ "Wacom Penpartner",    7,   5040,  3780,  255,  0, PENPARTNER },
-        { "Wacom Graphire",      8,  10206,  7422,  511, 63, GRAPHIRE },
-	{ "Wacom Graphire2 4x5", 8,  10206,  7422,  511, 63, GRAPHIRE },
-	{ "Wacom Graphire2 5x7", 8,  13918, 10206,  511, 63, GRAPHIRE },
-	{ "Wacom Graphire3",     8,  10208,  7424,  511, 63, GRAPHIRE },
-	{ "Wacom Graphire3 6x8", 8,  16704, 12064,  511, 63, GRAPHIRE },
-	{ "Wacom Graphire4 4x5", 8,  10208,  7424,  511, 63, WACOM_G4 },
-	{ "Wacom Graphire4 6x8", 8,  16704, 12064,  511, 63, WACOM_G4 },
-	{ "Wacom BambooFun 4x5", 9,  14760,  9225,  511, 63, WACOM_MO },
-	{ "Wacom BambooFun 6x8", 9,  21648, 13530,  511, 63, WACOM_MO },
-	{ "Wacom Bamboo1 Medium",8,  16704, 12064,  511, 63, GRAPHIRE },
-	{ "Wacom Volito",        8,   5104,  3712,  511, 63, GRAPHIRE },
-	{ "Wacom PenStation2",   8,   3250,  2320,  255, 63, GRAPHIRE },
-	{ "Wacom Volito2 4x5",   8,   5104,  3712,  511, 63, GRAPHIRE },
-	{ "Wacom Volito2 2x3",   8,   3248,  2320,  511, 63, GRAPHIRE },
-	{ "Wacom PenPartner2",   8,   3250,  2320,  511, 63, GRAPHIRE },
-	{ "Wacom Bamboo",        9,  14760,  9225,  511, 63, WACOM_MO },
-	{ "Wacom Bamboo1",       8,   5104,  3712,  511, 63, GRAPHIRE },
-	{ "Wacom Intuos 4x5",   10,  12700, 10600, 1023, 31, INTUOS },
-	{ "Wacom Intuos 6x8",   10,  20320, 16240, 1023, 31, INTUOS },
-	{ "Wacom Intuos 9x12",  10,  30480, 24060, 1023, 31, INTUOS },
-	{ "Wacom Intuos 12x12", 10,  30480, 31680, 1023, 31, INTUOS },
-	{ "Wacom Intuos 12x18", 10,  45720, 31680, 1023, 31, INTUOS },
-	{ "Wacom PL400",         8,   5408,  4056,  255,  0, PL },
-	{ "Wacom PL500",         8,   6144,  4608,  255,  0, PL },
-	{ "Wacom PL600",         8,   6126,  4604,  255,  0, PL },
-	{ "Wacom PL600SX",       8,   6260,  5016,  255,  0, PL },
-	{ "Wacom PL550",         8,   6144,  4608,  511,  0, PL },
-	{ "Wacom PL800",         8,   7220,  5780,  511,  0, PL },
-	{ "Wacom PL700",         8,   6758,  5406,  511,  0, PL },
-	{ "Wacom PL510",         8,   6282,  4762,  511,  0, PL },
-	{ "Wacom DTU710",        8,  34080, 27660,  511,  0, PL },
-	{ "Wacom DTF521",        8,   6282,  4762,  511,  0, PL },
-	{ "Wacom DTF720",        8,   6858,  5506,  511,  0, PL },
-	{ "Wacom DTF720a",       8,   6858,  5506,  511,  0, PL },
-	{ "Wacom Cintiq Partner",8,  20480, 15360,  511,  0, PTU },
-	{ "Wacom Intuos2 4x5",   10, 12700, 10600, 1023, 31, INTUOS },
-	{ "Wacom Intuos2 6x8",   10, 20320, 16240, 1023, 31, INTUOS },
-	{ "Wacom Intuos2 9x12",  10, 30480, 24060, 1023, 31, INTUOS },
-	{ "Wacom Intuos2 12x12", 10, 30480, 31680, 1023, 31, INTUOS },
-	{ "Wacom Intuos2 12x18", 10, 45720, 31680, 1023, 31, INTUOS },
-	{ "Wacom Intuos3 4x5",   10, 25400, 20320, 1023, 63, INTUOS3S },
-	{ "Wacom Intuos3 6x8",   10, 40640, 30480, 1023, 63, INTUOS3 },
-	{ "Wacom Intuos3 9x12",  10, 60960, 45720, 1023, 63, INTUOS3 },
-	{ "Wacom Intuos3 12x12", 10, 60960, 60960, 1023, 63, INTUOS3L },
-	{ "Wacom Intuos3 12x19", 10, 97536, 60960, 1023, 63, INTUOS3L },
-	{ "Wacom Intuos3 6x11",  10, 54204, 31750, 1023, 63, INTUOS3 },
-	{ "Wacom Intuos3 4x6",   10, 31496, 19685, 1023, 63, INTUOS3S },
-	{ "Wacom Intuos4 4x6",   10, 31496, 19685, 2047, 63, INTUOS4S },
-	{ "Wacom Intuos4 6x9",   10, 44704, 27940, 2047, 63, INTUOS4 },
-	{ "Wacom Intuos4 8x13",  10, 65024, 40640, 2047, 63, INTUOS4L },
-	{ "Wacom Intuos4 12x19", 10, 97536, 60960, 2047, 63, INTUOS4L },
-	{ "Wacom Cintiq 21UX",   10, 87200, 65600, 1023, 63, CINTIQ },
-	{ "Wacom Cintiq 20WSX",  10, 86680, 54180, 1023, 63, WACOM_BEE },
-	{ "Wacom Cintiq 12WX",   10, 53020, 33440, 1023, 63, WACOM_BEE },
-	{ "Wacom DTU1931",        8, 37832, 30305,  511,  0, PL },
-	{ "Wacom ISDv4 90",       8, 26202, 16325,  255,  0, TABLETPC },
-	{ "Wacom ISDv4 93",       8, 26202, 16325,  255,  0, TABLETPC },
-	{ "Wacom ISDv4 9A",       8, 26202, 16325,  255,  0, TABLETPC },
-	{ "Wacom Intuos2 6x8",   10, 20320, 16240, 1023, 31, INTUOS },
+	{ "Wacom Penpartner",    WACOM_PKGLEN_PENPRTN,   5040,  3780,  255,  0, PENPARTNER },
+	{ "Wacom Graphire",      WACOM_PKGLEN_GRAPHIRE,  10206,  7422,  511, 63, GRAPHIRE },
+	{ "Wacom Graphire2 4x5", WACOM_PKGLEN_GRAPHIRE,  10206,  7422,  511, 63, GRAPHIRE },
+	{ "Wacom Graphire2 5x7", WACOM_PKGLEN_GRAPHIRE,  13918, 10206,  511, 63, GRAPHIRE },
+	{ "Wacom Graphire3",     WACOM_PKGLEN_GRAPHIRE,  10208,  7424,  511, 63, GRAPHIRE },
+	{ "Wacom Graphire3 6x8", WACOM_PKGLEN_GRAPHIRE,  16704, 12064,  511, 63, GRAPHIRE },
+	{ "Wacom Graphire4 4x5", WACOM_PKGLEN_GRAPHIRE,  10208,  7424,  511, 63, WACOM_G4 },
+	{ "Wacom Graphire4 6x8", WACOM_PKGLEN_GRAPHIRE,  16704, 12064,  511, 63, WACOM_G4 },
+	{ "Wacom BambooFun 4x5", WACOM_PKGLEN_BBFUN,  14760,  9225,  511, 63, WACOM_MO },
+	{ "Wacom BambooFun 6x8", WACOM_PKGLEN_BBFUN,  21648, 13530,  511, 63, WACOM_MO },
+	{ "Wacom Bamboo1 Medium",WACOM_PKGLEN_GRAPHIRE,  16704, 12064,  511, 63, GRAPHIRE },
+	{ "Wacom Volito",        WACOM_PKGLEN_GRAPHIRE,   5104,  3712,  511, 63, GRAPHIRE },
+	{ "Wacom PenStation2",   WACOM_PKGLEN_GRAPHIRE,   3250,  2320,  255, 63, GRAPHIRE },
+	{ "Wacom Volito2 4x5",   WACOM_PKGLEN_GRAPHIRE,   5104,  3712,  511, 63, GRAPHIRE },
+	{ "Wacom Volito2 2x3",   WACOM_PKGLEN_GRAPHIRE,   3248,  2320,  511, 63, GRAPHIRE },
+	{ "Wacom PenPartner2",   WACOM_PKGLEN_GRAPHIRE,   3250,  2320,  511, 63, GRAPHIRE },
+	{ "Wacom Bamboo",        WACOM_PKGLEN_BBFUN,  14760,  9225,  511, 63, WACOM_MO },
+	{ "Wacom Bamboo1",       WACOM_PKGLEN_GRAPHIRE,   5104,  3712,  511, 63, GRAPHIRE },
+	{ "Wacom Intuos 4x5",    WACOM_PKGLEN_INTUOS,  12700, 10600, 1023, 31, INTUOS },
+	{ "Wacom Intuos 6x8",    WACOM_PKGLEN_INTUOS,  20320, 16240, 1023, 31, INTUOS },
+	{ "Wacom Intuos 9x12",   WACOM_PKGLEN_INTUOS,  30480, 24060, 1023, 31, INTUOS },
+	{ "Wacom Intuos 12x12",  WACOM_PKGLEN_INTUOS,  30480, 31680, 1023, 31, INTUOS },
+	{ "Wacom Intuos 12x18",  WACOM_PKGLEN_INTUOS,  45720, 31680, 1023, 31, INTUOS },
+	{ "Wacom PL400",         WACOM_PKGLEN_GRAPHIRE,   5408,  4056,  255,  0, PL },
+	{ "Wacom PL500",         WACOM_PKGLEN_GRAPHIRE,   6144,  4608,  255,  0, PL },
+	{ "Wacom PL600",         WACOM_PKGLEN_GRAPHIRE,   6126,  4604,  255,  0, PL },
+	{ "Wacom PL600SX",       WACOM_PKGLEN_GRAPHIRE,   6260,  5016,  255,  0, PL },
+	{ "Wacom PL550",         WACOM_PKGLEN_GRAPHIRE,   6144,  4608,  511,  0, PL },
+	{ "Wacom PL800",         WACOM_PKGLEN_GRAPHIRE,   7220,  5780,  511,  0, PL },
+	{ "Wacom PL700",         WACOM_PKGLEN_GRAPHIRE,   6758,  5406,  511,  0, PL },
+	{ "Wacom PL510",         WACOM_PKGLEN_GRAPHIRE,   6282,  4762,  511,  0, PL },
+	{ "Wacom DTU710",        WACOM_PKGLEN_GRAPHIRE,  34080, 27660,  511,  0, PL },
+	{ "Wacom DTF521",        WACOM_PKGLEN_GRAPHIRE,   6282,  4762,  511,  0, PL },
+	{ "Wacom DTF720",        WACOM_PKGLEN_GRAPHIRE,   6858,  5506,  511,  0, PL },
+	{ "Wacom DTF720a",       WACOM_PKGLEN_GRAPHIRE,   6858,  5506,  511,  0, PL },
+	{ "Wacom Cintiq Partner",WACOM_PKGLEN_GRAPHIRE,  20480, 15360,  511,  0, PTU },
+	{ "Wacom Intuos2 4x5",   WACOM_PKGLEN_INTUOS, 12700, 10600, 1023, 31, INTUOS },
+	{ "Wacom Intuos2 6x8",   WACOM_PKGLEN_INTUOS, 20320, 16240, 1023, 31, INTUOS },
+	{ "Wacom Intuos2 9x12",  WACOM_PKGLEN_INTUOS, 30480, 24060, 1023, 31, INTUOS },
+	{ "Wacom Intuos2 12x12", WACOM_PKGLEN_INTUOS, 30480, 31680, 1023, 31, INTUOS },
+	{ "Wacom Intuos2 12x18", WACOM_PKGLEN_INTUOS, 45720, 31680, 1023, 31, INTUOS },
+	{ "Wacom Intuos3 4x5",   WACOM_PKGLEN_INTUOS, 25400, 20320, 1023, 63, INTUOS3S },
+	{ "Wacom Intuos3 6x8",   WACOM_PKGLEN_INTUOS, 40640, 30480, 1023, 63, INTUOS3 },
+	{ "Wacom Intuos3 9x12",  WACOM_PKGLEN_INTUOS, 60960, 45720, 1023, 63, INTUOS3 },
+	{ "Wacom Intuos3 12x12", WACOM_PKGLEN_INTUOS, 60960, 60960, 1023, 63, INTUOS3L },
+	{ "Wacom Intuos3 12x19", WACOM_PKGLEN_INTUOS, 97536, 60960, 1023, 63, INTUOS3L },
+	{ "Wacom Intuos3 6x11",  WACOM_PKGLEN_INTUOS, 54204, 31750, 1023, 63, INTUOS3 },
+	{ "Wacom Intuos3 4x6",   WACOM_PKGLEN_INTUOS, 31496, 19685, 1023, 63, INTUOS3S },
+	{ "Wacom Intuos4 4x6",   WACOM_PKGLEN_INTUOS, 31496, 19685, 2047, 63, INTUOS4S },
+	{ "Wacom Intuos4 6x9",   WACOM_PKGLEN_INTUOS, 44704, 27940, 2047, 63, INTUOS4 },
+	{ "Wacom Intuos4 8x13",  WACOM_PKGLEN_INTUOS, 65024, 40640, 2047, 63, INTUOS4L },
+	{ "Wacom Intuos4 12x19", WACOM_PKGLEN_INTUOS, 97536, 60960, 2047, 63, INTUOS4L },
+	{ "Wacom Intuos4 WL",    WACOM_PKGLEN_INTUOS, 40840, 25400, 2047, 63, INTUOS4 },
+	{ "Wacom Cintiq 21UX",   WACOM_PKGLEN_INTUOS, 87200, 65600, 1023, 63, CINTIQ },
+	{ "Wacom Cintiq 20WSX",  WACOM_PKGLEN_INTUOS, 86680, 54180, 1023, 63, WACOM_BEE },
+	{ "Wacom Cintiq 12WX",   WACOM_PKGLEN_INTUOS, 53020, 33440, 1023, 63, WACOM_BEE },
+	{ "Wacom DTU1931",       WACOM_PKGLEN_GRAPHIRE, 37832, 30305,  511,  0, PL },
+	{ "Wacom Cintiq 21UX2",  WACOM_PKGLEN_INTUOS, 87200, 65600, 2047, 63, WACOM_21UX2 },
+	{ "Wacom ISDv4 90",      WACOM_PKGLEN_GRAPHIRE, 26202, 16325,  255,  0, TABLETPC },
+	{ "Wacom ISDv4 93",      WACOM_PKGLEN_GRAPHIRE, 26202, 16325,  255,  0, TABLETPC },
+	{ "Wacom ISDv4 9A",      WACOM_PKGLEN_GRAPHIRE, 26202, 16325,  255,  0, TABLETPC },
+	{ "Wacom Intuos2 6x8",   WACOM_PKGLEN_INTUOS, 20320, 16240, 1023, 31, INTUOS },
+	{ "Wacom DTU2231",       WACOM_PKGLEN_GRAPHIRE, 47864, 27011,  511,  0, DTU },
+	{ "Wacom DTU1631",       WACOM_PKGLEN_GRAPHIRE, 34623, 19553,  511,  0, DTU },
+	{ "Wacom Cintiq 24HD",   WACOM_PKGLEN_INTUOS,104480, 65600, 2047, 63, WACOM_24HD },
+	{ "Wacom Intuos5 touch S", WACOM_PKGLEN_INTUOS,31496,19685, 2047, 63, INTUOS5S },
+	{ "Wacom Intuos5 touch M", WACOM_PKGLEN_INTUOS,44704,27940, 2047, 63, INTUOS5 },
+	{ "Wacom Intuos5 touch L", WACOM_PKGLEN_INTUOS,65024,40640, 2047, 63, INTUOS5L },
+	{ "Wacom Intuos5 S",     WACOM_PKGLEN_INTUOS, 31496, 19685, 2047, 63, INTUOS5S },
+	{ "Wacom Intuos5 M",     WACOM_PKGLEN_INTUOS, 44704, 27940, 2047, 63, INTUOS5 },
+	{ "Wacom Bamboo Pen",	 WACOM_PKGLEN_BBFUN, 14720,  9200, 1023, 31, BAMBOO_PT },
+	{ "Wacom Cintiq 22HD",	 WACOM_PKGLEN_INTUOS, 95840, 54260, 2047, 63, WACOM_22HD },
+	{ "Wacom ISDv4 E6",      WACOM_PKGLEN_TPC2FG, 27760, 15694,  255,  0, TABLETPC2FG },
 	{ }
 };
 
+#define USB_DEVICE_DETAILED(prod, class, sub, proto)			\
+	USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_WACOM, prod, class, \
+			      sub, proto),
 static struct usb_device_id wacom_ids[] = {
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x00) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x10) },
@@ -920,14 +1206,47 @@ static struct usb_device_id wacom_ids[] = {
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xB9) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xBA) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xBB) },
+	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xBC) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x3F) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xC5) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xC6) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xC7) },
+	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xCC) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x90) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x93) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x9A) },
 	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0x47) },
+	/*
+	 * DTU-2231 has two interfaces on the same configuration, only one is
+ 	 * used
+ 	 */
+	{ USB_DEVICE_DETAILED(0xCE, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xF0) },
+	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xF4) },
+	{ USB_DEVICE_DETAILED(0x26, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0x27, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0x28, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0x29, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0x2A, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0xD4, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE_DETAILED(0xFA, USB_CLASS_HID,
+			      USB_INTERFACE_SUBCLASS_BOOT,
+			      USB_INTERFACE_PROTOCOL_MOUSE) },
+	{ USB_DEVICE(USB_VENDOR_ID_WACOM, 0xE6) },
 	{ }
 };
 

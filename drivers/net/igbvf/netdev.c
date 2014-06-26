@@ -1,7 +1,7 @@
 /*******************************************************************************
 
   Intel(R) 82576 Virtual Function Linux driver
-  Copyright(c) 2009 Intel Corporation.
+  Copyright(c) 2009 - 2012 Intel Corporation.
 
   This program is free software; you can redistribute it and/or modify it
   under the terms and conditions of the GNU General Public License,
@@ -25,6 +25,8 @@
 
 *******************************************************************************/
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/init.h>
@@ -35,21 +37,28 @@
 #include <linux/netdevice.h>
 #include <linux/tcp.h>
 #include <linux/ipv6.h>
+#include <linux/slab.h>
 #include <net/checksum.h>
 #include <net/ip6_checksum.h>
 #include <linux/mii.h>
 #include <linux/ethtool.h>
 #include <linux/if_vlan.h>
-#include <linux/pm_qos_params.h>
+#include <linux/prefetch.h>
 
 #include "igbvf.h"
 
-#define DRV_VERSION "1.0.0-k0"
+#define DRV_VERSION "2.0.2-k"
 char igbvf_driver_name[] = "igbvf";
 const char igbvf_driver_version[] = DRV_VERSION;
 static const char igbvf_driver_string[] =
-				"Intel(R) Virtual Function Network Driver";
-static const char igbvf_copyright[] = "Copyright (c) 2009 Intel Corporation.";
+		  "Intel(R) Gigabit Virtual Function Network Driver";
+static const char igbvf_copyright[] =
+		  "Copyright (c) 2009 - 2012 Intel Corporation.";
+
+#define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
+static int debug = -1;
+module_param(debug, int, 0);
+MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
 
 static int igbvf_poll(struct napi_struct *napi, int budget);
 static void igbvf_reset(struct igbvf_adapter *);
@@ -63,8 +72,16 @@ static struct igbvf_info igbvf_vf_info = {
 	.init_ops               = e1000_init_function_pointers_vf,
 };
 
+static struct igbvf_info igbvf_i350_vf_info = {
+	.mac			= e1000_vfadapt_i350,
+	.flags			= 0,
+	.pba			= 10,
+	.init_ops		= e1000_init_function_pointers_vf,
+};
+
 static const struct igbvf_info *igbvf_info_tbl[] = {
 	[board_vf]              = &igbvf_vf_info,
+	[board_i350_vf]		= &igbvf_i350_vf_info,
 };
 
 /**
@@ -90,11 +107,16 @@ static void igbvf_receive_skb(struct igbvf_adapter *adapter,
                               struct sk_buff *skb,
                               u32 status, u16 vlan)
 {
-	if (adapter->vlgrp && (status & E1000_RXD_STAT_VP))
-		vlan_hwaccel_receive_skb(skb, adapter->vlgrp,
-		                         le16_to_cpu(vlan) &
-		                         E1000_RXD_SPC_VLAN_MASK);
-	else
+	u16 vid;
+
+	if (adapter->vlgrp && (status & E1000_RXD_STAT_VP)) {
+		if ((adapter->flags & IGBVF_FLAG_RX_LB_VLAN_BSWAP) &&
+		    (status & E1000_RXDEXT_STATERR_LB))
+			vid = be16_to_cpu(vlan) & E1000_RXD_SPC_VLAN_MASK;
+		else
+			vid = le16_to_cpu(vlan) & E1000_RXD_SPC_VLAN_MASK;
+		vlan_hwaccel_receive_skb(skb, adapter->vlgrp, vid);
+	} else
 		netif_receive_skb(skb);
 }
 
@@ -163,29 +185,36 @@ static void igbvf_alloc_rx_buffers(struct igbvf_ring *rx_ring,
 				buffer_info->page_offset ^= PAGE_SIZE / 2;
 			}
 			buffer_info->page_dma =
-				pci_map_page(pdev, buffer_info->page,
+				dma_map_page(&pdev->dev, buffer_info->page,
 				             buffer_info->page_offset,
 				             PAGE_SIZE / 2,
-				             PCI_DMA_FROMDEVICE);
+					     DMA_FROM_DEVICE);
+			if (dma_mapping_error(&pdev->dev,
+					      buffer_info->page_dma)) {
+				__free_page(buffer_info->page);
+				buffer_info->page = NULL;
+				dev_err(&pdev->dev, "RX DMA map failed\n");
+				break;
+			}
 		}
 
 		if (!buffer_info->skb) {
-			skb = netdev_alloc_skb(netdev, bufsz + NET_IP_ALIGN);
+			skb = netdev_alloc_skb_ip_align(netdev, bufsz);
 			if (!skb) {
 				adapter->alloc_rx_buff_failed++;
 				goto no_buffers;
 			}
 
-			/* Make buffer alignment 2 beyond a 16 byte boundary
-			 * this will result in a 16 byte aligned IP header after
-			 * the 14 byte MAC header is removed
-			 */
-			skb_reserve(skb, NET_IP_ALIGN);
-
 			buffer_info->skb = skb;
-			buffer_info->dma = pci_map_single(pdev, skb->data,
+			buffer_info->dma = dma_map_single(&pdev->dev, skb->data,
 			                                  bufsz,
-			                                  PCI_DMA_FROMDEVICE);
+							  DMA_FROM_DEVICE);
+			if (dma_mapping_error(&pdev->dev, buffer_info->dma)) {
+				dev_kfree_skb(buffer_info->skb);
+				buffer_info->skb = NULL;
+				dev_err(&pdev->dev, "RX DMA map failed\n");
+				goto no_buffers;
+			}
 		}
 		/* Refresh the desc even if buffer_addrs didn't change because
 		 * each write-back erases this info. */
@@ -252,6 +281,7 @@ static bool igbvf_clean_rx_irq(struct igbvf_adapter *adapter,
 		if (*work_done >= work_to_do)
 			break;
 		(*work_done)++;
+		rmb(); /* read descriptor and rx_buffer_info after status DD */
 
 		buffer_info = &rx_ring->buffer_info[i];
 
@@ -273,28 +303,28 @@ static bool igbvf_clean_rx_irq(struct igbvf_adapter *adapter,
 		prefetch(skb->data - NET_IP_ALIGN);
 		buffer_info->skb = NULL;
 		if (!adapter->rx_ps_hdr_size) {
-			pci_unmap_single(pdev, buffer_info->dma,
+			dma_unmap_single(&pdev->dev, buffer_info->dma,
 			                 adapter->rx_buffer_len,
-			                 PCI_DMA_FROMDEVICE);
+					 DMA_FROM_DEVICE);
 			buffer_info->dma = 0;
 			skb_put(skb, length);
 			goto send_up;
 		}
 
 		if (!skb_shinfo(skb)->nr_frags) {
-			pci_unmap_single(pdev, buffer_info->dma,
+			dma_unmap_single(&pdev->dev, buffer_info->dma,
 			                 adapter->rx_ps_hdr_size,
-			                 PCI_DMA_FROMDEVICE);
+					 DMA_FROM_DEVICE);
 			skb_put(skb, hlen);
 		}
 
 		if (length) {
-			pci_unmap_page(pdev, buffer_info->page_dma,
+			dma_unmap_page(&pdev->dev, buffer_info->page_dma,
 			               PAGE_SIZE / 2,
-			               PCI_DMA_FROMDEVICE);
+				       DMA_FROM_DEVICE);
 			buffer_info->page_dma = 0;
 
-			skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags++,
+			skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags,
 			                   buffer_info->page,
 			                   buffer_info->page_offset,
 			                   length);
@@ -307,7 +337,7 @@ static bool igbvf_clean_rx_irq(struct igbvf_adapter *adapter,
 
 			skb->len += length;
 			skb->data_len += length;
-			skb->truesize += length;
+			skb->truesize += PAGE_SIZE / 2;
 		}
 send_up:
 		i++;
@@ -372,43 +402,24 @@ next_desc:
 static void igbvf_put_txbuf(struct igbvf_adapter *adapter,
                             struct igbvf_buffer *buffer_info)
 {
-	buffer_info->dma = 0;
+	if (buffer_info->dma) {
+		if (buffer_info->mapped_as_page)
+			dma_unmap_page(&adapter->pdev->dev,
+				       buffer_info->dma,
+				       buffer_info->length,
+				       DMA_TO_DEVICE);
+		else
+			dma_unmap_single(&adapter->pdev->dev,
+					 buffer_info->dma,
+					 buffer_info->length,
+					 DMA_TO_DEVICE);
+		buffer_info->dma = 0;
+	}
 	if (buffer_info->skb) {
-		skb_dma_unmap(&adapter->pdev->dev, buffer_info->skb,
-		              DMA_TO_DEVICE);
 		dev_kfree_skb_any(buffer_info->skb);
 		buffer_info->skb = NULL;
 	}
 	buffer_info->time_stamp = 0;
-}
-
-static void igbvf_print_tx_hang(struct igbvf_adapter *adapter)
-{
-	struct igbvf_ring *tx_ring = adapter->tx_ring;
-	unsigned int i = tx_ring->next_to_clean;
-	unsigned int eop = tx_ring->buffer_info[i].next_to_watch;
-	union e1000_adv_tx_desc *eop_desc = IGBVF_TX_DESC_ADV(*tx_ring, eop);
-
-	/* detected Tx unit hang */
-	dev_err(&adapter->pdev->dev,
-	        "Detected Tx Unit Hang:\n"
-	        "  TDH                  <%x>\n"
-	        "  TDT                  <%x>\n"
-	        "  next_to_use          <%x>\n"
-	        "  next_to_clean        <%x>\n"
-	        "buffer_info[next_to_clean]:\n"
-	        "  time_stamp           <%lx>\n"
-	        "  next_to_watch        <%x>\n"
-	        "  jiffies              <%lx>\n"
-	        "  next_to_watch.status <%x>\n",
-	        readl(adapter->hw.hw_addr + tx_ring->head),
-	        readl(adapter->hw.hw_addr + tx_ring->tail),
-	        tx_ring->next_to_use,
-	        tx_ring->next_to_clean,
-	        tx_ring->buffer_info[eop].time_stamp,
-	        eop,
-	        jiffies,
-	        eop_desc->wb.status);
 }
 
 /**
@@ -433,8 +444,8 @@ int igbvf_setup_tx_resources(struct igbvf_adapter *adapter,
 	tx_ring->size = tx_ring->count * sizeof(union e1000_adv_tx_desc);
 	tx_ring->size = ALIGN(tx_ring->size, 4096);
 
-	tx_ring->desc = pci_alloc_consistent(pdev, tx_ring->size,
-					     &tx_ring->dma);
+	tx_ring->desc = dma_alloc_coherent(&pdev->dev, tx_ring->size,
+					   &tx_ring->dma, GFP_KERNEL);
 
 	if (!tx_ring->desc)
 		goto err;
@@ -475,8 +486,8 @@ int igbvf_setup_rx_resources(struct igbvf_adapter *adapter,
 	rx_ring->size = rx_ring->count * desc_len;
 	rx_ring->size = ALIGN(rx_ring->size, 4096);
 
-	rx_ring->desc = pci_alloc_consistent(pdev, rx_ring->size,
-	                                     &rx_ring->dma);
+	rx_ring->desc = dma_alloc_coherent(&pdev->dev, rx_ring->size,
+					   &rx_ring->dma, GFP_KERNEL);
 
 	if (!rx_ring->desc)
 		goto err;
@@ -544,7 +555,8 @@ void igbvf_free_tx_resources(struct igbvf_ring *tx_ring)
 	vfree(tx_ring->buffer_info);
 	tx_ring->buffer_info = NULL;
 
-	pci_free_consistent(pdev, tx_ring->size, tx_ring->desc, tx_ring->dma);
+	dma_free_coherent(&pdev->dev, tx_ring->size, tx_ring->desc,
+			  tx_ring->dma);
 
 	tx_ring->desc = NULL;
 }
@@ -569,13 +581,13 @@ static void igbvf_clean_rx_ring(struct igbvf_ring *rx_ring)
 		buffer_info = &rx_ring->buffer_info[i];
 		if (buffer_info->dma) {
 			if (adapter->rx_ps_hdr_size){
-				pci_unmap_single(pdev, buffer_info->dma,
+				dma_unmap_single(&pdev->dev, buffer_info->dma,
 				                 adapter->rx_ps_hdr_size,
-				                 PCI_DMA_FROMDEVICE);
+						 DMA_FROM_DEVICE);
 			} else {
-				pci_unmap_single(pdev, buffer_info->dma,
+				dma_unmap_single(&pdev->dev, buffer_info->dma,
 				                 adapter->rx_buffer_len,
-				                 PCI_DMA_FROMDEVICE);
+						 DMA_FROM_DEVICE);
 			}
 			buffer_info->dma = 0;
 		}
@@ -587,9 +599,10 @@ static void igbvf_clean_rx_ring(struct igbvf_ring *rx_ring)
 
 		if (buffer_info->page) {
 			if (buffer_info->page_dma)
-				pci_unmap_page(pdev, buffer_info->page_dma,
+				dma_unmap_page(&pdev->dev,
+					       buffer_info->page_dma,
 				               PAGE_SIZE / 2,
-				               PCI_DMA_FROMDEVICE);
+					       DMA_FROM_DEVICE);
 			put_page(buffer_info->page);
 			buffer_info->page = NULL;
 			buffer_info->page_dma = 0;
@@ -644,14 +657,13 @@ void igbvf_free_rx_resources(struct igbvf_ring *rx_ring)
  *      traffic pattern.  Constants in this function were computed
  *      based on theoretical maximum wire speed and thresholds were set based
  *      on testing data as well as attempting to minimize response time
- *      while increasing bulk throughput.  This functionality is controlled
- *      by the InterruptThrottleRate module parameter.
+ *      while increasing bulk throughput.
  **/
-static unsigned int igbvf_update_itr(struct igbvf_adapter *adapter,
-                                     u16 itr_setting, int packets,
-                                     int bytes)
+static enum latency_range igbvf_update_itr(struct igbvf_adapter *adapter,
+					   enum latency_range itr_setting,
+					   int packets, int bytes)
 {
-	unsigned int retval = itr_setting;
+	enum latency_range retval = itr_setting;
 
 	if (packets == 0)
 		goto update_itr_done;
@@ -687,95 +699,129 @@ static unsigned int igbvf_update_itr(struct igbvf_adapter *adapter,
 			retval = low_latency;
 		}
 		break;
+	default:
+		break;
 	}
 
 update_itr_done:
 	return retval;
 }
 
-static void igbvf_set_itr(struct igbvf_adapter *adapter)
+static int igbvf_range_to_itr(enum latency_range current_range)
 {
-	struct e1000_hw *hw = &adapter->hw;
-	u16 current_itr;
-	u32 new_itr = adapter->itr;
+	int new_itr;
 
-	adapter->tx_itr = igbvf_update_itr(adapter, adapter->tx_itr,
-	                                   adapter->total_tx_packets,
-	                                   adapter->total_tx_bytes);
-	/* conservative mode (itr 3) eliminates the lowest_latency setting */
-	if (adapter->itr_setting == 3 && adapter->tx_itr == lowest_latency)
-		adapter->tx_itr = low_latency;
-
-	adapter->rx_itr = igbvf_update_itr(adapter, adapter->rx_itr,
-	                                   adapter->total_rx_packets,
-	                                   adapter->total_rx_bytes);
-	/* conservative mode (itr 3) eliminates the lowest_latency setting */
-	if (adapter->itr_setting == 3 && adapter->rx_itr == lowest_latency)
-		adapter->rx_itr = low_latency;
-
-	current_itr = max(adapter->rx_itr, adapter->tx_itr);
-
-	switch (current_itr) {
+	switch (current_range) {
 	/* counts and packets in update_itr are dependent on these numbers */
 	case lowest_latency:
-		new_itr = 70000;
+		new_itr = IGBVF_70K_ITR;
 		break;
 	case low_latency:
-		new_itr = 20000; /* aka hwitr = ~200 */
+		new_itr = IGBVF_20K_ITR;
 		break;
 	case bulk_latency:
-		new_itr = 4000;
+		new_itr = IGBVF_4K_ITR;
 		break;
 	default:
+		new_itr = IGBVF_START_ITR;
 		break;
 	}
+	return new_itr;
+}
 
-	if (new_itr != adapter->itr) {
+static void igbvf_set_itr(struct igbvf_adapter *adapter)
+{
+	u32 new_itr;
+
+	adapter->tx_ring->itr_range =
+			igbvf_update_itr(adapter,
+					 adapter->tx_ring->itr_val,
+					 adapter->total_tx_packets,
+					 adapter->total_tx_bytes);
+
+	/* conservative mode (itr 3) eliminates the lowest_latency setting */
+	if (adapter->requested_itr == 3 &&
+	    adapter->tx_ring->itr_range == lowest_latency)
+		adapter->tx_ring->itr_range = low_latency;
+
+	new_itr = igbvf_range_to_itr(adapter->tx_ring->itr_range);
+
+
+	if (new_itr != adapter->tx_ring->itr_val) {
+		u32 current_itr = adapter->tx_ring->itr_val;
 		/*
 		 * this attempts to bias the interrupt rate towards Bulk
 		 * by adding intermediate steps when interrupt rate is
 		 * increasing
 		 */
-		new_itr = new_itr > adapter->itr ?
-		             min(adapter->itr + (new_itr >> 2), new_itr) :
-		             new_itr;
-		adapter->itr = new_itr;
-		adapter->rx_ring->itr_val = 1952;
+		new_itr = new_itr > current_itr ?
+			     min(current_itr + (new_itr >> 2), new_itr) :
+			     new_itr;
+		adapter->tx_ring->itr_val = new_itr;
 
-		if (adapter->msix_entries)
-			adapter->rx_ring->set_itr = 1;
-		else
-			ew32(ITR, 1952);
+		adapter->tx_ring->set_itr = 1;
+	}
+
+	adapter->rx_ring->itr_range =
+			igbvf_update_itr(adapter, adapter->rx_ring->itr_val,
+					 adapter->total_rx_packets,
+					 adapter->total_rx_bytes);
+	if (adapter->requested_itr == 3 &&
+	    adapter->rx_ring->itr_range == lowest_latency)
+		adapter->rx_ring->itr_range = low_latency;
+
+	new_itr = igbvf_range_to_itr(adapter->rx_ring->itr_range);
+
+	if (new_itr != adapter->rx_ring->itr_val) {
+		u32 current_itr = adapter->rx_ring->itr_val;
+		new_itr = new_itr > current_itr ?
+			     min(current_itr + (new_itr >> 2), new_itr) :
+			     new_itr;
+		adapter->rx_ring->itr_val = new_itr;
+
+		adapter->rx_ring->set_itr = 1;
 	}
 }
 
 /**
  * igbvf_clean_tx_irq - Reclaim resources after transmit completes
  * @adapter: board private structure
+ *
  * returns true if ring is completely cleaned
  **/
 static bool igbvf_clean_tx_irq(struct igbvf_ring *tx_ring)
 {
 	struct igbvf_adapter *adapter = tx_ring->adapter;
-	struct e1000_hw *hw = &adapter->hw;
 	struct net_device *netdev = adapter->netdev;
 	struct igbvf_buffer *buffer_info;
 	struct sk_buff *skb;
 	union e1000_adv_tx_desc *tx_desc, *eop_desc;
 	unsigned int total_bytes = 0, total_packets = 0;
-	unsigned int i, eop, count = 0;
+	unsigned int i, count = 0;
 	bool cleaned = false;
 
 	i = tx_ring->next_to_clean;
-	eop = tx_ring->buffer_info[i].next_to_watch;
-	eop_desc = IGBVF_TX_DESC_ADV(*tx_ring, eop);
+	buffer_info = &tx_ring->buffer_info[i];
+	eop_desc = buffer_info->next_to_watch;
 
-	while ((eop_desc->wb.status & cpu_to_le32(E1000_TXD_STAT_DD)) &&
-	       (count < tx_ring->count)) {
+	do {
+		/* if next_to_watch is not set then there is no work pending */
+		if (!eop_desc)
+			break;
+
+		/* prevent any other reads prior to eop_desc */
+		read_barrier_depends();
+
+		/* if DD is not set pending work has not been completed */
+		if (!(eop_desc->wb.status & cpu_to_le32(E1000_TXD_STAT_DD)))
+			break;
+
+		/* clear next_to_watch to prevent false hangs */
+		buffer_info->next_to_watch = NULL;
+
 		for (cleaned = false; !cleaned; count++) {
 			tx_desc = IGBVF_TX_DESC_ADV(*tx_ring, i);
-			buffer_info = &tx_ring->buffer_info[i];
-			cleaned = (i == eop);
+			cleaned = (tx_desc == eop_desc);
 			skb = buffer_info->skb;
 
 			if (skb) {
@@ -796,10 +842,12 @@ static bool igbvf_clean_tx_irq(struct igbvf_ring *tx_ring)
 			i++;
 			if (i == tx_ring->count)
 				i = 0;
+
+			buffer_info = &tx_ring->buffer_info[i];
 		}
-		eop = tx_ring->buffer_info[i].next_to_watch;
-		eop_desc = IGBVF_TX_DESC_ADV(*tx_ring, eop);
-	}
+
+		eop_desc = buffer_info->next_to_watch;
+	} while (count < tx_ring->count);
 
 	tx_ring->next_to_clean = i;
 
@@ -817,25 +865,9 @@ static bool igbvf_clean_tx_irq(struct igbvf_ring *tx_ring)
 		}
 	}
 
-	if (adapter->detect_tx_hung) {
-		/* Detect a transmit hang in hardware, this serializes the
-		 * check with the clearing of time_stamp and movement of i */
-		adapter->detect_tx_hung = false;
-		if (tx_ring->buffer_info[i].time_stamp &&
-		    time_after(jiffies, tx_ring->buffer_info[i].time_stamp +
-		               (adapter->tx_timeout_factor * HZ))
-		    && !(er32(STATUS) & E1000_STATUS_TXOFF)) {
-
-			tx_desc = IGBVF_TX_DESC_ADV(*tx_ring, i);
-			/* detected Tx unit hang */
-			igbvf_print_tx_hang(adapter);
-
-			netif_stop_queue(netdev);
-		}
-	}
 	adapter->net_stats.tx_bytes += total_bytes;
 	adapter->net_stats.tx_packets += total_packets;
-	return (count < tx_ring->count);
+	return count < tx_ring->count;
 }
 
 static irqreturn_t igbvf_msix_other(int irq, void *data)
@@ -863,6 +895,11 @@ static irqreturn_t igbvf_intr_msix_tx(int irq, void *data)
 	struct e1000_hw *hw = &adapter->hw;
 	struct igbvf_ring *tx_ring = adapter->tx_ring;
 
+	if (tx_ring->set_itr) {
+		writel(tx_ring->itr_val,
+		       adapter->hw.hw_addr + tx_ring->itr_register);
+		adapter->tx_ring->set_itr = 0;
+	}
 
 	adapter->total_tx_bytes = 0;
 	adapter->total_tx_packets = 0;
@@ -965,19 +1002,10 @@ static void igbvf_configure_msix(struct igbvf_adapter *adapter)
 
 	igbvf_assign_vector(adapter, IGBVF_NO_QUEUE, 0, vector++);
 	adapter->eims_enable_mask |= tx_ring->eims_value;
-	if (tx_ring->itr_val)
-		writel(tx_ring->itr_val,
-		       hw->hw_addr + tx_ring->itr_register);
-	else
-		writel(1952, hw->hw_addr + tx_ring->itr_register);
-
+	writel(tx_ring->itr_val, hw->hw_addr + tx_ring->itr_register);
 	igbvf_assign_vector(adapter, 0, IGBVF_NO_QUEUE, vector++);
 	adapter->eims_enable_mask |= rx_ring->eims_value;
-	if (rx_ring->itr_val)
-		writel(rx_ring->itr_val,
-		       hw->hw_addr + rx_ring->itr_register);
-	else
-		writel(1952, hw->hw_addr + rx_ring->itr_register);
+	writel(rx_ring->itr_val, hw->hw_addr + rx_ring->itr_register);
 
 	/* set vector for other causes, i.e. link changes */
 
@@ -1049,27 +1077,27 @@ static int igbvf_request_msix(struct igbvf_adapter *adapter)
 	}
 
 	err = request_irq(adapter->msix_entries[vector].vector,
-	                  &igbvf_intr_msix_tx, 0, adapter->tx_ring->name,
+	                  igbvf_intr_msix_tx, 0, adapter->tx_ring->name,
 	                  netdev);
 	if (err)
 		goto out;
 
 	adapter->tx_ring->itr_register = E1000_EITR(vector);
-	adapter->tx_ring->itr_val = 1952;
+	adapter->tx_ring->itr_val = adapter->current_itr;
 	vector++;
 
 	err = request_irq(adapter->msix_entries[vector].vector,
-	                  &igbvf_intr_msix_rx, 0, adapter->rx_ring->name,
+	                  igbvf_intr_msix_rx, 0, adapter->rx_ring->name,
 	                  netdev);
 	if (err)
 		goto out;
 
 	adapter->rx_ring->itr_register = E1000_EITR(vector);
-	adapter->rx_ring->itr_val = 1952;
+	adapter->rx_ring->itr_val = adapter->current_itr;
 	vector++;
 
 	err = request_irq(adapter->msix_entries[vector].vector,
-	                  &igbvf_msix_other, 0, netdev->name, netdev);
+	                  igbvf_msix_other, 0, netdev->name, netdev);
 	if (err)
 		goto out;
 
@@ -1179,7 +1207,7 @@ static int igbvf_poll(struct napi_struct *napi, int budget)
 	if (work_done < budget) {
 		napi_complete(napi);
 
-		if (adapter->itr_setting & 3)
+		if (adapter->requested_itr & 3)
 			igbvf_set_itr(adapter);
 
 		if (!test_bit(__IGBVF_DOWN, &adapter->state))
@@ -1271,6 +1299,7 @@ static void igbvf_configure_tx(struct igbvf_adapter *adapter)
 	/* disable transmits */
 	txdctl = er32(TXDCTL(0));
 	ew32(TXDCTL(0), txdctl & ~E1000_TXDCTL_QUEUE_ENABLE);
+	e1e_flush();
 	msleep(10);
 
 	/* Setup the HW Tx Head and Tail descriptor pointers */
@@ -1300,8 +1329,6 @@ static void igbvf_configure_tx(struct igbvf_adapter *adapter)
 
 	/* enable Report Status bit */
 	adapter->txd_cmd |= E1000_ADVTXD_DCMD_RS;
-
-	adapter->tx_queue_len = adapter->netdev->tx_queue_len;
 }
 
 /**
@@ -1353,6 +1380,7 @@ static void igbvf_configure_rx(struct igbvf_adapter *adapter)
 	/* disable receives */
 	rxdctl = er32(RXDCTL(0));
 	ew32(RXDCTL(0), rxdctl & ~E1000_RXDCTL_QUEUE_ENABLE);
+	e1e_flush();
 	msleep(10);
 
 	rdlen = rx_ring->count * sizeof(union e1000_adv_rx_desc);
@@ -1399,8 +1427,8 @@ static void igbvf_set_multi(struct net_device *netdev)
 	u8  *mta_list = NULL;
 	int i;
 
-	if (netdev->mc_count) {
-		mta_list = kmalloc(netdev->mc_count * 6, GFP_ATOMIC);
+	if (!netdev_mc_empty(netdev)) {
+		mta_list = kmalloc(netdev_mc_count(netdev) * 6, GFP_ATOMIC);
 		if (!mta_list) {
 			dev_err(&adapter->pdev->dev,
 			        "failed to allocate multicast filter list\n");
@@ -1409,15 +1437,9 @@ static void igbvf_set_multi(struct net_device *netdev)
 	}
 
 	/* prepare a packed array of only addresses. */
-	mc_ptr = netdev->mc_list;
-
-	for (i = 0; i < netdev->mc_count; i++) {
-		if (!mc_ptr)
-			break;
-		memcpy(mta_list + (i*ETH_ALEN), mc_ptr->dmi_addr,
-		       ETH_ALEN);
-		mc_ptr = mc_ptr->next;
-	}
+	i = 0;
+	netdev_for_each_mc_addr(mc_ptr, netdev)
+		memcpy(mta_list + (i++ * ETH_ALEN), mc_ptr->dmi_addr, ETH_ALEN);
 
 	hw->mac.ops.update_mc_addr_list(hw, mta_list, i, 0, 0);
 	kfree(mta_list);
@@ -1465,6 +1487,8 @@ static void igbvf_reset(struct igbvf_adapter *adapter)
 		memcpy(netdev->perm_addr, adapter->hw.mac.addr,
 		       netdev->addr_len);
 	}
+
+	adapter->last_reset = jiffies;
 }
 
 int igbvf_up(struct igbvf_adapter *adapter)
@@ -1524,7 +1548,6 @@ void igbvf_down(struct igbvf_adapter *adapter)
 
 	del_timer_sync(&adapter->watchdog_timer);
 
-	netdev->tx_queue_len = adapter->tx_queue_len;
 	netif_carrier_off(netdev);
 
 	/* record the stats before reset*/
@@ -1570,8 +1593,8 @@ static int __devinit igbvf_sw_init(struct igbvf_adapter *adapter)
 	adapter->tx_abs_int_delay = 32;
 	adapter->rx_int_delay = 0;
 	adapter->rx_abs_int_delay = 8;
-	adapter->itr_setting = 3;
-	adapter->itr = 20000;
+	adapter->requested_itr = 3;
+	adapter->current_itr = IGBVF_START_ITR;
 
 	/* Set various function pointers */
 	adapter->ei->init_ops(&adapter->hw);
@@ -1744,6 +1767,7 @@ static int igbvf_set_mac(struct net_device *netdev, void *p)
 		return -EADDRNOTAVAIL;
 
 	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+	netdev->addr_assign_type &= ~NET_ADDR_RANDOM;
 
 	return 0;
 }
@@ -1796,10 +1820,9 @@ void igbvf_update_stats(struct igbvf_adapter *adapter)
 
 static void igbvf_print_link_info(struct igbvf_adapter *adapter)
 {
-	dev_info(&adapter->pdev->dev, "Link is Up %d Mbps %s\n",
-	         adapter->link_speed,
-	         ((adapter->link_duplex == FULL_DUPLEX) ?
-	          "Full Duplex" : "Half Duplex"));
+	dev_info(&adapter->pdev->dev, "Link is Up %d Mbps %s Duplex\n",
+		 adapter->link_speed,
+		 adapter->link_duplex == FULL_DUPLEX ? "Full" : "Half");
 }
 
 static bool igbvf_has_link(struct igbvf_adapter *adapter)
@@ -1808,11 +1831,15 @@ static bool igbvf_has_link(struct igbvf_adapter *adapter)
 	s32 ret_val = E1000_SUCCESS;
 	bool link_active;
 
+	/* If interface is down, stay link down */
+	if (test_bit(__IGBVF_DOWN, &adapter->state))
+		return false;
+
 	ret_val = hw->mac.ops.check_for_link(hw);
 	link_active = !hw->mac.get_link_status;
 
 	/* if check for link returns error we will need to reset */
-	if (ret_val)
+	if (ret_val && time_after(jiffies, adapter->last_reset + (10 * HZ)))
 		schedule_work(&adapter->reset_task);
 
 	return link_active;
@@ -1846,31 +1873,10 @@ static void igbvf_watchdog_task(struct work_struct *work)
 
 	if (link) {
 		if (!netif_carrier_ok(netdev)) {
-			bool txb2b = 1;
-
 			mac->ops.get_link_up_info(&adapter->hw,
 			                          &adapter->link_speed,
 			                          &adapter->link_duplex);
 			igbvf_print_link_info(adapter);
-
-			/*
-			 * tweak tx_queue_len according to speed/duplex
-			 * and adjust the timeout factor
-			 */
-			netdev->tx_queue_len = adapter->tx_queue_len;
-			adapter->tx_timeout_factor = 1;
-			switch (adapter->link_speed) {
-			case SPEED_10:
-				txb2b = 0;
-				netdev->tx_queue_len = 10;
-				adapter->tx_timeout_factor = 16;
-				break;
-			case SPEED_100:
-				txb2b = 0;
-				netdev->tx_queue_len = 100;
-				/* maybe add some timeout factor ? */
-				break;
-			}
 
 			netif_carrier_on(netdev);
 			netif_wake_queue(netdev);
@@ -1904,9 +1910,6 @@ static void igbvf_watchdog_task(struct work_struct *work)
 
 	/* Cause software interrupt to ensure Rx ring is cleaned */
 	ew32(EICS, adapter->rx_ring->eims_value);
-
-	/* Force detection of hung controller every watchdog period */
-	adapter->detect_tx_hung = 1;
 
 	/* Reset the timer */
 	if (!test_bit(__IGBVF_DOWN, &adapter->state))
@@ -1990,7 +1993,6 @@ static int igbvf_tso(struct igbvf_adapter *adapter,
 	context_desc->seqnum_seed = 0;
 
 	buffer_info->time_stamp = jiffies;
-	buffer_info->next_to_watch = i;
 	buffer_info->dma = 0;
 	i++;
 	if (i == tx_ring->count)
@@ -2050,7 +2052,6 @@ static inline bool igbvf_tx_csum(struct igbvf_adapter *adapter,
 		context_desc->mss_l4len_idx = 0;
 
 		buffer_info->time_stamp = jiffies;
-		buffer_info->next_to_watch = i;
 		buffer_info->dma = 0;
 		i++;
 		if (i == tx_ring->count)
@@ -2090,35 +2091,32 @@ static int igbvf_maybe_stop_tx(struct net_device *netdev, int size)
 
 static inline int igbvf_tx_map_adv(struct igbvf_adapter *adapter,
                                    struct igbvf_ring *tx_ring,
-                                   struct sk_buff *skb,
-                                   unsigned int first)
+				   struct sk_buff *skb)
 {
 	struct igbvf_buffer *buffer_info;
+	struct pci_dev *pdev = adapter->pdev;
 	unsigned int len = skb_headlen(skb);
 	unsigned int count = 0, i;
 	unsigned int f;
-	dma_addr_t *map;
 
 	i = tx_ring->next_to_use;
-
-	if (skb_dma_map(&adapter->pdev->dev, skb, DMA_TO_DEVICE)) {
-		dev_err(&adapter->pdev->dev, "TX DMA map failed\n");
-		return 0;
-	}
-
-	map = skb_shinfo(skb)->dma_maps;
 
 	buffer_info = &tx_ring->buffer_info[i];
 	BUG_ON(len >= IGBVF_MAX_DATA_PER_TXD);
 	buffer_info->length = len;
 	/* set time_stamp *before* dma to help avoid a possible race */
 	buffer_info->time_stamp = jiffies;
-	buffer_info->next_to_watch = i;
-	buffer_info->dma = skb_shinfo(skb)->dma_head;
+	buffer_info->mapped_as_page = false;
+	buffer_info->dma = dma_map_single(&pdev->dev, skb->data, len,
+					  DMA_TO_DEVICE);
+	if (dma_mapping_error(&pdev->dev, buffer_info->dma))
+		goto dma_error;
+
 
 	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++) {
 		struct skb_frag_struct *frag;
 
+		count++;
 		i++;
 		if (i == tx_ring->count)
 			i = 0;
@@ -2130,20 +2128,47 @@ static inline int igbvf_tx_map_adv(struct igbvf_adapter *adapter,
 		BUG_ON(len >= IGBVF_MAX_DATA_PER_TXD);
 		buffer_info->length = len;
 		buffer_info->time_stamp = jiffies;
-		buffer_info->next_to_watch = i;
-		buffer_info->dma = map[count];
-		count++;
+		buffer_info->mapped_as_page = true;
+		buffer_info->dma = dma_map_page(&pdev->dev,
+						frag->page,
+						frag->page_offset,
+						len,
+						DMA_TO_DEVICE);
+		if (dma_mapping_error(&pdev->dev, buffer_info->dma))
+			goto dma_error;
 	}
 
 	tx_ring->buffer_info[i].skb = skb;
-	tx_ring->buffer_info[first].next_to_watch = i;
 
-	return count + 1;
+	return ++count;
+
+dma_error:
+	dev_err(&pdev->dev, "TX DMA map failed\n");
+
+	/* clear timestamp and dma mappings for failed buffer_info mapping */
+	buffer_info->dma = 0;
+	buffer_info->time_stamp = 0;
+	buffer_info->length = 0;
+	buffer_info->mapped_as_page = false;
+	if (count)
+		count--;
+
+	/* clear timestamp and dma mappings for remaining portion of packet */
+	while (count--) {
+		if (i==0)
+			i += tx_ring->count;
+		i--;
+		buffer_info = &tx_ring->buffer_info[i];
+		igbvf_put_txbuf(adapter, buffer_info);
+	}
+
+	return 0;
 }
 
 static inline void igbvf_tx_queue_adv(struct igbvf_adapter *adapter,
                                       struct igbvf_ring *tx_ring,
-                                      int tx_flags, int count, u32 paylen,
+				      int tx_flags, int count,
+				      unsigned int first, u32 paylen,
                                       u8 hdr_len)
 {
 	union e1000_adv_tx_desc *tx_desc = NULL;
@@ -2193,6 +2218,7 @@ static inline void igbvf_tx_queue_adv(struct igbvf_adapter *adapter,
 	 * such as IA-64). */
 	wmb();
 
+	tx_ring->buffer_info[first].next_to_watch = tx_desc;
 	tx_ring->next_to_use = i;
 	writel(i, adapter->hw.hw_addr + tx_ring->tail);
 	/* we need this if more than one processor can write to our tail
@@ -2257,13 +2283,13 @@ static netdev_tx_t igbvf_xmit_frame_ring_adv(struct sk_buff *skb,
 
 	/*
 	 * count reflects descriptors mapped, if 0 then mapping error
-	 * has occured and we need to rewind the descriptor queue
+	 * has occurred and we need to rewind the descriptor queue
 	 */
-	count = igbvf_tx_map_adv(adapter, tx_ring, skb, first);
+	count = igbvf_tx_map_adv(adapter, tx_ring, skb);
 
 	if (count) {
 		igbvf_tx_queue_adv(adapter, tx_ring, tx_flags, count,
-		                   skb->len, hdr_len);
+				   first, skb->len, hdr_len);
 		/* Make sure there is space in the ring for the next send. */
 		igbvf_maybe_stop_tx(netdev, MAX_SKB_FRAGS + 4);
 	} else {
@@ -2570,13 +2596,11 @@ static void igbvf_print_device_info(struct igbvf_adapter *adapter)
 	struct net_device *netdev = adapter->netdev;
 	struct pci_dev *pdev = adapter->pdev;
 
-	dev_info(&pdev->dev, "Intel(R) 82576 Virtual Function\n");
-	dev_info(&pdev->dev, "Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
-	         /* MAC address */
-	         netdev->dev_addr[0], netdev->dev_addr[1],
-	         netdev->dev_addr[2], netdev->dev_addr[3],
-	         netdev->dev_addr[4], netdev->dev_addr[5]);
-	dev_info(&pdev->dev, "MAC: %d\n", hw->mac.type);
+	if (hw->mac.type == e1000_vfadapt_i350)
+		dev_info(&pdev->dev, "Intel(R) I350 Virtual Function\n");
+	else
+		dev_info(&pdev->dev, "Intel(R) 82576 Virtual Function\n");
+	dev_info(&pdev->dev, "Address: %pM\n", netdev->dev_addr);
 }
 
 static const struct net_device_ops igbvf_netdev_ops = {
@@ -2624,16 +2648,16 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 		return err;
 
 	pci_using_dac = 0;
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
+	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
 	if (!err) {
-		err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
+		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
 		if (!err)
 			pci_using_dac = 1;
 	} else {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
-			err = pci_set_consistent_dma_mask(pdev,
-							  DMA_BIT_MASK(32));
+			err = dma_set_coherent_mask(&pdev->dev,
+						    DMA_BIT_MASK(32));
 			if (err) {
 				dev_err(&pdev->dev, "No usable DMA "
 				        "configuration, aborting\n");
@@ -2665,7 +2689,7 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 	adapter->flags = ei->flags;
 	adapter->hw.back = adapter;
 	adapter->hw.mac.type = ei->mac;
-	adapter->msg_enable = (1 << NETIF_MSG_DRV | NETIF_MSG_PROBE) - 1;
+	adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
 
 	/* PCI config space info */
 
@@ -2673,8 +2697,7 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 	hw->device_id = pdev->device;
 	hw->subsystem_vendor_id = pdev->subsystem_vendor;
 	hw->subsystem_device_id = pdev->subsystem_device;
-
-	pci_read_config_byte(pdev, PCI_REVISION_ID, &hw->revision_id);
+	hw->revision_id = pdev->revision;
 
 	err = -EIO;
 	adapter->hw.hw_addr = ioremap(pci_resource_start(pdev, 0),
@@ -2707,6 +2730,7 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 	                   NETIF_F_IP_CSUM |
 	                   NETIF_F_HW_VLAN_TX |
 	                   NETIF_F_HW_VLAN_RX |
+	                   NETIF_F_GRO |
 	                   NETIF_F_HW_VLAN_FILTER;
 
 	netdev->features |= NETIF_F_IPV6_CSUM;
@@ -2726,28 +2750,29 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 	err = hw->mac.ops.reset_hw(hw);
 	if (err) {
 		dev_info(&pdev->dev,
-		         "PF still in reset state, assigning new address\n");
-		random_ether_addr(hw->mac.addr);
+			 "PF still in reset state. Is the PF interface up?\n");
 	} else {
 		err = hw->mac.ops.read_mac_addr(hw);
-		if (err) {
-			dev_err(&pdev->dev, "Error reading MAC address\n");
-			goto err_hw_init;
-		}
+		if (err)
+			dev_info(&pdev->dev, "Error reading MAC address.\n");
+		else if (is_zero_ether_addr(adapter->hw.mac.addr))
+			dev_info(&pdev->dev, "MAC address not assigned by administrator.\n");
+		memcpy(netdev->dev_addr, adapter->hw.mac.addr,
+		       netdev->addr_len);
 	}
 
-	memcpy(netdev->dev_addr, adapter->hw.mac.addr, netdev->addr_len);
-	memcpy(netdev->perm_addr, adapter->hw.mac.addr, netdev->addr_len);
-
-	if (!is_valid_ether_addr(netdev->perm_addr)) {
-		dev_err(&pdev->dev, "Invalid MAC Address: "
-		        "%02x:%02x:%02x:%02x:%02x:%02x\n",
-		        netdev->dev_addr[0], netdev->dev_addr[1],
-		        netdev->dev_addr[2], netdev->dev_addr[3],
-		        netdev->dev_addr[4], netdev->dev_addr[5]);
-		err = -EIO;
-		goto err_hw_init;
+	if (!is_valid_ether_addr(netdev->dev_addr)) {
+		dev_info(&pdev->dev, "Assigning random MAC address.\n");
+		eth_hw_addr_random(netdev);
+		memcpy(adapter->hw.mac.addr, netdev->dev_addr,
+			netdev->addr_len);
 	}
+
+	/* workaround for RHEL6 */
+	if (is_local_ether_addr(netdev->dev_addr))
+		netdev->addr_assign_type |= NET_ADDR_RANDOM;
+
+	memcpy(netdev->perm_addr, netdev->dev_addr, netdev->addr_len);
 
 	setup_timer(&adapter->watchdog_timer, &igbvf_watchdog,
 	            (unsigned long) adapter);
@@ -2762,14 +2787,18 @@ static int __devinit igbvf_probe(struct pci_dev *pdev,
 	/* reset the hardware with the new settings */
 	igbvf_reset(adapter);
 
-	/* tell the stack to leave us alone until igbvf_open() is called */
-	netif_carrier_off(netdev);
-	netif_stop_queue(netdev);
+	/* set hardware-specific flags */
+	if (adapter->hw.mac.type == e1000_vfadapt_i350)
+		adapter->flags |= IGBVF_FLAG_RX_LB_VLAN_BSWAP;
 
 	strcpy(netdev->name, "eth%d");
 	err = register_netdev(netdev);
 	if (err)
 		goto err_hw_init;
+
+	/* tell the stack to leave us alone until igbvf_open() is called */
+	netif_carrier_off(netdev);
+	netif_stop_queue(netdev);
 
 	igbvf_print_device_info(adapter);
 
@@ -2809,13 +2838,14 @@ static void __devexit igbvf_remove(struct pci_dev *pdev)
 	struct e1000_hw *hw = &adapter->hw;
 
 	/*
-	 * flush_scheduled work may reschedule our watchdog task, so
-	 * explicitly disable watchdog tasks from being rescheduled
+	 * The watchdog timer may be rescheduled, so explicitly
+	 * disable it from being rescheduled.
 	 */
 	set_bit(__IGBVF_DOWN, &adapter->state);
 	del_timer_sync(&adapter->watchdog_timer);
 
-	flush_scheduled_work();
+	cancel_work_sync(&adapter->reset_task);
+	cancel_work_sync(&adapter->watchdog_task);
 
 	unregister_netdev(netdev);
 
@@ -2846,8 +2876,9 @@ static struct pci_error_handlers igbvf_err_handler = {
 	.resume = igbvf_io_resume,
 };
 
-static struct pci_device_id igbvf_pci_tbl[] = {
+static DEFINE_PCI_DEVICE_TABLE(igbvf_pci_tbl) = {
 	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_82576_VF), board_vf },
+	{ PCI_VDEVICE(INTEL, E1000_DEV_ID_I350_VF), board_i350_vf },
 	{ } /* terminate list */
 };
 MODULE_DEVICE_TABLE(pci, igbvf_pci_tbl);
@@ -2876,13 +2907,10 @@ static struct pci_driver igbvf_driver = {
 static int __init igbvf_init_module(void)
 {
 	int ret;
-	printk(KERN_INFO "%s - version %s\n",
-	       igbvf_driver_string, igbvf_driver_version);
-	printk(KERN_INFO "%s\n", igbvf_copyright);
+	pr_info("%s - version %s\n", igbvf_driver_string, igbvf_driver_version);
+	pr_info("%s\n", igbvf_copyright);
 
 	ret = pci_register_driver(&igbvf_driver);
-	pm_qos_add_requirement(PM_QOS_CPU_DMA_LATENCY, igbvf_driver_name,
-	                       PM_QOS_DEFAULT_VALUE);
 
 	return ret;
 }
@@ -2897,13 +2925,12 @@ module_init(igbvf_init_module);
 static void __exit igbvf_exit_module(void)
 {
 	pci_unregister_driver(&igbvf_driver);
-	pm_qos_remove_requirement(PM_QOS_CPU_DMA_LATENCY, igbvf_driver_name);
 }
 module_exit(igbvf_exit_module);
 
 
 MODULE_AUTHOR("Intel Corporation, <e1000-devel@lists.sourceforge.net>");
-MODULE_DESCRIPTION("Intel(R) 82576 Virtual Function Network Driver");
+MODULE_DESCRIPTION("Intel(R) Gigabit Virtual Function Network Driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
 

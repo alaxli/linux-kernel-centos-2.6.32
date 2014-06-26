@@ -224,8 +224,10 @@ static int phonet_device_notify(struct notifier_block *me, unsigned long what,
 				void *arg)
 {
 	struct net_device *dev = arg;
+	struct phonet_net *pnn = net_generic(dev_net(dev), phonet_net_id);
 
-	if (!net_eq(dev_net(dev), &init_net))
+	if (!pnn)
+		/* pernet memory already freed */
 		return 0;
 
 	switch (what) {
@@ -249,11 +251,7 @@ static struct notifier_block phonet_device_notifier = {
 /* Per-namespace Phonet devices handling */
 static int phonet_init_net(struct net *net)
 {
-	struct phonet_net *pnn;
-
-	if (!net_eq(net, &init_net))
-		return 0;
-	pnn = kmalloc(sizeof(*pnn), GFP_KERNEL);
+	struct phonet_net *pnn = kmalloc(sizeof(*pnn), GFP_KERNEL);
 	if (!pnn)
 		return -ENOMEM;
 
@@ -270,12 +268,8 @@ static int phonet_init_net(struct net *net)
 
 static void phonet_exit_net(struct net *net)
 {
-	struct phonet_net *pnn;
+	struct phonet_net *pnn = net_generic(net, phonet_net_id);
 	struct net_device *dev;
-
-	if (!net_eq(net, &init_net))
-		return;
-	pnn = net_generic(net, phonet_net_id);
 
 	rtnl_lock();
 	for_each_netdev(net, dev)
@@ -283,6 +277,7 @@ static void phonet_exit_net(struct net *net)
 	rtnl_unlock();
 
 	proc_net_remove(net, "phonet");
+	net_assign_generic(net, phonet_net_id, NULL);
 	kfree(pnn);
 }
 

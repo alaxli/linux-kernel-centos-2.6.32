@@ -108,9 +108,8 @@ struct x86_emulate_ops {
 				const void *new,
 				unsigned int bytes,
 				struct kvm_vcpu *vcpu);
-
-	bool (*get_cpuid)(struct x86_emulate_ctxt *ctxt,
-			 u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
+	bool (*get_cpuid)(struct kvm_vcpu *vcpu,
+			  u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
 };
 
 /* Type, address-of, and value of an instruction's operand. */
@@ -206,7 +205,8 @@ struct x86_emulate_ctxt {
 #define X86EMUL_CPUID_VENDOR_GenuineIntel_edx 0x49656e69
 
 int x86_decode_insn(struct x86_emulate_ctxt *ctxt,
-		    struct x86_emulate_ops *ops);
+		    struct x86_emulate_ops *ops,
+		    void *insn, int insn_len);
 int x86_emulate_insn(struct x86_emulate_ctxt *ctxt,
 		     struct x86_emulate_ops *ops);
 

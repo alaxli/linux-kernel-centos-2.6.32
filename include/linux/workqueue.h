@@ -22,6 +22,12 @@ typedef void (*work_func_t)(struct work_struct *work);
  */
 #define work_data_bits(work) ((unsigned long *)(&(work)->data))
 
+enum {
+	/* bit mask for work_busy() return values */
+	WORK_BUSY_PENDING	= 1 << 0,
+	WORK_BUSY_RUNNING	= 1 << 1,
+};
+
 struct work_struct {
 	atomic_long_t data;
 #define WORK_STRUCT_PENDING 0		/* T if work item pending execution */
@@ -193,7 +199,10 @@ __create_workqueue_key(const char *name, int singlethread,
 #define create_workqueue(name) __create_workqueue((name), 0, 0, 0)
 #define create_rt_workqueue(name) __create_workqueue((name), 0, 0, 1)
 #define create_freezeable_workqueue(name) __create_workqueue((name), 1, 1, 0)
+#define create_freezable_workqueue(name) create_freezeable_workqueue(name)
 #define create_singlethread_workqueue(name) __create_workqueue((name), 1, 0, 0)
+
+#define alloc_ordered_workqueue(name, flags) create_singlethread_workqueue(name)
 
 extern void destroy_workqueue(struct workqueue_struct *wq);
 
@@ -224,6 +233,8 @@ int execute_in_process_context(work_func_t fn, struct execute_work *);
 extern int flush_work(struct work_struct *work);
 
 extern int cancel_work_sync(struct work_struct *work);
+
+extern unsigned int work_busy(struct work_struct *work);
 
 /*
  * Kill off a pending schedule_delayed_work().  Note that the work callback

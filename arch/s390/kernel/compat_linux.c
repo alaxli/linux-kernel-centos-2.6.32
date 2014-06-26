@@ -31,14 +31,8 @@
 #include <linux/shm.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
-#include <linux/nfs_fs.h>
 #include <linux/quota.h>
 #include <linux/module.h>
-#include <linux/sunrpc/svc.h>
-#include <linux/nfsd/nfsd.h>
-#include <linux/nfsd/cache.h>
-#include <linux/nfsd/xdr.h>
-#include <linux/nfsd/syscall.h>
 #include <linux/poll.h>
 #include <linux/personality.h>
 #include <linux/stat.h>
@@ -446,14 +440,14 @@ asmlinkage long sys32_execve(char __user *name, compat_uptr_t __user *argv,
 			     compat_uptr_t __user *envp)
 {
 	struct pt_regs *regs = task_pt_regs(current);
-	char *filename;
+	struct filename *filename;
 	long rc;
 
 	filename = getname(name);
 	rc = PTR_ERR(filename);
 	if (IS_ERR(filename))
 		return rc;
-	rc = compat_do_execve(filename, argv, envp, regs);
+	rc = compat_do_execve(filename->name, argv, envp, regs);
 	if (rc)
 		goto out;
 	current->thread.fp_regs.fpc=0;

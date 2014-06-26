@@ -43,6 +43,12 @@ struct blk_queue_tags;
 #define DISABLE_CLUSTERING 0
 #define ENABLE_CLUSTERING 1
 
+enum {
+	SCSI_QDEPTH_DEFAULT,	/* default requested change, e.g. from sysfs */
+	SCSI_QDEPTH_QFULL,	/* scsi-ml requested due to queue full */
+	SCSI_QDEPTH_RAMP_UP,	/* scsi-ml requested due to threshhold event */
+};
+
 struct scsi_host_template {
 	struct module *module;
 	const char *name;
@@ -118,6 +124,11 @@ struct scsi_host_template {
 	 * this device/host completes, or a period of time determined by
 	 * I/O pressure in the system if there are no other outstanding
 	 * commands.
+	 *
+	 * NOTE: The 'lockless' flag in the scsi_host_template indicates
+	 * whether the host_lock should be held before calling this
+	 * routine. Also, the lockless queuecommand, as implemented
+	 * upstream has a different signature.
 	 *
 	 * STATUS: REQUIRED
 	 */
@@ -294,7 +305,7 @@ struct scsi_host_template {
 	 *
 	 * Status: OPTIONAL
 	 */
-	int (* change_queue_depth)(struct scsi_device *, int);
+	int (* change_queue_depth)(struct scsi_device *, int, int);
 
 	/*
 	 * Fill in this function to allow the changing of tag types
@@ -446,6 +457,15 @@ struct scsi_host_template {
 	 */
 	unsigned ordered_tag:1;
 
+#ifndef __GENKSYMS__
+	/*
+	 * True if we are calling queuecommand without the
+	 * host_lock held. LLDs may want to do this for
+	 * performance reasons.
+	 */
+	unsigned lockless:1;
+#endif /* __GENKSYMS__ */
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */
@@ -550,7 +570,11 @@ struct Scsi_Host {
 	unsigned int host_eh_scheduled;    /* EH scheduled without command */
     
 	unsigned int host_no;  /* Used for IOCTL_GET_IDLUN, /proc/scsi et al. */
+#ifdef __GENKSYMS__
 	int resetting; /* if set, it means that last_reset is a valid value */
+#else
+	int eh_deadline;
+#endif
 	unsigned long last_reset;
 
 	/*
@@ -756,7 +780,8 @@ static inline struct device *scsi_get_device(struct Scsi_Host *shost)
  **/
 static inline int scsi_host_scan_allowed(struct Scsi_Host *shost)
 {
-	return shost->shost_state == SHOST_RUNNING;
+	return shost->shost_state == SHOST_RUNNING ||
+	       shost->shost_state == SHOST_RECOVERY;
 }
 
 extern void scsi_unblock_requests(struct Scsi_Host *);
@@ -816,6 +841,9 @@ static inline unsigned int scsi_host_dif_capable(struct Scsi_Host *shost, unsign
 				       SHOST_DIF_TYPE2_PROTECTION,
 				       SHOST_DIF_TYPE3_PROTECTION };
 
+	if (target_type > SHOST_DIF_TYPE3_PROTECTION)
+		return 0;
+
 	return shost->prot_capabilities & cap[target_type] ? target_type : 0;
 }
 
@@ -826,6 +854,9 @@ static inline unsigned int scsi_host_dix_capable(struct Scsi_Host *shost, unsign
 				       SHOST_DIX_TYPE1_PROTECTION,
 				       SHOST_DIX_TYPE2_PROTECTION,
 				       SHOST_DIX_TYPE3_PROTECTION };
+
+	if (target_type > SHOST_DIX_TYPE3_PROTECTION)
+		return 0;
 
 	return shost->prot_capabilities & cap[target_type];
 #endif

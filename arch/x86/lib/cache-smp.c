@@ -17,3 +17,4 @@ int wbinvd_on_all_cpus(void)
 	return on_each_cpu(__wbinvd, NULL, 1);
 }
 EXPORT_SYMBOL(wbinvd_on_all_cpus);
+

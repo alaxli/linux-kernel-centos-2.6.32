@@ -103,6 +103,7 @@ void rcu_sched_qs(int cpu)
 	rdp->passed_quiesc = 1;
 	rcu_preempt_note_context_switch(cpu);
 }
+EXPORT_SYMBOL_GPL(rcu_sched_qs);
 
 void rcu_bh_qs(int cpu)
 {
@@ -1043,7 +1044,7 @@ static void rcu_do_batch(struct rcu_state *rsp, struct rcu_data *rdp)
 	while (list) {
 		next = list->next;
 		prefetch(next);
-		list->func(list);
+		__rcu_reclaim(list);
 		list = next;
 		if (++count >= rdp->blimit)
 			break;

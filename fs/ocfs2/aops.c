@@ -547,6 +547,9 @@ bail:
  *
  * called like this: dio->get_blocks(dio->inode, fs_startblk,
  * 					fs_count, map_bh, dio->rw == WRITE);
+ *
+ * Note that we never bother to allocate blocks here, and thus ignore the
+ * create argument.
  */
 static int ocfs2_direct_IO_get_blocks(struct inode *inode, sector_t iblock,
 				     struct buffer_head *bh_result, int create)
@@ -563,14 +566,6 @@ static int ocfs2_direct_IO_get_blocks(struct inode *inode, sector_t iblock,
 
 	inode_blocks = ocfs2_blocks_for_bytes(inode->i_sb, i_size_read(inode));
 
-	/*
-	 * Any write past EOF is not allowed because we'd be extending.
-	 */
-	if (create && (iblock + max_blocks) > inode_blocks) {
-		ret = -EIO;
-		goto bail;
-	}
-
 	/* This figures out the size of the next contiguous block, and
 	 * our logical offset */
 	ret = ocfs2_extent_map_get_blocks(inode, iblock, &p_blkno,
@@ -582,18 +577,8 @@ static int ocfs2_direct_IO_get_blocks(struct inode *inode, sector_t iblock,
 		goto bail;
 	}
 
-	if (!ocfs2_sparse_alloc(OCFS2_SB(inode->i_sb)) && !p_blkno && create) {
-		ocfs2_error(inode->i_sb,
-			    "Inode %llu has a hole at block %llu\n",
-			    (unsigned long long)OCFS2_I(inode)->ip_blkno,
-			    (unsigned long long)iblock);
-		ret = -EROFS;
-		goto bail;
-	}
-
-	/* We should already CoW the refcounted extent in case of create. */
-	BUG_ON(create && (ext_flags & OCFS2_EXT_REFCOUNTED));
-
+	/* We should already CoW the refcounted extent. */
+	BUG_ON(ext_flags & OCFS2_EXT_REFCOUNTED);
 	/*
 	 * get_more_blocks() expects us to describe a hole by clearing
 	 * the mapped bit on bh_result().
@@ -602,20 +587,8 @@ static int ocfs2_direct_IO_get_blocks(struct inode *inode, sector_t iblock,
 	 */
 	if (p_blkno && !(ext_flags & OCFS2_EXT_UNWRITTEN))
 		map_bh(bh_result, inode->i_sb, p_blkno);
-	else {
-		/*
-		 * ocfs2_prepare_inode_for_write() should have caught
-		 * the case where we'd be filling a hole and triggered
-		 * a buffered write instead.
-		 */
-		if (create) {
-			ret = -EIO;
-			mlog_errno(ret);
-			goto bail;
-		}
-
+	else
 		clear_buffer_mapped(bh_result);
-	}
 
 	/* make sure we don't map more than max_blocks blocks here as
 	   that's all the kernel will handle at this point. */
@@ -635,7 +608,9 @@ bail:
 static void ocfs2_dio_end_io(struct kiocb *iocb,
 			     loff_t offset,
 			     ssize_t bytes,
-			     void *private)
+			     void *private,
+			     int ret,
+			     bool is_async)
 {
 	struct inode *inode = iocb->ki_filp->f_path.dentry->d_inode;
 	int level;
@@ -649,6 +624,9 @@ static void ocfs2_dio_end_io(struct kiocb *iocb,
 	if (!level)
 		up_read(&inode->i_alloc_sem);
 	ocfs2_rw_unlock(inode, level);
+
+	if (is_async)
+		aio_complete(iocb, ret, 0);
 }
 
 /*
@@ -1090,12 +1068,6 @@ static int ocfs2_prepare_page_for_write(struct inode *inode, u64 *p_blkno,
 
 	ocfs2_figure_cluster_boundaries(OCFS2_SB(inode->i_sb), cpos,
 					&cluster_start, &cluster_end);
-
-	/* treat the write as new if the a hole/lseek spanned across
-	 * the page boundary.
-	 */
-	new = new | ((i_size_read(inode) <= page_offset(page)) &&
-			(page_offset(page) <= user_pos));
 
 	if (page == wc->w_target_page) {
 		map_from = user_pos & (PAGE_CACHE_SIZE - 1);

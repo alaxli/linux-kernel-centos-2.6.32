@@ -11,6 +11,7 @@
  * Jeremy Fitzhardinge <jeremy@xensource.com>, XenSource Inc, 2007
  */
 
+#include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/smp.h>
@@ -27,13 +28,19 @@
 #include <linux/page-flags.h>
 #include <linux/highmem.h>
 #include <linux/console.h>
+#include <linux/pci.h>
+#include <linux/gfp.h>
+#include <linux/crash_dump.h>
 
+#include <xen/xen.h>
 #include <xen/interface/xen.h>
 #include <xen/interface/version.h>
 #include <xen/interface/physdev.h>
 #include <xen/interface/vcpu.h>
+#include <xen/interface/memory.h>
 #include <xen/features.h>
 #include <xen/page.h>
+#include <xen/hvm.h>
 #include <xen/hvc-console.h>
 
 #include <asm/paravirt.h>
@@ -53,6 +60,7 @@
 #include <asm/tlbflush.h>
 #include <asm/reboot.h>
 #include <asm/stackprotector.h>
+#include <asm/hypervisor.h>
 
 #include "xen-ops.h"
 #include "mmu.h"
@@ -69,9 +77,13 @@ EXPORT_SYMBOL_GPL(xen_domain_type);
 struct start_info *xen_start_info;
 EXPORT_SYMBOL_GPL(xen_start_info);
 
+static struct shared_info *shared_info_page;
 struct shared_info xen_dummy_shared_info;
 
 void *xen_initial_gdt;
+
+__read_mostly int xen_have_vector_callback;
+EXPORT_SYMBOL_GPL(xen_have_vector_callback);
 
 /*
  * Point at some empty memory to start with. We map the real shared_info
@@ -174,6 +186,8 @@ static void __init xen_banner(void)
 
 static __read_mostly unsigned int cpuid_leaf1_edx_mask = ~0;
 static __read_mostly unsigned int cpuid_leaf1_ecx_mask = ~0;
+static __read_mostly unsigned int cpuid_leaf81_edx_mask = ~0;
+static __read_mostly unsigned int cpuid_leaf87_edx_mask = 0;
 
 static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 		      unsigned int *cx, unsigned int *dx)
@@ -187,14 +201,25 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
 	 * unsupported kernel subsystems as possible.
 	 */
 	switch (*ax) {
-	case 1:
+	case 0x1:
 		maskecx = cpuid_leaf1_ecx_mask;
 		maskedx = cpuid_leaf1_edx_mask;
 		break;
 
+	case 5: /* CPUID_MWAIT_LEAF */
+		maskecx = maskedx = 0;
+
 	case 0xb:
 		/* Suppress extended topology stuff */
 		maskebx = 0;
+		break;
+
+	case 0x80000001:
+		maskedx = cpuid_leaf81_edx_mask;
+		break;
+
+	case 0x80000007:
+		maskedx = cpuid_leaf87_edx_mask;
 		break;
 	}
 
@@ -214,14 +239,20 @@ static __init void xen_init_cpuid_mask(void)
 {
 	unsigned int ax, bx, cx, dx;
 
+	cpuid_leaf1_ecx_mask =
+		~((1 << (X86_FEATURE_MWAIT % 32)) |
+		  (1 << (X86_FEATURE_AVX % 32)));
+
 	cpuid_leaf1_edx_mask =
-		~((1 << X86_FEATURE_MCE)  |  /* disable MCE */
-		  (1 << X86_FEATURE_MCA)  |  /* disable MCA */
-		  (1 << X86_FEATURE_ACC));   /* thermal monitoring */
+		~(1 << X86_FEATURE_ACC);   /* thermal monitoring */
+
+	cpuid_leaf81_edx_mask = ~(1 << (X86_FEATURE_GBPAGES % 32));
 
 	if (!xen_initial_domain())
 		cpuid_leaf1_edx_mask &=
-			~((1 << X86_FEATURE_APIC) |  /* disable local APIC */
+			~((1 << X86_FEATURE_MCE)  |  /* disable MCE */
+			  (1 << X86_FEATURE_MCA)  |  /* disable MCA */
+			  (1 << X86_FEATURE_APIC) |  /* disable local APIC */
 			  (1 << X86_FEATURE_ACPI));  /* disable ACPI */
 
 	ax = 1;
@@ -331,6 +362,24 @@ static void xen_set_ldt(const void *addr, unsigned entries)
 
 	xen_mc_issue(PARAVIRT_LAZY_CPU);
 }
+
+#ifdef CONFIG_X86_32
+static void xen_load_user_cs_desc(int cpu, struct mm_struct *mm)
+{
+	void *gdt;
+	xmaddr_t mgdt;
+	u64 descriptor;
+	struct desc_struct user_cs;
+
+	gdt = &get_cpu_gdt_table(cpu)[GDT_ENTRY_DEFAULT_USER_CS];
+	mgdt = virt_to_machine(gdt);
+
+	user_cs = mm->context.user_cs;
+	descriptor = (u64) user_cs.a | ((u64) user_cs.b) << 32;
+
+	HYPERVISOR_update_descriptor(mgdt.maddr, descriptor);
+}
+#endif /*CONFIG_X86_32*/
 
 static void xen_load_gdt(const struct desc_ptr *dtr)
 {
@@ -728,7 +777,6 @@ static void set_xen_basic_apic_ops(void)
 
 #endif
 
-
 static void xen_clts(void)
 {
 	struct multicall_space mcs;
@@ -773,19 +821,11 @@ static void xen_write_cr4(unsigned long cr4)
 {
 	cr4 &= ~X86_CR4_PGE;
 	cr4 &= ~X86_CR4_PSE;
+	cr4 &= ~X86_CR4_OSXSAVE;
 
 	native_write_cr4(cr4);
 }
-#ifdef CONFIG_X86_64
-static inline unsigned long xen_read_cr8(void)
-{
-	return 0;
-}
-static inline void xen_write_cr8(unsigned long val)
-{
-	BUG_ON(val);
-}
-#endif
+
 static int xen_write_msr_safe(unsigned int msr, unsigned low, unsigned high)
 {
 	int ret;
@@ -951,22 +991,12 @@ static const struct pv_cpu_ops xen_cpu_ops __initdata = {
 	.read_cr4_safe = native_read_cr4_safe,
 	.write_cr4 = xen_write_cr4,
 
-#ifdef CONFIG_X86_64
-	.read_cr8 = xen_read_cr8,
-	.write_cr8 = xen_write_cr8,
-#endif
-
 	.wbinvd = native_wbinvd,
 
 	.read_msr = native_read_msr_safe,
-	.rdmsr_regs = native_rdmsr_safe_regs,
 	.write_msr = xen_write_msr_safe,
-	.wrmsr_regs = native_wrmsr_safe_regs,
-
 	.read_tsc = native_read_tsc,
 	.read_pmc = native_read_pmc,
-
-	.read_tscp = native_read_tscp,
 
 	.iret = xen_iret,
 	.irq_enable_sysexit = xen_sysexit,
@@ -977,6 +1007,9 @@ static const struct pv_cpu_ops xen_cpu_ops __initdata = {
 
 	.load_tr_desc = paravirt_nop,
 	.set_ldt = xen_set_ldt,
+#ifdef CONFIG_X86_32
+	.load_user_cs_desc = xen_load_user_cs_desc,
+#endif /*CONFIG_X86_32*/
 	.load_gdt = xen_load_gdt,
 	.load_idt = xen_load_idt,
 	.load_tls = xen_load_tls,
@@ -1038,6 +1071,26 @@ static void xen_machine_halt(void)
 static void xen_crash_shutdown(struct pt_regs *regs)
 {
 	xen_reboot(SHUTDOWN_crash);
+}
+
+static int
+xen_panic_event(struct notifier_block *this, unsigned long event, void *ptr)
+{
+	struct sched_shutdown r = { .reason = SHUTDOWN_crash};
+
+	if (HYPERVISOR_sched_op(SCHEDOP_shutdown, &r))
+		BUG();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block xen_panic_block = {
+	.notifier_call= xen_panic_event,
+};
+
+int xen_panic_handler_init(void)
+{
+	atomic_notifier_chain_register(&panic_notifier_list, &xen_panic_block);
+	return 0;
 }
 
 static const struct machine_ops __initdata xen_machine_ops = {
@@ -1157,6 +1210,15 @@ asmlinkage void __init xen_start_kernel(void)
 
 	xen_smp_init();
 
+#ifdef CONFIG_ACPI_NUMA
+	/*
+	 * The pages we from Xen are not related to machine pages, so
+	 * any NUMA information the kernel tries to get from ACPI will
+	 * be meaningless.  Prevent it from trying.
+	 */
+	acpi_numa = -1;
+#endif
+
 	pgd = (pgd_t *)xen_start_info->pt_base;
 
 	/* Don't do the full vcpu_info placement stuff until we have a
@@ -1199,7 +1261,11 @@ asmlinkage void __init xen_start_kernel(void)
 		add_preferred_console("xenboot", 0, NULL);
 		add_preferred_console("tty", 0, NULL);
 		add_preferred_console("hvc", 0, NULL);
+	} else {
+		/* Make sure ACS will be enabled */
+		pci_request_acs();
 	}
+		
 
 	xen_raw_console_write("about to get started...\n");
 
@@ -1211,4 +1277,128 @@ asmlinkage void __init xen_start_kernel(void)
 #else
 	x86_64_start_reservations((char *)__pa_symbol(&boot_params));
 #endif
+}
+
+uint32_t xen_cpuid_base(void)
+{
+	uint32_t base, eax, ebx, ecx, edx;
+	char signature[13];
+
+	for (base = 0x40000000; base < 0x40010000; base += 0x100) {
+		cpuid(base, &eax, &ebx, &ecx, &edx);
+		*(uint32_t *)(signature + 0) = ebx;
+		*(uint32_t *)(signature + 4) = ecx;
+		*(uint32_t *)(signature + 8) = edx;
+		signature[12] = 0;
+
+		if (!strcmp("XenVMMXenVMM", signature) && ((eax - base) >= 2))
+			return base;
+	}
+
+	return 0;
+}
+
+static int init_hvm_pv_info(int *major, int *minor)
+{
+	uint32_t eax, ebx, ecx, edx, pages, msr, base;
+	u64 pfn;
+
+	base = xen_cpuid_base();
+	if (!base)
+		return -EINVAL;
+
+	cpuid(base + 1, &eax, &ebx, &ecx, &edx);
+
+	*major = eax >> 16;
+	*minor = eax & 0xffff;
+	printk(KERN_INFO "Xen version %d.%d.\n", *major, *minor);
+
+	cpuid(base + 2, &pages, &msr, &ecx, &edx);
+
+	pfn = __pa(hypercall_page);
+	wrmsr_safe(msr, (u32)pfn, (u32)(pfn >> 32));
+
+	xen_setup_features();
+
+	pv_info = xen_info;
+	pv_info.kernel_rpl = 0;
+
+	xen_domain_type = XEN_HVM_DOMAIN;
+
+	return 0;
+}
+
+void xen_hvm_init_shared_info(void)
+{
+	int cpu;
+	struct xen_add_to_physmap xatp;
+
+	xatp.domid = DOMID_SELF;
+	xatp.idx = 0;
+	xatp.space = XENMAPSPACE_shared_info;
+	xatp.gpfn = __pa(shared_info_page) >> PAGE_SHIFT;
+	if (HYPERVISOR_memory_op(XENMEM_add_to_physmap, &xatp))
+		BUG();
+
+	HYPERVISOR_shared_info = (struct shared_info *)shared_info_page;
+
+	/* xen_vcpu is a pointer to the vcpu_info struct in the shared_info
+	 * page, we use it in the event channel upcall and in some pvclock
+	 * related functions. We don't need the vcpu_info placement
+	 * optimizations because we don't use any pv_mmu or pv_irq op on
+	 * HVM.
+	 * When xen_hvm_init_shared_info is run at boot time only vcpu 0 is
+	 * online but xen_hvm_init_shared_info is run at resume time too and
+	 * in that case multiple vcpus might be online. */
+	for_each_online_cpu(cpu) {
+		per_cpu(xen_vcpu, cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
+	}
+}
+
+static int __cpuinit xen_hvm_cpu_notify(struct notifier_block *self,
+				    unsigned long action, void *hcpu)
+{
+	int cpu = (long)hcpu;
+	switch (action) {
+	case CPU_UP_PREPARE:
+		per_cpu(xen_vcpu, cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block __cpuinitdata xen_hvm_cpu_notifier = {
+	.notifier_call	= xen_hvm_cpu_notify,
+};
+
+void __init xen_hvm_guest_init(void)
+{
+	int r;
+	int major, minor;
+
+	if (xen_pv_domain())
+		return;
+
+	if (is_kdump_kernel())
+		return;
+
+	r = init_hvm_pv_info(&major, &minor);
+	if (r < 0)
+		return;
+
+	shared_info_page = (struct shared_info *)
+		alloc_bootmem_pages(PAGE_SIZE);
+
+	xen_hvm_init_shared_info();
+
+	xen_panic_handler_init();
+
+	if (xen_feature(XENFEAT_hvm_callback_vector))
+		xen_have_vector_callback = 1;
+	register_cpu_notifier(&xen_hvm_cpu_notifier);
+	xen_unplug_emulated_devices();
+	have_vcpu_info_placement = 0;
+	x86_init.irqs.intr_init = xen_init_IRQ;
 }

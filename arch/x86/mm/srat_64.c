@@ -17,6 +17,7 @@
 #include <linux/topology.h>
 #include <linux/bootmem.h>
 #include <linux/mm.h>
+#include <linux/dmi.h>
 #include <asm/proto.h>
 #include <asm/numa.h>
 #include <asm/e820.h>
@@ -133,6 +134,10 @@ acpi_numa_x2apic_affinity_init(struct acpi_srat_x2apic_cpu_affinity *pa)
 	}
 
 	apic_id = pa->apic_id;
+	if (apic_id >= MAX_LOCAL_APIC) {
+		printk(KERN_INFO "SRAT: PXM %u -> APIC 0x%04x -> Node %u skipped apicid that is too big\n", pxm, apic_id, node);
+		return;
+	}
 	apicid_to_node[apic_id] = node;
 	node_set(node, cpu_nodes_parsed);
 	acpi_numa = 1;
@@ -167,6 +172,12 @@ acpi_numa_processor_affinity_init(struct acpi_srat_cpu_affinity *pa)
 		apic_id = (pa->apic_id << 8) | pa->local_sapic_eid;
 	else
 		apic_id = pa->apic_id;
+
+	if (apic_id >= MAX_LOCAL_APIC) {
+		printk(KERN_INFO "SRAT: PXM %u -> APIC 0x%02x -> Node %u skipped apicid that is too big\n", pxm, apic_id, node);
+		return;
+	}
+
 	apicid_to_node[apic_id] = node;
 	node_set(node, cpu_nodes_parsed);
 	acpi_numa = 1;
@@ -244,6 +255,7 @@ acpi_numa_memory_affinity_init(struct acpi_srat_mem_affinity *ma)
 	unsigned long start, end;
 	int node, pxm;
 	int i;
+	const char *dmi_product_name;
 
 	if (srat_disabled())
 		return;
@@ -295,7 +307,10 @@ acpi_numa_memory_affinity_init(struct acpi_srat_mem_affinity *ma)
 	e820_register_active_regions(node, start >> PAGE_SHIFT,
 				     end >> PAGE_SHIFT);
 
-	if (ma->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE) {
+	dmi_product_name = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (ma->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE &&
+	    (!dmi_match(DMI_SYS_VENDOR, "FUJITSU") ||
+	     !strstr(dmi_product_name, "PRIMEQUEST"))) {
 		update_nodes_add(node, start, end);
 		/* restore nodes[node] */
 		*nd = oldnode;
@@ -321,7 +336,7 @@ static int __init nodes_cover_memory(const struct bootnode *nodes)
 		unsigned long s = nodes[i].start >> PAGE_SHIFT;
 		unsigned long e = nodes[i].end >> PAGE_SHIFT;
 		pxmram += e - s;
-		pxmram -= absent_pages_in_range(s, e);
+		pxmram -= __absent_pages_in_range(i, s, e);
 		if ((long)pxmram < 0)
 			pxmram = 0;
 	}
@@ -352,6 +367,8 @@ int __init acpi_scan_nodes(unsigned long start, unsigned long end)
 	for (i = 0; i < MAX_NUMNODES; i++)
 		cutoff_node(i, start, end);
 
+	/* for out of order entries in SRAT */
+	sort_node_map();
 	if (!nodes_cover_memory(nodes)) {
 		bad_srat();
 		return -1;

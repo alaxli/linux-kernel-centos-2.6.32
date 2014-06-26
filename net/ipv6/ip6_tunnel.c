@@ -43,6 +43,7 @@
 
 #include <net/icmp.h>
 #include <net/ip.h>
+#include <net/ip_tunnels.h>
 #include <net/ipv6.h>
 #include <net/ip6_route.h>
 #include <net/addrconf.h>
@@ -56,7 +57,6 @@
 MODULE_AUTHOR("Ville Nuorvala");
 MODULE_DESCRIPTION("IPv6 tunneling device");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_NETDEV("ip6tnl0");
 
 #define IPV6_TLV_TEL_DST_SIZE 8
 
@@ -1468,27 +1468,27 @@ static int __init ip6_tunnel_init(void)
 
 	err = register_pernet_gen_device(&ip6_tnl_net_id, &ip6_tnl_net_ops);
 	if (err < 0)
-		goto out_pernet;
+		goto out;
 
-	err = xfrm6_tunnel_register(&ip4ip6_handler, AF_INET);
-	if (err < 0) {
+	if (xfrm6_tunnel_register(&ip4ip6_handler, AF_INET)) {
 		printk(KERN_ERR "ip6_tunnel init: can't register ip4ip6\n");
-		goto out_ip4ip6;
+		err = -EAGAIN;
+		goto unreg_pernet_dev;
 	}
 
-	err = xfrm6_tunnel_register(&ip6ip6_handler, AF_INET6);
-	if (err < 0) {
+	if (xfrm6_tunnel_register(&ip6ip6_handler, AF_INET6)) {
 		printk(KERN_ERR "ip6_tunnel init: can't register ip6ip6\n");
-		goto out_ip6ip6;
+		err = -EAGAIN;
+		goto unreg_ip4ip6;
 	}
 
 	return 0;
 
-out_ip6ip6:
+unreg_ip4ip6:
 	xfrm6_tunnel_deregister(&ip4ip6_handler, AF_INET);
-out_ip4ip6:
+unreg_pernet_dev:
 	unregister_pernet_gen_device(ip6_tnl_net_id, &ip6_tnl_net_ops);
-out_pernet:
+out:
 	return err;
 }
 

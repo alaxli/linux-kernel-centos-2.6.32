@@ -5,6 +5,7 @@
 #include <asm/ldt.h>
 #include <asm/mmu.h>
 #include <linux/smp.h>
+#include <linux/mm_types.h>
 
 static inline void fill_ldt(struct desc_struct *desc,
 			    const struct user_desc *info)
@@ -93,6 +94,9 @@ static inline int desc_empty(const void *ptr)
 
 #define load_TLS(t, cpu) native_load_tls(t, cpu)
 #define set_ldt native_set_ldt
+#ifdef CONFIG_X86_32
+#define load_user_cs_desc native_load_user_cs_desc
+#endif /*CONFIG_X86_32*/
 
 #define write_ldt_entry(dt, entry, desc)	\
 	native_write_ldt_entry(dt, entry, desc)
@@ -309,6 +313,19 @@ static inline void set_desc_limit(struct desc_struct *desc, unsigned long limit)
 	desc->limit = (limit >> 16) & 0xf;
 }
 
+#ifdef CONFIG_TRACING
+extern struct desc_ptr trace_idt_descr;
+extern gate_desc trace_idt_table[];
+static inline void write_trace_idt_entry(int entry, const gate_desc *gate)
+{
+	write_idt_entry(trace_idt_table, entry, gate);
+}
+#else
+static inline void write_trace_idt_entry(int entry, const gate_desc *gate)
+{
+}
+#endif
+
 static inline void _set_gate(int gate, unsigned type, void *addr,
 			     unsigned dpl, unsigned ist, unsigned seg)
 {
@@ -319,6 +336,7 @@ static inline void _set_gate(int gate, unsigned type, void *addr,
 	 * setup time
 	 */
 	write_idt_entry(idt_table, gate, &s);
+	write_trace_idt_entry(gate, &s);
 }
 
 /*
@@ -347,11 +365,38 @@ static inline void alloc_system_vector(int vector)
 		BUG();
 }
 
-static inline void alloc_intr_gate(unsigned int n, void *addr)
+#ifdef CONFIG_TRACING
+static inline void trace_set_intr_gate(unsigned int gate, void *addr)
 {
-	alloc_system_vector(n);
+	gate_desc s;
+
+	pack_gate(&s, GATE_INTERRUPT, (unsigned long)addr, 0, 0, __KERNEL_CS);
+	write_idt_entry(trace_idt_table, gate, &s);
+}
+
+static inline void __trace_alloc_intr_gate(unsigned int n, void *addr)
+{
+	trace_set_intr_gate(n, addr);
+}
+#else
+static inline void trace_set_intr_gate(unsigned int gate, void *addr)
+{
+}
+
+#define __trace_alloc_intr_gate(n, addr)
+#endif
+
+static inline void __alloc_intr_gate(unsigned int n, void *addr)
+{
 	set_intr_gate(n, addr);
 }
+
+#define alloc_intr_gate(n, addr)				\
+	do {							\
+		alloc_system_vector(n);				\
+		__alloc_intr_gate(n, addr);			\
+		__trace_alloc_intr_gate(n, trace_##addr);	\
+	} while (0)
 
 /*
  * This routine sets up an interrupt gate at directory privilege level 3.
@@ -390,6 +435,67 @@ static inline void set_system_intr_gate_ist(int n, void *addr, unsigned ist)
 {
 	BUG_ON((unsigned)n > 0xFF);
 	_set_gate(n, GATE_INTERRUPT, addr, 0x3, ist, __KERNEL_CS);
+}
+
+#ifdef CONFIG_X86_32
+static inline void set_user_cs(struct desc_struct *desc, unsigned long limit)
+{
+	limit = (limit - 1) / PAGE_SIZE;
+	desc->a = limit & 0xffff;
+	desc->b = (limit & 0xf0000) | 0x00c0fb00;
+}
+
+static inline void native_load_user_cs_desc(int cpu, struct mm_struct *mm)
+{
+	get_cpu_gdt_table(cpu)[GDT_ENTRY_DEFAULT_USER_CS] = (mm)->context.user_cs;
+}
+
+#define arch_add_exec_range arch_add_exec_range
+#define arch_remove_exec_range arch_remove_exec_range
+#define arch_flush_exec_range arch_flush_exec_range
+extern void arch_add_exec_range(struct mm_struct *mm, unsigned long limit);
+extern void arch_remove_exec_range(struct mm_struct *mm, unsigned long limit);
+extern void arch_flush_exec_range(struct mm_struct *mm);
+#endif /* CONFIG_X86_32 */
+
+#ifdef CONFIG_TRACING
+extern atomic_t trace_idt_ctr;
+static inline bool is_trace_idt_enabled(void)
+{
+	if (atomic_read(&trace_idt_ctr))
+		return true;
+
+	return false;
+}
+
+static inline void load_trace_idt(void)
+{
+	load_idt((const struct desc_ptr *)&trace_idt_descr);
+}
+#else
+static inline bool is_trace_idt_enabled(void)
+{
+	return false;
+}
+
+static inline void load_trace_idt(void)
+{
+}
+#endif
+
+ /*
+  * The load_current_idt() must be called with interrupts disabled
+  * to avoid races. That way the IDT will always be set back to the expected
+  * descriptor. It's also called when a CPU is being initialized, and
+  * that doesn't need to disable interrupts, as nothing should be
+  * bothering the CPU then.
+  */
+static inline void load_current_idt(void)
+{
+	if (is_trace_idt_enabled())
+		load_trace_idt();
+	else
+		load_idt((const struct desc_ptr *)&idt_descr);
 }
 
 #endif /* _ASM_X86_DESC_H */

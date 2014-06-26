@@ -57,9 +57,9 @@ static void sctp_datamsg_init(struct sctp_datamsg *msg)
 	msg->send_failed = 0;
 	msg->send_error = 0;
 	msg->can_abandon = 0;
+	msg->can_delay = 1;
 	msg->expires_at = 0;
 	INIT_LIST_HEAD(&msg->chunks);
-	msg->msg_size = 0;
 }
 
 /* Allocate and initialize datamsg. */
@@ -156,7 +156,6 @@ static void sctp_datamsg_assign(struct sctp_datamsg *msg, struct sctp_chunk *chu
 {
 	sctp_datamsg_hold(msg);
 	chunk->msg = msg;
-	msg->msg_size += chunk->skb->len;
 }
 
 
@@ -246,6 +245,7 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 	if (msg_len >= first_len) {
 		msg_len -= first_len;
 		whole = 1;
+		msg->can_delay = 0;
 	}
 
 	/* How many full sized?  How many bytes leftover? */
@@ -272,7 +272,7 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 			goto errout;
 		err = sctp_user_addto_chunk(chunk, offset, len, msgh->msg_iov);
 		if (err < 0)
-			goto errout_chunk_free;
+			goto errout;
 
 		offset += len;
 
@@ -308,16 +308,13 @@ struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *asoc,
 		__skb_pull(chunk->skb, (__u8 *)chunk->chunk_hdr
 			   - (__u8 *)chunk->skb->data);
 		if (err < 0)
-			goto errout_chunk_free;
+			goto errout;
 
 		sctp_datamsg_assign(msg, chunk);
 		list_add_tail(&chunk->frag_list, &msg->chunks);
 	}
 
 	return msg;
-
-errout_chunk_free:
-	sctp_chunk_free(chunk);
 
 errout:
 	list_for_each_safe(pos, temp, &msg->chunks) {

@@ -1,291 +1,686 @@
 #include "builtin.h"
-
-#include "util/util.h"
-#include "util/cache.h"
-#include "util/symbol.h"
+#include "util/color.h"
+#include "util/evlist.h"
+#include "util/machine.h"
 #include "util/thread.h"
-#include "util/header.h"
-
 #include "util/parse-options.h"
+#include "util/thread_map.h"
+#include "event-parse.h"
 
-#include "perf.h"
-#include "util/debug.h"
+#include <libaudit.h>
+#include <stdlib.h>
 
-#include "util/trace-event.h"
+static struct syscall_fmt {
+	const char *name;
+	const char *alias;
+	bool	   errmsg;
+	bool	   timeout;
+} syscall_fmts[] = {
+	{ .name	    = "access",	    .errmsg = true, },
+	{ .name	    = "arch_prctl", .errmsg = true, .alias = "prctl", },
+	{ .name	    = "fstat",	    .errmsg = true, .alias = "newfstat", },
+	{ .name	    = "fstatat",    .errmsg = true, .alias = "newfstatat", },
+	{ .name	    = "futex",	    .errmsg = true, },
+	{ .name	    = "open",	    .errmsg = true, },
+	{ .name	    = "poll",	    .errmsg = true, .timeout = true, },
+	{ .name	    = "ppoll",	    .errmsg = true, .timeout = true, },
+	{ .name	    = "read",	    .errmsg = true, },
+	{ .name	    = "recvfrom",   .errmsg = true, },
+	{ .name	    = "select",	    .errmsg = true, .timeout = true, },
+	{ .name	    = "socket",	    .errmsg = true, },
+	{ .name	    = "stat",	    .errmsg = true, .alias = "newstat", },
+};
 
-static char		const *input_name = "perf.data";
-static int		input;
-static unsigned long	page_size;
-static unsigned long	mmap_window = 32;
-
-static unsigned long	total = 0;
-static unsigned long	total_comm = 0;
-
-static struct rb_root	threads;
-static struct thread	*last_match;
-
-static struct perf_header *header;
-static u64		sample_type;
-
-
-static int
-process_comm_event(event_t *event, unsigned long offset, unsigned long head)
+static int syscall_fmt__cmp(const void *name, const void *fmtp)
 {
-	struct thread *thread;
-
-	thread = threads__findnew(event->comm.pid, &threads, &last_match);
-
-	dump_printf("%p [%p]: PERF_RECORD_COMM: %s:%d\n",
-		(void *)(offset + head),
-		(void *)(long)(event->header.size),
-		event->comm.comm, event->comm.pid);
-
-	if (thread == NULL ||
-	    thread__set_comm(thread, event->comm.comm)) {
-		dump_printf("problem processing PERF_RECORD_COMM, skipping event.\n");
-		return -1;
-	}
-	total_comm++;
-
-	return 0;
+	const struct syscall_fmt *fmt = fmtp;
+	return strcmp(name, fmt->name);
 }
 
-static int
-process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+static struct syscall_fmt *syscall_fmt__find(const char *name)
 {
-	char level;
-	int show = 0;
-	struct dso *dso = NULL;
-	struct thread *thread;
-	u64 ip = event->ip.ip;
-	u64 timestamp = -1;
-	u32 cpu = -1;
-	u64 period = 1;
-	void *more_data = event->ip.__more_data;
-	int cpumode;
-
-	thread = threads__findnew(event->ip.pid, &threads, &last_match);
-
-	if (sample_type & PERF_SAMPLE_TIME) {
-		timestamp = *(u64 *)more_data;
-		more_data += sizeof(u64);
-	}
-
-	if (sample_type & PERF_SAMPLE_CPU) {
-		cpu = *(u32 *)more_data;
-		more_data += sizeof(u32);
-		more_data += sizeof(u32); /* reserved */
-	}
-
-	if (sample_type & PERF_SAMPLE_PERIOD) {
-		period = *(u64 *)more_data;
-		more_data += sizeof(u64);
-	}
-
-	dump_printf("%p [%p]: PERF_RECORD_SAMPLE (IP, %d): %d/%d: %p period: %Ld\n",
-		(void *)(offset + head),
-		(void *)(long)(event->header.size),
-		event->header.misc,
-		event->ip.pid, event->ip.tid,
-		(void *)(long)ip,
-		(long long)period);
-
-	dump_printf(" ... thread: %s:%d\n", thread->comm, thread->pid);
-
-	if (thread == NULL) {
-		eprintf("problem processing %d event, skipping it.\n",
-			event->header.type);
-		return -1;
-	}
-
-	cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
-
-	if (cpumode == PERF_RECORD_MISC_KERNEL) {
-		show = SHOW_KERNEL;
-		level = 'k';
-
-		dso = kernel_dso;
-
-		dump_printf(" ...... dso: %s\n", dso->name);
-
-	} else if (cpumode == PERF_RECORD_MISC_USER) {
-
-		show = SHOW_USER;
-		level = '.';
-
-	} else {
-		show = SHOW_HV;
-		level = 'H';
-
-		dso = hypervisor_dso;
-
-		dump_printf(" ...... dso: [hypervisor]\n");
-	}
-
-	if (sample_type & PERF_SAMPLE_RAW) {
-		struct {
-			u32 size;
-			char data[0];
-		} *raw = more_data;
-
-		/*
-		 * FIXME: better resolve from pid from the struct trace_entry
-		 * field, although it should be the same than this perf
-		 * event pid
-		 */
-		print_event(cpu, raw->data, raw->size, timestamp, thread->comm);
-	}
-	total += period;
-
-	return 0;
+	const int nmemb = ARRAY_SIZE(syscall_fmts);
+	return bsearch(name, syscall_fmts, nmemb, sizeof(struct syscall_fmt), syscall_fmt__cmp);
 }
 
-static int
-process_event(event_t *event, unsigned long offset, unsigned long head)
+struct syscall {
+	struct event_format *tp_format;
+	const char	    *name;
+	struct syscall_fmt  *fmt;
+};
+
+static size_t fprintf_duration(unsigned long t, FILE *fp)
 {
-	trace_event(event);
+	double duration = (double)t / NSEC_PER_MSEC;
+	size_t printed = fprintf(fp, "(");
+
+	if (duration >= 1.0)
+		printed += color_fprintf(fp, PERF_COLOR_RED, "%6.3f ms", duration);
+	else if (duration >= 0.01)
+		printed += color_fprintf(fp, PERF_COLOR_YELLOW, "%6.3f ms", duration);
+	else
+		printed += color_fprintf(fp, PERF_COLOR_NORMAL, "%6.3f ms", duration);
+	return printed + fprintf(stdout, "): ");
+}
+
+struct thread_trace {
+	u64		  entry_time;
+	u64		  exit_time;
+	bool		  entry_pending;
+	unsigned long	  nr_events;
+	char		  *entry_str;
+	double		  runtime_ms;
+};
+
+static struct thread_trace *thread_trace__new(void)
+{
+	return zalloc(sizeof(struct thread_trace));
+}
+
+static struct thread_trace *thread__trace(struct thread *thread)
+{
+	struct thread_trace *ttrace;
+
+	if (thread == NULL)
+		goto fail;
+
+	if (thread->priv == NULL)
+		thread->priv = thread_trace__new();
+		
+	if (thread->priv == NULL)
+		goto fail;
+
+	ttrace = thread->priv;
+	++ttrace->nr_events;
+
+	return ttrace;
+fail:
+	color_fprintf(stdout, PERF_COLOR_RED,
+		      "WARNING: not enough memory, dropping samples!\n");
+	return NULL;
+}
+
+struct trace {
+	int			audit_machine;
+	struct {
+		int		max;
+		struct syscall  *table;
+	} syscalls;
+	struct perf_record_opts opts;
+	struct machine		host;
+	u64			base_time;
+	unsigned long		nr_events;
+	bool			sched;
+	bool			multiple_threads;
+	double			duration_filter;
+	double			runtime_ms;
+};
+
+static bool trace__filter_duration(struct trace *trace, double t)
+{
+	return t < (trace->duration_filter * NSEC_PER_MSEC);
+}
+
+static size_t trace__fprintf_tstamp(struct trace *trace, u64 tstamp, FILE *fp)
+{
+	double ts = (double)(tstamp - trace->base_time) / NSEC_PER_MSEC;
+
+	return fprintf(fp, "%10.3f ", ts);
+}
+
+static bool done = false;
+
+static void sig_handler(int sig __maybe_unused)
+{
+	done = true;
+}
+
+static size_t trace__fprintf_entry_head(struct trace *trace, struct thread *thread,
+					u64 duration, u64 tstamp, FILE *fp)
+{
+	size_t printed = trace__fprintf_tstamp(trace, tstamp, fp);
+	printed += fprintf_duration(duration, fp);
+
+	if (trace->multiple_threads)
+		printed += fprintf(fp, "%d ", thread->pid);
+
+	return printed;
+}
+
+static int trace__process_event(struct machine *machine, union perf_event *event)
+{
+	int ret = 0;
 
 	switch (event->header.type) {
-	case PERF_RECORD_MMAP ... PERF_RECORD_LOST:
-		return 0;
-
-	case PERF_RECORD_COMM:
-		return process_comm_event(event, offset, head);
-
-	case PERF_RECORD_EXIT ... PERF_RECORD_READ:
-		return 0;
-
-	case PERF_RECORD_SAMPLE:
-		return process_sample_event(event, offset, head);
-
-	case PERF_RECORD_MAX:
+	case PERF_RECORD_LOST:
+		color_fprintf(stdout, PERF_COLOR_RED,
+			      "LOST %" PRIu64 " events!\n", event->lost.lost);
+		ret = machine__process_lost_event(machine, event);
 	default:
+		ret = machine__process_event(machine, event);
+		break;
+	}
+
+	return ret;
+}
+
+static int trace__tool_process(struct perf_tool *tool __maybe_unused,
+			       union perf_event *event,
+			       struct perf_sample *sample __maybe_unused,
+			       struct machine *machine)
+{
+	return trace__process_event(machine, event);
+}
+
+static int trace__symbols_init(struct trace *trace, struct perf_evlist *evlist)
+{
+	int err = symbol__init();
+
+	if (err)
+		return err;
+
+	machine__init(&trace->host, "", HOST_KERNEL_ID);
+	machine__create_kernel_maps(&trace->host);
+
+	if (perf_target__has_task(&trace->opts.target)) {
+		err = perf_event__synthesize_thread_map(NULL, evlist->threads,
+							trace__tool_process,
+							&trace->host);
+	} else {
+		err = perf_event__synthesize_threads(NULL, trace__tool_process,
+						     &trace->host);
+	}
+
+	if (err)
+		symbol__exit();
+
+	return err;
+}
+
+static int trace__read_syscall_info(struct trace *trace, int id)
+{
+	char tp_name[128];
+	struct syscall *sc;
+	const char *name = audit_syscall_to_name(id, trace->audit_machine);
+
+	if (name == NULL)
+		return -1;
+
+	if (id > trace->syscalls.max) {
+		struct syscall *nsyscalls = realloc(trace->syscalls.table, (id + 1) * sizeof(*sc));
+
+		if (nsyscalls == NULL)
+			return -1;
+
+		if (trace->syscalls.max != -1) {
+			memset(nsyscalls + trace->syscalls.max + 1, 0,
+			       (id - trace->syscalls.max) * sizeof(*sc));
+		} else {
+			memset(nsyscalls, 0, (id + 1) * sizeof(*sc));
+		}
+
+		trace->syscalls.table = nsyscalls;
+		trace->syscalls.max   = id;
+	}
+
+	sc = trace->syscalls.table + id;
+	sc->name = name;
+	sc->fmt  = syscall_fmt__find(sc->name);
+
+	snprintf(tp_name, sizeof(tp_name), "sys_enter_%s", sc->name);
+	sc->tp_format = event_format__new("syscalls", tp_name);
+
+	if (sc->tp_format == NULL && sc->fmt && sc->fmt->alias) {
+		snprintf(tp_name, sizeof(tp_name), "sys_enter_%s", sc->fmt->alias);
+		sc->tp_format = event_format__new("syscalls", tp_name);
+	}
+
+	return sc->tp_format != NULL ? 0 : -1;
+}
+
+static size_t syscall__scnprintf_args(struct syscall *sc, char *bf, size_t size,
+				      unsigned long *args)
+{
+	int i = 0;
+	size_t printed = 0;
+
+	if (sc->tp_format != NULL) {
+		struct format_field *field;
+
+		/* No need to skip 'nr' field, since it's not in RHEL6 yet. */
+		for (field = sc->tp_format->format.fields; field; field = field->next) {
+			printed += scnprintf(bf + printed, size - printed,
+					     "%s%s: %ld", printed ? ", " : "",
+					     field->name, args[i++]);
+		}
+	} else {
+		while (i < 6) {
+			printed += scnprintf(bf + printed, size - printed,
+					     "%sarg%d: %ld",
+					     printed ? ", " : "", i, args[i]);
+			++i;
+		}
+	}
+
+	return printed;
+}
+
+typedef int (*tracepoint_handler)(struct trace *trace, struct perf_evsel *evsel,
+				  struct perf_sample *sample);
+
+static struct syscall *trace__syscall_info(struct trace *trace,
+					   struct perf_evsel *evsel,
+					   struct perf_sample *sample)
+{
+	int id = perf_evsel__intval(evsel, sample, "id");
+
+	if (id < 0) {
+		printf("Invalid syscall %d id, skipping...\n", id);
+		return NULL;
+	}
+
+	if ((id > trace->syscalls.max || trace->syscalls.table[id].name == NULL) &&
+	    trace__read_syscall_info(trace, id))
+		goto out_cant_read;
+
+	if ((id > trace->syscalls.max || trace->syscalls.table[id].name == NULL))
+		goto out_cant_read;
+
+	return &trace->syscalls.table[id];
+
+out_cant_read:
+	printf("Problems reading syscall %d", id);
+	if (id <= trace->syscalls.max && trace->syscalls.table[id].name != NULL)
+		printf("(%s)", trace->syscalls.table[id].name);
+	puts(" information");
+	return NULL;
+}
+
+static int trace__sys_enter(struct trace *trace, struct perf_evsel *evsel,
+			    struct perf_sample *sample)
+{
+	char *msg;
+	void *args;
+	size_t printed = 0;
+	struct thread *thread = machine__findnew_thread(&trace->host, sample->tid);
+	struct syscall *sc = trace__syscall_info(trace, evsel, sample);
+	struct thread_trace *ttrace = thread__trace(thread);
+
+	if (ttrace == NULL || sc == NULL)
+		return -1;
+
+	args = perf_evsel__rawptr(evsel, sample, "args");
+	if (args == NULL) {
+		printf("Problems reading syscall arguments\n");
 		return -1;
 	}
+
+	ttrace = thread->priv;
+
+	if (ttrace->entry_str == NULL) {
+		ttrace->entry_str = malloc(1024);
+		if (!ttrace->entry_str)
+			return -1;
+	}
+
+	ttrace->entry_time = sample->time;
+	msg = ttrace->entry_str;
+	printed += scnprintf(msg + printed, 1024 - printed, "%s(", sc->name);
+
+	printed += syscall__scnprintf_args(sc, msg + printed, 1024 - printed,  args);
+
+	if (!strcmp(sc->name, "exit_group") || !strcmp(sc->name, "exit")) {
+		if (!trace->duration_filter) {
+			trace__fprintf_entry_head(trace, thread, 1, sample->time, stdout);
+			printf("%-70s\n", ttrace->entry_str);
+		}
+	} else
+		ttrace->entry_pending = true;
 
 	return 0;
 }
 
-static int __cmd_trace(void)
+static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
+			   struct perf_sample *sample)
 {
-	int ret, rc = EXIT_FAILURE;
-	unsigned long offset = 0;
-	unsigned long head = 0;
-	struct stat perf_stat;
-	event_t *event;
-	uint32_t size;
-	char *buf;
+	int ret;
+	u64 duration = 0;
+	struct thread *thread = machine__findnew_thread(&trace->host, sample->tid);
+	struct thread_trace *ttrace = thread__trace(thread);
+	struct syscall *sc = trace__syscall_info(trace, evsel, sample);
 
-	trace_report();
-	register_idle_thread(&threads, &last_match);
+	if (ttrace == NULL || sc == NULL)
+		return -1;
 
-	input = open(input_name, O_RDONLY);
-	if (input < 0) {
-		perror("failed to open file");
-		exit(-1);
+	ret = perf_evsel__intval(evsel, sample, "ret");
+
+	ttrace = thread->priv;
+
+	ttrace->exit_time = sample->time;
+
+	if (ttrace->entry_time) {
+		duration = sample->time - ttrace->entry_time;
+		if (trace__filter_duration(trace, duration))
+			goto out;
+	} else if (trace->duration_filter)
+		goto out;
+
+	trace__fprintf_entry_head(trace, thread, duration, sample->time, stdout);
+
+	if (ttrace->entry_pending) {
+		printf("%-70s", ttrace->entry_str);
+	} else {
+		printf(" ... [");
+		color_fprintf(stdout, PERF_COLOR_YELLOW, "continued");
+		printf("]: %s()", sc->name);
 	}
 
-	ret = fstat(input, &perf_stat);
-	if (ret < 0) {
-		perror("failed to stat file");
-		exit(-1);
-	}
+	if (ret < 0 && sc->fmt && sc->fmt->errmsg) {
+		char bf[256];
+		const char *emsg = strerror_r(-ret, bf, sizeof(bf)),
+			   *e = audit_errno_to_name(-ret);
 
-	if (!perf_stat.st_size) {
-		fprintf(stderr, "zero-sized file, nothing to do!\n");
-		exit(0);
-	}
-	header = perf_header__read(input);
-	head = header->data_offset;
-	sample_type = perf_header__sample_type(header);
+		printf(") = -1 %s %s", e, emsg);
+	} else if (ret == 0 && sc->fmt && sc->fmt->timeout)
+		printf(") = 0 Timeout");
+	else
+		printf(") = %d", ret);
 
-	if (!(sample_type & PERF_SAMPLE_RAW))
-		die("No trace sample to read. Did you call perf record "
-		    "without -R?");
+	putchar('\n');
+out:
+	ttrace->entry_pending = false;
 
-	if (load_kernel() < 0) {
-		perror("failed to load kernel symbols");
-		return EXIT_FAILURE;
-	}
-
-remap:
-	buf = (char *)mmap(NULL, page_size * mmap_window, PROT_READ,
-			   MAP_SHARED, input, offset);
-	if (buf == MAP_FAILED) {
-		perror("failed to mmap file");
-		exit(-1);
-	}
-
-more:
-	event = (event_t *)(buf + head);
-
-	if (head + event->header.size >= page_size * mmap_window) {
-		unsigned long shift = page_size * (head / page_size);
-		int res;
-
-		res = munmap(buf, page_size * mmap_window);
-		assert(res == 0);
-
-		offset += shift;
-		head -= shift;
-		goto remap;
-	}
-
-	size = event->header.size;
-
-	if (!size || process_event(event, offset, head) < 0) {
-
-		/*
-		 * assume we lost track of the stream, check alignment, and
-		 * increment a single u64 in the hope to catch on again 'soon'.
-		 */
-
-		if (unlikely(head & 7))
-			head &= ~7ULL;
-
-		size = 8;
-	}
-
-	head += size;
-
-	if (offset + head < (unsigned long)perf_stat.st_size)
-		goto more;
-
-	rc = EXIT_SUCCESS;
-	close(input);
-
-	return rc;
+	return 0;
 }
 
-static const char * const annotate_usage[] = {
-	"perf trace [<options>] <command>",
-	NULL
-};
-
-static const struct option options[] = {
-	OPT_BOOLEAN('D', "dump-raw-trace", &dump_trace,
-		    "dump raw trace in ASCII"),
-	OPT_BOOLEAN('v', "verbose", &verbose,
-		    "be more verbose (show symbol address, etc)"),
-	OPT_END()
-};
-
-int cmd_trace(int argc, const char **argv, const char *prefix __used)
+static int trace__sched_stat_runtime(struct trace *trace, struct perf_evsel *evsel,
+				     struct perf_sample *sample)
 {
-	symbol__init();
-	page_size = getpagesize();
+        u64 runtime = perf_evsel__intval(evsel, sample, "runtime");
+	double runtime_ms = (double)runtime / NSEC_PER_MSEC;
+	struct thread *thread = machine__findnew_thread(&trace->host, sample->tid);
+	struct thread_trace *ttrace = thread__trace(thread);
 
-	argc = parse_options(argc, argv, options, annotate_usage, 0);
-	if (argc) {
-		/*
-		 * Special case: if there's an argument left then assume tha
-		 * it's a symbol filter:
-		 */
-		if (argc > 1)
-			usage_with_options(annotate_usage, options);
+	if (ttrace == NULL)
+		goto out_dump;
+
+	ttrace->runtime_ms += runtime_ms;
+	trace->runtime_ms += runtime_ms;
+	return 0;
+
+out_dump:
+	printf("%s: comm=%s,pid=%u,runtime=%" PRIu64 ",vruntime=%" PRIu64 ")\n",
+	       evsel->name,
+	       perf_evsel__strval(evsel, sample, "comm"),
+	       (pid_t)perf_evsel__intval(evsel, sample, "pid"),
+	       runtime,
+	       perf_evsel__intval(evsel, sample, "vruntime"));
+	return 0;
+}
+
+static int trace__run(struct trace *trace, int argc, const char **argv)
+{
+	struct perf_evlist *evlist = perf_evlist__new(NULL, NULL);
+	struct perf_evsel *evsel;
+	int err = -1, i;
+	unsigned long before;
+	const bool forks = argc > 0;
+
+	if (evlist == NULL) {
+		printf("Not enough memory to run!\n");
+		goto out;
 	}
 
-	setup_pager();
+	if (perf_evlist__add_newtp(evlist, "syscalls", "sys_enter", trace__sys_enter) ||
+	    perf_evlist__add_newtp(evlist, "syscalls", "sys_exit", trace__sys_exit)) {
+		printf("Couldn't read the syscalls tracepoints information!\n");
+		goto out_delete_evlist;
+	}
 
-	return __cmd_trace();
+	if (trace->sched &&
+	    perf_evlist__add_newtp(evlist, "sched", "sched_stat_runtime",
+				   trace__sched_stat_runtime)) {
+		printf("Couldn't read the sched_stat_runtime tracepoint information!\n");
+		goto out_delete_evlist;
+	}
+
+	err = perf_evlist__create_maps(evlist, &trace->opts.target);
+	if (err < 0) {
+		printf("Problems parsing the target to trace, check your options!\n");
+		goto out_delete_evlist;
+	}
+
+	err = trace__symbols_init(trace, evlist);
+	if (err < 0) {
+		printf("Problems initializing symbol libraries!\n");
+		goto out_delete_evlist;
+	}
+
+	perf_evlist__config_attrs(evlist, &trace->opts);
+
+	signal(SIGCHLD, sig_handler);
+	signal(SIGINT, sig_handler);
+
+	if (forks) {
+		err = perf_evlist__prepare_workload(evlist, &trace->opts, argv);
+		if (err < 0) {
+			printf("Couldn't run the workload!\n");
+			goto out_delete_evlist;
+		}
+	}
+
+	err = perf_evlist__open(evlist);
+	if (err < 0) {
+		printf("Couldn't create the events: %s\n", strerror(errno));
+		goto out_delete_evlist;
+	}
+
+	err = perf_evlist__mmap(evlist, UINT_MAX, false);
+	if (err < 0) {
+		printf("Couldn't mmap the events: %s\n", strerror(errno));
+		goto out_delete_evlist;
+	}
+
+	perf_evlist__enable(evlist);
+
+	if (forks)
+		perf_evlist__start_workload(evlist);
+
+	trace->multiple_threads = evlist->threads->map[0] == -1 || evlist->threads->nr > 1;
+again:
+	before = trace->nr_events;
+
+	for (i = 0; i < evlist->nr_mmaps; i++) {
+		union perf_event *event;
+
+		while ((event = perf_evlist__mmap_read(evlist, i)) != NULL) {
+			const u32 type = event->header.type;
+			tracepoint_handler handler;
+			struct perf_sample sample;
+
+			++trace->nr_events;
+
+			err = perf_evlist__parse_sample(evlist, event, &sample);
+			if (err) {
+				printf("Can't parse sample, err = %d, skipping...\n", err);
+				continue;
+			}
+
+			if (trace->base_time == 0)
+				trace->base_time = sample.time;
+
+			if (type != PERF_RECORD_SAMPLE) {
+				trace__process_event(&trace->host, event);
+				continue;
+			}
+
+			evsel = perf_evlist__id2evsel(evlist, sample.id);
+			if (evsel == NULL) {
+				printf("Unknown tp ID %" PRIu64 ", skipping...\n", sample.id);
+				continue;
+			}
+
+			if (sample.raw_data == NULL) {
+				printf("%s sample with no payload for tid: %d, cpu %d, raw_size=%d, skipping...\n",
+				       perf_evsel__name(evsel), sample.tid,
+				       sample.cpu, sample.raw_size);
+				continue;
+			}
+
+			if (sample.raw_data == NULL) {
+				printf("%s sample with no payload for tid: %d, cpu %d, raw_size=%d, skipping...\n",
+				       perf_evsel__name(evsel), sample.tid,
+				       sample.cpu, sample.raw_size);
+				continue;
+			}
+
+			handler = evsel->handler.func;
+			handler(trace, evsel, &sample);
+		}
+	}
+
+	if (trace->nr_events == before) {
+		if (done)
+			goto out_delete_evlist;
+
+		poll(evlist->pollfd, evlist->nr_fds, -1);
+	}
+
+	if (done)
+		perf_evlist__disable(evlist);
+
+	goto again;
+
+out_delete_evlist:
+	perf_evlist__delete(evlist);
+out:
+	return err;
+}
+
+static size_t trace__fprintf_threads_header(FILE *fp)
+{
+	size_t printed;
+
+	printed  = fprintf(fp, "\n _____________________________________________________________________\n");
+	printed += fprintf(fp," __)    Summary of events    (__\n\n");
+	printed += fprintf(fp,"              [ task - pid ]     [ events ] [ ratio ]  [ runtime ]\n");
+	printed += fprintf(fp," _____________________________________________________________________\n\n");
+
+	return printed;
+}
+
+static size_t trace__fprintf_thread_summary(struct trace *trace, FILE *fp)
+{
+	size_t printed = trace__fprintf_threads_header(fp);
+	struct rb_node *nd;
+
+	for (nd = rb_first(&trace->host.threads); nd; nd = rb_next(nd)) {
+		struct thread *thread = rb_entry(nd, struct thread, rb_node);
+		struct thread_trace *ttrace = thread->priv;
+		const char *color;
+		double ratio;
+
+		if (ttrace == NULL)
+			continue;
+
+		ratio = (double)ttrace->nr_events / trace->nr_events * 100.0;
+
+		color = PERF_COLOR_NORMAL;
+		if (ratio > 50.0)
+			color = PERF_COLOR_RED;
+		else if (ratio > 25.0)
+			color = PERF_COLOR_GREEN;
+		else if (ratio > 5.0)
+			color = PERF_COLOR_YELLOW;
+
+		printed += color_fprintf(fp, color, "%20s", thread->comm);
+		printed += fprintf(fp, " - %-5d :%11lu   [", thread->pid, ttrace->nr_events);
+		printed += color_fprintf(fp, color, "%5.1f%%", ratio);
+		printed += fprintf(fp, " ] %10.3f ms\n", ttrace->runtime_ms);
+	}
+
+	return printed;
+}
+
+static int trace__set_duration(const struct option *opt, const char *str,
+			       int unset __maybe_unused)
+{
+	struct trace *trace = opt->value;
+
+	trace->duration_filter = atof(str);
+	return 0;
+}
+
+int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
+{
+	const char * const trace_usage[] = {
+		"perf trace [<options>] [<command>]",
+		"perf trace [<options>] -- <command> [<options>]",
+		NULL
+	};
+	struct trace trace = {
+		.audit_machine = audit_detect_machine(),
+		.syscalls = {
+			. max = -1,
+		},
+		.opts = {
+			.target = {
+				.uid	   = UINT_MAX,
+				.uses_mmap = true,
+			},
+			.user_freq     = UINT_MAX,
+			.user_interval = ULLONG_MAX,
+			.no_delay      = true,
+			.mmap_pages    = 1024,
+		},
+	};
+	const struct option trace_options[] = {
+	OPT_STRING('p', "pid", &trace.opts.target.pid, "pid",
+		    "trace events on existing process id"),
+	OPT_STRING(0, "tid", &trace.opts.target.tid, "tid",
+		    "trace events on existing thread id"),
+	OPT_BOOLEAN(0, "all-cpus", &trace.opts.target.system_wide,
+		    "system-wide collection from all CPUs"),
+	OPT_STRING(0, "cpu", &trace.opts.target.cpu_list, "cpu",
+		    "list of cpus to monitor"),
+	OPT_BOOLEAN(0, "no-inherit", &trace.opts.no_inherit,
+		    "child tasks do not inherit counters"),
+	OPT_UINTEGER(0, "mmap-pages", &trace.opts.mmap_pages,
+		     "number of mmap data pages"),
+	OPT_STRING(0, "uid", &trace.opts.target.uid_str, "user",
+		   "user to profile"),
+	OPT_CALLBACK(0, "duration", &trace, "float",
+		     "show only events with duration > N.M ms",
+		     trace__set_duration),
+	OPT_BOOLEAN(0, "sched", &trace.sched, "show blocking scheduler events"),
+	OPT_END()
+	};
+	int err;
+	char bf[BUFSIZ];
+
+	argc = parse_options(argc, argv, trace_options, trace_usage, 0);
+
+	err = perf_target__validate(&trace.opts.target);
+	if (err) {
+		perf_target__strerror(&trace.opts.target, err, bf, sizeof(bf));
+		printf("%s", bf);
+		return err;
+	}
+
+	err = perf_target__parse_uid(&trace.opts.target);
+	if (err) {
+		perf_target__strerror(&trace.opts.target, err, bf, sizeof(bf));
+		printf("%s", bf);
+		return err;
+	}
+
+	if (!argc && perf_target__none(&trace.opts.target))
+		trace.opts.target.system_wide = true;
+
+	err = trace__run(&trace, argc, argv);
+
+	if (trace.sched && !err)
+		trace__fprintf_thread_summary(&trace, stdout);
+
+	return err;
 }

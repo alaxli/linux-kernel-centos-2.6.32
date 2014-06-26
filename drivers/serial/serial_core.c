@@ -194,6 +194,13 @@ static int uart_startup(struct uart_state *state, int init_hw)
 			spin_unlock_irq(&uport->lock);
 		}
 
+		if (port->flags & ASYNC_DSR_FLOW) {
+			spin_lock_irq(&uport->lock);
+			if (!(uport->ops->get_mctrl(uport) & TIOCM_DSR))
+				port->tty->hw_stopped = 1;
+			spin_unlock_irq(&uport->lock);
+		}
+
 		set_bit(ASYNCB_INITIALIZED, &port->flags);
 
 		clear_bit(TTY_IO_ERROR, &port->tty->flags);
@@ -448,6 +455,11 @@ uart_change_speed(struct uart_state *state, struct ktermios *old_termios)
 	else
 		clear_bit(ASYNCB_CTS_FLOW, &port->flags);
 
+	if (termios->c_cflag & CDTRDSR)
+		set_bit(ASYNCB_DSR_FLOW, &port->flags);
+	else
+		clear_bit(ASYNCB_DSR_FLOW, &port->flags);
+
 	if (termios->c_cflag & CLOCAL)
 		clear_bit(ASYNCB_CHECK_CD, &port->flags);
 	else
@@ -611,6 +623,8 @@ static void uart_throttle(struct tty_struct *tty)
 
 	if (tty->termios->c_cflag & CRTSCTS)
 		uart_clear_mctrl(state->uart_port, TIOCM_RTS);
+	if (tty->termios->c_cflag & CDTRDSR)
+		uart_clear_mctrl(state->uart_port, TIOCM_DTR);
 }
 
 static void uart_unthrottle(struct tty_struct *tty)
@@ -627,6 +641,8 @@ static void uart_unthrottle(struct tty_struct *tty)
 
 	if (tty->termios->c_cflag & CRTSCTS)
 		uart_set_mctrl(port, TIOCM_RTS);
+	if (tty->termios->c_cflag & CDTRDSR)
+		uart_set_mctrl(port, TIOCM_DTR);
 }
 
 static int uart_get_info(struct uart_state *state,
@@ -1067,30 +1083,31 @@ uart_wait_modem_status(struct uart_state *state, unsigned long arg)
  * NB: both 1->0 and 0->1 transitions are counted except for
  *     RI where only 0->1 is counted.
  */
-static int uart_get_icount(struct tty_struct *tty,
-			  struct serial_icounter_struct *icount)
+static int uart_get_count(struct uart_state *state,
+			  struct serial_icounter_struct __user *icnt)
 {
-	struct uart_state *state = tty->driver_data;
+	struct serial_icounter_struct icount;
 	struct uart_icount cnow;
 	struct uart_port *uport = state->uart_port;
 
+	memset(&icount, 0, sizeof(struct serial_icounter_struct));
 	spin_lock_irq(&uport->lock);
 	memcpy(&cnow, &uport->icount, sizeof(struct uart_icount));
 	spin_unlock_irq(&uport->lock);
 
-	icount->cts         = cnow.cts;
-	icount->dsr         = cnow.dsr;
-	icount->rng         = cnow.rng;
-	icount->dcd         = cnow.dcd;
-	icount->rx          = cnow.rx;
-	icount->tx          = cnow.tx;
-	icount->frame       = cnow.frame;
-	icount->overrun     = cnow.overrun;
-	icount->parity      = cnow.parity;
-	icount->brk         = cnow.brk;
-	icount->buf_overrun = cnow.buf_overrun;
+	icount.cts         = cnow.cts;
+	icount.dsr         = cnow.dsr;
+	icount.rng         = cnow.rng;
+	icount.dcd         = cnow.dcd;
+	icount.rx          = cnow.rx;
+	icount.tx          = cnow.tx;
+	icount.frame       = cnow.frame;
+	icount.overrun     = cnow.overrun;
+	icount.parity      = cnow.parity;
+	icount.brk         = cnow.brk;
+	icount.buf_overrun = cnow.buf_overrun;
 
-	return 0;
+	return copy_to_user(icnt, &icount, sizeof(icount)) ? -EFAULT : 0;
 }
 
 /*
@@ -1142,6 +1159,10 @@ uart_ioctl(struct tty_struct *tty, struct file *filp, unsigned int cmd,
 	switch (cmd) {
 	case TIOCMIWAIT:
 		ret = uart_wait_modem_status(state, arg);
+		break;
+
+	case TIOCGICOUNT:
+		ret = uart_get_count(state, uarg);
 		break;
 	}
 
@@ -1220,6 +1241,9 @@ static void uart_set_termios(struct tty_struct *tty,
 		if (!(cflag & CRTSCTS) ||
 		    !test_bit(TTY_THROTTLED, &tty->flags))
 			mask |= TIOCM_RTS;
+		if (!(cflag & CDTRDSR) ||
+		    !test_bit(TTY_THROTTLED, &tty->flags))
+			mask &= ~TIOCM_DTR;
 		uart_set_mctrl(state->uart_port, mask);
 	}
 
@@ -1240,6 +1264,24 @@ static void uart_set_termios(struct tty_struct *tty,
 		}
 		spin_unlock_irqrestore(&state->uart_port->lock, flags);
 	}
+
+	/* Handle turning off CDTRDSR */
+	if ((old_termios->c_cflag & CDTRDSR) && !(cflag & CDTRDSR)) {
+		spin_lock_irqsave(&state->uart_port->lock, flags);
+		tty->hw_stopped = 0;
+		__uart_start(tty);
+		spin_unlock_irqrestore(&state->uart_port->lock, flags);
+	}
+
+	if (!(old_termios->c_cflag & CDTRDSR) && (cflag & CDTRDSR)) {
+		spin_lock_irqsave(&state->uart_port->lock, flags);
+		if (!(state->uart_port->ops->get_mctrl(state->uart_port) & TIOCM_DSR)) {
+			tty->hw_stopped = 1;
+			state->uart_port->ops->stop_tx(state->uart_port);
+		}
+		spin_unlock_irqrestore(&state->uart_port->lock, flags);
+	}
+
 #if 0
 	/*
 	 * No need to wake up processes in open wait, since they
@@ -1522,7 +1564,8 @@ uart_block_til_ready(struct file *filp, struct uart_state *state)
 		 * not set RTS here - we want to make sure we catch
 		 * the data from the modem.
 		 */
-		if (port->tty->termios->c_cflag & CBAUD)
+		if (port->tty->termios->c_cflag & CBAUD &&
+		    !(port->tty->termios->c_cflag & CDTRDSR))
 			uart_set_mctrl(uport, TIOCM_DTR);
 
 		/*
@@ -1949,6 +1992,8 @@ uart_set_options(struct uart_port *port, struct console *co,
 
 	if (flow == 'r')
 		termios.c_cflag |= CRTSCTS;
+	if (flow == 'd')
+		termios.c_cflag |= CDTRDSR;
 
 	/*
 	 * some uarts on other side don't support no flow control.
@@ -2318,7 +2363,6 @@ static const struct tty_operations uart_ops = {
 #endif
 	.tiocmget	= uart_tiocmget,
 	.tiocmset	= uart_tiocmset,
-	.get_icount	= uart_get_icount,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_init	= uart_poll_init,
 	.poll_get_char	= uart_poll_get_char,

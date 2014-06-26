@@ -528,7 +528,8 @@ retry:
 	return err;
 }
 
-static int clariion_activate(struct scsi_device *sdev)
+static int clariion_activate(struct scsi_device *sdev,
+				activate_complete fn, void *data)
 {
 	struct clariion_dh_data *csdev = get_clariion_data(sdev);
 	int result;
@@ -559,7 +560,9 @@ done:
 		    csdev->port, lun_state[csdev->lun_state],
 		    csdev->default_sp + 'A');
 
-	return result;
+	if (fn)
+		fn(data, result);
+	return 0;
 }
 /*
  * params - parameters in the following format
@@ -624,6 +627,24 @@ static const struct scsi_dh_devlist clariion_dev_list[] = {
 	{NULL, NULL},
 };
 
+static bool clariion_match(struct scsi_device *sdev)
+{
+	int i;
+
+	if (scsi_device_tpgs(sdev))
+		return false;
+
+	for (i = 0; clariion_dev_list[i].vendor; i++) {
+		if (!strncmp(sdev->vendor, clariion_dev_list[i].vendor,
+			strlen(clariion_dev_list[i].vendor)) &&
+		    !strncmp(sdev->model, clariion_dev_list[i].model,
+			strlen(clariion_dev_list[i].model))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static int clariion_bus_attach(struct scsi_device *sdev);
 static void clariion_bus_detach(struct scsi_device *sdev);
 
@@ -646,7 +667,7 @@ static int clariion_bus_attach(struct scsi_device *sdev)
 	unsigned long flags;
 	int err;
 
-	scsi_dh_data = kzalloc(sizeof(struct scsi_device_handler *)
+	scsi_dh_data = kzalloc(sizeof(*scsi_dh_data)
 			       + sizeof(*h) , GFP_KERNEL);
 	if (!scsi_dh_data) {
 		sdev_printk(KERN_ERR, sdev, "%s: Attach failed\n",
@@ -710,11 +731,19 @@ static void clariion_bus_detach(struct scsi_device *sdev)
 static int __init clariion_init(void)
 {
 	int r;
+	struct scsi_device_handler_aux *scsi_dh_aux = NULL;
 
-	r = scsi_register_device_handler(&clariion_dh);
-	if (r != 0)
+	scsi_dh_aux = kzalloc(sizeof(struct scsi_device_handler_aux), GFP_KERNEL);
+	if (!scsi_dh_aux)
+		return -ENOMEM;
+	scsi_dh_aux->match = clariion_match;
+
+	r = scsi_register_device_handler(&clariion_dh, scsi_dh_aux);
+	if (r != 0) {
+		kfree(scsi_dh_aux);
 		printk(KERN_ERR "%s: Failed to register scsi device handler.",
 			CLARIION_NAME);
+	}
 	return r;
 }
 

@@ -241,16 +241,17 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 			    .iif = oif };
 
 	struct fib_result res;
-	int no_addr, rpf;
+	int no_addr, rpf, accept_local;
 	int ret;
 	struct net *net;
 
-	no_addr = rpf = 0;
+	no_addr = rpf = accept_local = 0;
 	rcu_read_lock();
 	in_dev = __in_dev_get_rcu(dev);
 	if (in_dev) {
 		no_addr = in_dev->ifa_list == NULL;
 		rpf = IN_DEV_RPFILTER(in_dev);
+		accept_local = IN_DEV_ACCEPT_LOCAL(in_dev);
 		if (mark && !IN_DEV_SRC_VMARK(in_dev))
 			fl.mark = 0;
 	}
@@ -262,8 +263,10 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 	net = dev_net(dev);
 	if (fib_lookup(net, &fl, &res))
 		goto last_resort;
-	if (res.type != RTN_UNICAST)
-		goto e_inval_res;
+	if (res.type != RTN_UNICAST) {
+		if (res.type != RTN_LOCAL || !accept_local)
+			goto e_inval_res;
+	}
 	*spec_dst = FIB_RES_PREFSRC(res);
 	fib_combine_itag(itag, &res);
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
@@ -963,6 +966,9 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 	case NETDEV_CHANGE:
 		rt_cache_flush(dev_net(dev), 0);
 		break;
+	case NETDEV_UNREGISTER_BATCH:
+		rt_cache_flush_batch();
+		break;
 	}
 	return NOTIFY_DONE;
 }
@@ -1058,9 +1064,9 @@ static struct pernet_operations fib_net_ops = {
 
 void __init ip_fib_init(void)
 {
-	rtnl_register(PF_INET, RTM_NEWROUTE, inet_rtm_newroute, NULL);
-	rtnl_register(PF_INET, RTM_DELROUTE, inet_rtm_delroute, NULL);
-	rtnl_register(PF_INET, RTM_GETROUTE, NULL, inet_dump_fib);
+	rtnl_register(PF_INET, RTM_NEWROUTE, inet_rtm_newroute, NULL, NULL);
+	rtnl_register(PF_INET, RTM_DELROUTE, inet_rtm_delroute, NULL, NULL);
+	rtnl_register(PF_INET, RTM_GETROUTE, NULL, inet_dump_fib, NULL);
 
 	register_pernet_subsys(&fib_net_ops);
 	register_netdevice_notifier(&fib_netdev_notifier);

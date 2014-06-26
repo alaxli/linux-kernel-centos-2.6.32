@@ -521,13 +521,13 @@ static int raw_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	ipc.addr = daddr;
 
 	if (!ipc.opt) {
-		struct ip_options_rcu *inet_opt;
+		struct ip_options *inet_opt;
 
 		rcu_read_lock();
-		inet_opt = rcu_dereference(inet->inet_opt);
+		inet_opt = rcu_dereference(inet->opt);
 		if (inet_opt) {
 			memcpy(&opt_copy, inet_opt,
-			       sizeof(*inet_opt) + inet_opt->opt.optlen);
+			       sizeof(*inet_opt) + inet_opt->optlen);
 			ipc.opt = &opt_copy.opt;
 		}
 		rcu_read_unlock();
@@ -540,10 +540,10 @@ static int raw_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		 */
 		if (inet->hdrincl)
 			goto done;
-		if (ipc.opt->opt.srr) {
+		if (ipc.opt->srr) {
 			if (!daddr)
 				goto done;
-			daddr = ipc.opt->opt.faddr;
+			daddr = ipc.opt->faddr;
 		}
 	}
 	tos = RT_CONN_FLAGS(sk);
@@ -608,7 +608,7 @@ back_from_confirm:
 	}
 done:
 	if (free)
-		kfree(ipc.opt);
+		kfree_ip_options(ipc.opt);
 	ip_rt_put(rt);
 
 out:
@@ -681,11 +681,8 @@ static int raw_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	if (flags & MSG_OOB)
 		goto out;
 
-	if (addr_len)
-		*addr_len = sizeof(*sin);
-
 	if (flags & MSG_ERRQUEUE) {
-		err = ip_recv_error(sk, msg, len);
+		err = ip_recv_error(sk, msg, len, addr_len);
 		goto out;
 	}
 
@@ -703,7 +700,7 @@ static int raw_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	if (err)
 		goto done;
 
-	sock_recv_timestamp(msg, sk, skb);
+	sock_recv_ts_and_drops(msg, sk, skb);
 
 	/* Copy the address. */
 	if (sin) {
@@ -711,6 +708,7 @@ static int raw_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		sin->sin_addr.s_addr = ip_hdr(skb)->saddr;
 		sin->sin_port = 0;
 		memset(&sin->sin_zero, 0, sizeof(sin->sin_zero));
+		*addr_len = sizeof(*sin);
 	}
 	if (inet->cmsg_flags)
 		ip_cmsg_recv(msg, skb);

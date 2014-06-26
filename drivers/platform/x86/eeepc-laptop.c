@@ -137,7 +137,6 @@ struct eeepc_hotk {
 	u32 cm_supported;		/* the control methods supported
 					   by this BIOS */
 	bool cpufv_disabled;
-	bool hotplug_disabled;
 	uint init_flag;			/* Init flags */
 	u16 event_count[128];		/* count for each event */
 	struct input_dev *inputdev;
@@ -253,14 +252,6 @@ static struct backlight_ops eeepcbl_ops = {
 MODULE_AUTHOR("Corentin Chary, Eric Cooper");
 MODULE_DESCRIPTION(EEEPC_HOTK_NAME);
 MODULE_LICENSE("GPL");
-
-static bool hotplug_disabled;
-
-module_param(hotplug_disabled, bool, 0644);
-MODULE_PARM_DESC(hotplug_disabled,
-		 "Disable hotplug for wireless device. "
-		 "If your laptop need that, please report to "
-		 "acpi4asus-user@lists.sourceforge.net.");
 
 /*
  * ACPI Helpers
@@ -623,10 +614,6 @@ static void eeepc_dmi_check(void)
 {
 	const char *model;
 
-	model = dmi_get_system_info(DMI_PRODUCT_NAME);
-	if (!model)
-		return;
-
 	/*
 	 * Blacklist for setting cpufv (cpu speed).
 	 *
@@ -646,24 +633,16 @@ static void eeepc_dmi_check(void)
 	 * substring matching.  We don't want to affect the "701SD"
 	 * and "701SDX" models, because they do support S.H.E.
 	 */
+
+	model = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (!model)
+		return;
+
 	if (strcmp(model, "701") == 0 || strcmp(model, "702") == 0) {
 		ehotk->cpufv_disabled = true;
 		pr_info("model %s does not officially support setting cpu "
 			"speed\n", model);
 		pr_info("cpufv disabled to avoid instability\n");
-	}
-
-	/*
-	 * Blacklist for wlan hotplug
-	 *
-	 * Eeepc 1005HA doesn't work like others models and don't need the
-	 * hotplug code. In fact, current hotplug code seems to unplug another
-	 * device...
-	 */
-	if (strcmp(model, "1005HA") == 0 || strcmp(model, "1201N") == 0 ||
-	    strcmp(model, "1005PE") == 0) {
-		ehotk->hotplug_disabled = true;
-		pr_info("wlan hotplug disabled\n");
 	}
 }
 
@@ -752,8 +731,6 @@ static void eeepc_rfkill_hotplug(void)
 	struct pci_dev *dev;
 	struct pci_bus *bus;
 	bool blocked = eeepc_wlan_rfkill_blocked();
-	bool absent;
-	u32 l;
 
 	if (ehotk->wlan_rfkill)
 		rfkill_set_sw_state(ehotk->wlan_rfkill, blocked);
@@ -764,22 +741,6 @@ static void eeepc_rfkill_hotplug(void)
 		bus = pci_find_bus(0, 1);
 		if (!bus) {
 			pr_warning("Unable to find PCI bus 1?\n");
-			goto out_unlock;
-		}
-
-		if (pci_bus_read_config_dword(bus, 0, PCI_VENDOR_ID, &l)) {
-			pr_err("Unable to read PCI config space?\n");
-			goto out_unlock;
-		}
-		absent = (l == 0xffffffff);
-
-		if (blocked != absent) {
-			pr_warning("BIOS says wireless lan is %s, "
-					"but the pci device is %s\n",
-				blocked ? "blocked" : "unblocked",
-				absent ? "absent" : "present");
-			pr_warning("skipped wireless hotplug as probably "
-					"inappropriate for this model\n");
 			goto out_unlock;
 		}
 
@@ -1216,9 +1177,6 @@ static int eeepc_rfkill_init(struct device *dev)
 	if (result && result != -ENODEV)
 		goto exit;
 
-	if (ehotk->hotplug_disabled)
-		return 0;
-
 	result = eeepc_setup_pci_hotplug();
 	/*
 	 * If we get -EBUSY then something else is handling the PCI hotplug -
@@ -1331,8 +1289,6 @@ static int __devinit eeepc_hotk_add(struct acpi_device *device)
 	strcpy(acpi_device_class(device), EEEPC_HOTK_CLASS);
 	device->driver_data = ehotk;
 	ehotk->device = device;
-
-	ehotk->hotplug_disabled = hotplug_disabled;
 
 	eeepc_dmi_check();
 

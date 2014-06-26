@@ -304,17 +304,20 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 	ireq->wscale_ok		= tcp_opt.wscale_ok;
 	ireq->tstamp_ok		= tcp_opt.saw_tstamp;
 	req->ts_recent		= tcp_opt.saw_tstamp ? tcp_opt.rcv_tsval : 0;
+	treq->snt_synack	= tcp_opt.saw_tstamp ? tcp_opt.rcv_tsecr : 0;
 
 	/* We throwed the options of the initial SYN away, so we hope
 	 * the ACK carries the same options again (see RFC1122 4.2.3.8)
 	 */
 	if (opt && opt->optlen) {
-		int opt_size = sizeof(struct ip_options_rcu) + opt->optlen;
-
-		ireq->opt = kmalloc(opt_size, GFP_ATOMIC);
-		if (ireq->opt != NULL && ip_options_echo(&ireq->opt->opt, skb)) {
-			kfree(ireq->opt);
-			ireq->opt = NULL;
+		ireq->opt = kmalloc_ip_options(opt->optlen, GFP_ATOMIC);
+		if (ireq->opt != NULL) {
+			if (ip_options_echo(ireq->opt, skb)) {
+				kfree_ip_options(ireq->opt);
+				ireq->opt = NULL;
+			} else {
+				rhel_ip_options_set_alloc_flag(ireq->opt);
+			}
 		}
 	}
 
@@ -356,7 +359,8 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb,
 
 	tcp_select_initial_window(tcp_full_space(sk), req->mss,
 				  &req->rcv_wnd, &req->window_clamp,
-				  ireq->wscale_ok, &rcv_wscale);
+				  ireq->wscale_ok, &rcv_wscale,
+				  dst_metric(&rt->u.dst, RTAX_INITRWND));
 
 	ireq->rcv_wscale  = rcv_wscale;
 

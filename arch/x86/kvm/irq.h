@@ -45,7 +45,6 @@ struct kvm_kpic_state {
 	u8 irr;		/* interrupt request register */
 	u8 imr;		/* interrupt mask register */
 	u8 isr;		/* interrupt service register */
-	u8 isr_ack;	/* interrupt ack detection */
 	u8 priority_add;	/* highest irq priority */
 	u8 irq_base;
 	u8 read_reg_select;
@@ -58,11 +57,13 @@ struct kvm_kpic_state {
 	u8 init4;		/* true if 4 byte init */
 	u8 elcr;		/* PIIX edge/trigger selection */
 	u8 elcr_mask;
+	u8 isr_ack;	/* interrupt ack detection */
 	struct kvm_pic *pics_state;
 };
 
 struct kvm_pic {
 	spinlock_t lock;
+	bool wakeup_needed;
 	unsigned pending_acks;
 	struct kvm *kvm;
 	struct kvm_kpic_state pics[2]; /* 0 is master pic, 1 is slave pic */
@@ -71,6 +72,7 @@ struct kvm_pic {
 	int output;		/* intr from master PIC */
 	struct kvm_io_device dev;
 	void (*ack_notifier)(void *opaque, int irq);
+	unsigned long irq_states[16];
 };
 
 struct kvm_pic *kvm_create_pic(struct kvm *kvm);

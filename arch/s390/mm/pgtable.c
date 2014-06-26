@@ -51,17 +51,6 @@ void clear_table_pgstes(unsigned long *table)
 
 #endif
 
-unsigned long VMALLOC_START = VMALLOC_END - VMALLOC_SIZE;
-EXPORT_SYMBOL(VMALLOC_START);
-
-static int __init parse_vmalloc(char *arg)
-{
-	if (!arg)
-		return -EINVAL;
-	VMALLOC_START = (VMALLOC_END - memparse(arg, &arg)) & PAGE_MASK;
-	return 0;
-}
-early_param("vmalloc", parse_vmalloc);
 
 unsigned long *crst_table_alloc(struct mm_struct *mm, int noexec)
 {
@@ -98,12 +87,23 @@ void crst_table_free(struct mm_struct *mm, unsigned long *table)
 }
 
 #ifdef CONFIG_64BIT
+static void __crst_table_upgrade(void *arg)
+{
+	struct mm_struct *mm = arg;
+
+	if (current->active_mm == mm)
+		update_mm(mm, current);
+	__tlb_flush_local();
+}
+
 int crst_table_upgrade(struct mm_struct *mm, unsigned long limit)
 {
 	unsigned long *table, *pgd;
 	unsigned long entry;
+	int flush;
 
 	BUG_ON(limit > (1UL << 53));
+	flush = 0;
 repeat:
 	table = crst_table_alloc(mm, mm->context.noexec);
 	if (!table)
@@ -129,13 +129,15 @@ repeat:
 		mm->pgd = (pgd_t *) table;
 		mm->task_size = mm->context.asce_limit;
 		table = NULL;
+		flush = 1;
 	}
 	spin_unlock(&mm->page_table_lock);
 	if (table)
 		crst_table_free(mm, table);
 	if (mm->context.asce_limit < limit)
 		goto repeat;
-	update_mm(mm, current);
+	if (flush)
+		on_each_cpu(__crst_table_upgrade, mm, 0);
 	return 0;
 }
 
@@ -143,9 +145,8 @@ void crst_table_downgrade(struct mm_struct *mm, unsigned long limit)
 {
 	pgd_t *pgd;
 
-	if (mm->context.asce_limit <= limit)
-		return;
-	__tlb_flush_mm(mm);
+	if (current->active_mm == mm)
+		__tlb_flush_mm(mm);
 	while (mm->context.asce_limit > limit) {
 		pgd = mm->pgd;
 		switch (pgd_val(*pgd) & _REGION_ENTRY_TYPE_MASK) {
@@ -168,7 +169,8 @@ void crst_table_downgrade(struct mm_struct *mm, unsigned long limit)
 		mm->task_size = mm->context.asce_limit;
 		crst_table_free(mm, (unsigned long *) pgd);
 	}
-	update_mm(mm, current);
+	if (current->active_mm == mm)
+		update_mm(mm, current);
 }
 #endif
 
@@ -269,7 +271,7 @@ int s390_enable_sie(void)
 	struct mm_struct *mm, *old_mm;
 
 	/* Do we have switched amode? If no, we cannot do sie */
-	if (!switch_amode)
+	if (user_mode == HOME_SPACE_MODE)
 		return -EINVAL;
 
 	/* Do we have pgstes? if yes, we are done */

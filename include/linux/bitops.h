@@ -16,16 +16,24 @@
  */
 #include <asm/bitops.h>
 
-#define for_each_bit(bit, addr, size) \
-	for ((bit) = find_first_bit((addr), (size)); \
-	     (bit) < (size); \
+#define for_each_set_bit(bit, addr, size) \
+	for ((bit) = find_first_bit((addr), (size));		\
+	     (bit) < (size);					\
 	     (bit) = find_next_bit((addr), (size), (bit) + 1))
 
+/* same as for_each_set_bit() but use bit as value to start with */
+#define for_each_set_bit_cont(bit, addr, size) \
+	for ((bit) = find_next_bit((addr), (size), (bit));	\
+	     (bit) < (size);					\
+	     (bit) = find_next_bit((addr), (size), (bit) + 1))
+
+/* Temporary */
+#define for_each_bit(bit, addr, size) for_each_set_bit(bit, addr, size)
 
 static __inline__ int get_bitmask_order(unsigned int count)
 {
 	int order;
-	
+
 	order = fls(count);
 	return order;	/* We could be slightly more clever with -1 here... */
 }
@@ -33,7 +41,7 @@ static __inline__ int get_bitmask_order(unsigned int count)
 static __inline__ int get_count_order(unsigned int count)
 {
 	int order;
-	
+
 	order = fls(count) - 1;
 	if (count & (count - 1))
 		order++;
@@ -45,25 +53,30 @@ static inline unsigned long hweight_long(unsigned long w)
 	return sizeof(w) == 4 ? hweight32(w) : hweight64(w);
 }
 
-/**
- * rol64 - rotate a 64-bit value left
- * @word: value to rotate
- * @shift: bits to roll
+/*
+ * Clearly slow versions of the hweightN() functions, their benefit is
+ * of course compile time evaluation of constant arguments.
  */
-static inline __u64 rol64(__u64 word, unsigned int shift)
-{
-	return (word << shift) | (word >> (64 - shift));
-}
+#define HWEIGHT8(w)					\
+      (	BUILD_BUG_ON_ZERO(!__builtin_constant_p(w)) +	\
+	(!!((w) & (1ULL << 0))) +			\
+	(!!((w) & (1ULL << 1))) +			\
+	(!!((w) & (1ULL << 2))) +			\
+	(!!((w) & (1ULL << 3))) +			\
+	(!!((w) & (1ULL << 4))) +			\
+	(!!((w) & (1ULL << 5))) +			\
+	(!!((w) & (1ULL << 6))) +			\
+	(!!((w) & (1ULL << 7)))	)
 
-/**
- * ror64 - rotate a 64-bit value right
- * @word: value to rotate
- * @shift: bits to roll
+#define HWEIGHT16(w) (HWEIGHT8(w)  + HWEIGHT8((w) >> 8))
+#define HWEIGHT32(w) (HWEIGHT16(w) + HWEIGHT16((w) >> 16))
+#define HWEIGHT64(w) (HWEIGHT32(w) + HWEIGHT32((w) >> 32))
+
+/*
+ * Type invariant version that simply casts things to the
+ * largest type.
  */
-static inline __u64 ror64(__u64 word, unsigned int shift)
-{
-	return (word >> shift) | (word << (64 - shift));
-}
+#define HWEIGHT(w)   HWEIGHT64((u64)(w))
 
 /**
  * rol32 - rotate a 32-bit value left
@@ -123,6 +136,17 @@ static inline __u8 rol8(__u8 word, unsigned int shift)
 static inline __u8 ror8(__u8 word, unsigned int shift)
 {
 	return (word >> shift) | (word << (8 - shift));
+}
+
+/**
+ * sign_extend32 - sign extend a 32-bit value using specified bit as sign-bit
+ * @value: value to sign extend
+ * @index: 0 based bit index (0<=index<32) to sign bit
+ */
+static inline __s32 sign_extend32(__u32 value, int index)
+{
+	__u8 shift = 31 - index;
+	return (__s32)(value << shift) >> shift;
 }
 
 static inline unsigned fls_long(unsigned long l)

@@ -84,10 +84,6 @@ static short mmcr1_adder_bits[8] = {
 };
 
 /*
- * Bits in MMCRA
- */
-
-/*
  * Layout of constraint bits:
  * 6666555555555544444444443333333333222222222211111111110000000000
  * 3210987654321098765432109876543210987654321098765432109876543210
@@ -486,6 +482,7 @@ static struct power_pmu ppc970_pmu = {
 	.n_generic		= ARRAY_SIZE(ppc970_generic_events),
 	.generic_events		= ppc970_generic_events,
 	.cache_events		= &ppc970_cache_events,
+	.flags			= PPMU_NO_SIPR | PPMU_NO_CONT_SAMPLING,
 };
 
 static int init_ppc970_pmu(void)
@@ -498,4 +495,4 @@ static int init_ppc970_pmu(void)
 	return register_power_pmu(&ppc970_pmu);
 }
 
-arch_initcall(init_ppc970_pmu);
+early_initcall(init_ppc970_pmu);

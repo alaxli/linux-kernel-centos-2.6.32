@@ -31,6 +31,10 @@ int inet6_csk_bind_conflict(const struct sock *sk,
 {
 	const struct sock *sk2;
 	const struct hlist_node *node;
+	int relax = test_bit(SOCK_RELAX, &sk->sk_flags);
+	int reuse = sk->sk_reuse;
+	int reuseport = sk->sk_reuseport;
+	int uid = sock_i_uid((struct sock *)sk);
 
 	/* We must walk the whole port owner list in this case. -DaveM */
 	/*
@@ -41,11 +45,20 @@ int inet6_csk_bind_conflict(const struct sock *sk,
 		if (sk != sk2 &&
 		    (!sk->sk_bound_dev_if ||
 		     !sk2->sk_bound_dev_if ||
-		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if) &&
-		    (!sk->sk_reuse || !sk2->sk_reuse ||
-		     sk2->sk_state == TCP_LISTEN) &&
-		     ipv6_rcv_saddr_equal(sk, sk2))
-			break;
+		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) {
+			if ((!reuse || !sk2->sk_reuse ||
+			     sk2->sk_state == TCP_LISTEN) &&
+			    (!reuseport || !sk2->sk_reuseport ||
+			     (sk2->sk_state != TCP_TIME_WAIT &&
+			      uid != sock_i_uid((struct sock *)sk2)))) {
+				if (ipv6_rcv_saddr_equal(sk, sk2))
+					break;
+			}
+			if (!relax && reuse && sk2->sk_reuse &&
+			    sk2->sk_state != TCP_LISTEN &&
+			    ipv6_rcv_saddr_equal(sk, sk2))
+				break;
+		}
 	}
 
 	return node != NULL;
@@ -57,20 +70,18 @@ EXPORT_SYMBOL_GPL(inet6_csk_bind_conflict);
  * request_sock (formerly open request) hash tables.
  */
 static u32 inet6_synq_hash(const struct in6_addr *raddr, const __be16 rport,
-			   const u32 rnd, const u16 synq_hsize)
+			   const u32 rnd, const u32 synq_hsize)
 {
-	u32 a = (__force u32)raddr->s6_addr32[0];
-	u32 b = (__force u32)raddr->s6_addr32[1];
-	u32 c = (__force u32)raddr->s6_addr32[2];
+	u32 c;
 
-	a += JHASH_GOLDEN_RATIO;
-	b += JHASH_GOLDEN_RATIO;
-	c += rnd;
-	__jhash_mix(a, b, c);
+	c = jhash_3words((__force u32)raddr->s6_addr32[0],
+			 (__force u32)raddr->s6_addr32[1],
+			 (__force u32)raddr->s6_addr32[2],
+			 rnd);
 
-	a += (__force u32)raddr->s6_addr32[3];
-	b += (__force u32)rport;
-	__jhash_mix(a, b, c);
+	c = jhash_2words((__force u32)raddr->s6_addr32[3],
+			 (__force u32)rport,
+			 c);
 
 	return c & (synq_hsize - 1);
 }

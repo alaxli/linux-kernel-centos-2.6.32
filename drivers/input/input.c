@@ -12,7 +12,7 @@
 
 #include <linux/init.h>
 #include <linux/types.h>
-#include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/module.h>
 #include <linux/random.h>
 #include <linux/major.h>
@@ -24,31 +24,12 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/smp_lock.h>
-#include "input-compat.h"
 
 MODULE_AUTHOR("Vojtech Pavlik <vojtech@suse.cz>");
 MODULE_DESCRIPTION("Input core");
 MODULE_LICENSE("GPL");
 
 #define INPUT_DEVICES	256
-
-/*
- * EV_ABS events which should not be cached are listed here.
- */
-static unsigned int input_abs_bypass_init_data[] __initdata = {
-	ABS_MT_TOUCH_MAJOR,
-	ABS_MT_TOUCH_MINOR,
-	ABS_MT_WIDTH_MAJOR,
-	ABS_MT_WIDTH_MINOR,
-	ABS_MT_ORIENTATION,
-	ABS_MT_POSITION_X,
-	ABS_MT_POSITION_Y,
-	ABS_MT_TOOL_TYPE,
-	ABS_MT_BLOB_ID,
-	ABS_MT_TRACKING_ID,
-	0
-};
-static unsigned long input_abs_bypass[BITS_TO_LONGS(ABS_CNT)];
 
 static LIST_HEAD(input_dev_list);
 static LIST_HEAD(input_handler_list);
@@ -163,6 +144,56 @@ static void input_stop_autorepeat(struct input_dev *dev)
 #define INPUT_PASS_TO_DEVICE	2
 #define INPUT_PASS_TO_ALL	(INPUT_PASS_TO_HANDLERS | INPUT_PASS_TO_DEVICE)
 
+static int input_handle_abs_event(struct input_dev *dev,
+				  unsigned int code, int *pval)
+{
+	bool is_mt_event;
+	int *pold;
+
+	if (code == ABS_MT_SLOT) {
+		/*
+		 * "Stage" the event; we'll flush it later, when we
+		 * get actiual touch data.
+		 */
+		if (*pval >= 0 && *pval < dev->mtsize)
+			dev->slot = *pval;
+
+		return INPUT_IGNORE_EVENT;
+	}
+
+	is_mt_event = code >= ABS_MT_FIRST && code <= ABS_MT_LAST;
+
+	if (!is_mt_event) {
+		pold = &dev->abs[code];
+	} else if (dev->mt) {
+		struct input_mt_slot *mtslot = &dev->mt[dev->slot];
+		pold = &mtslot->abs[code - ABS_MT_FIRST];
+	} else {
+		/*
+		 * Bypass filtering for multitouch events when
+		 * not employing slots.
+		 */
+		pold = NULL;
+	}
+
+	if (pold) {
+		*pval = input_defuzz_abs_event(*pval, *pold,
+						dev->absfuzz[code]);
+		if (*pold == *pval)
+			return INPUT_IGNORE_EVENT;
+
+		*pold = *pval;
+	}
+
+	/* Flush pending "slot" event */
+	if (is_mt_event && dev->slot != dev->abs[ABS_MT_SLOT]) {
+		dev->abs[ABS_MT_SLOT] = dev->slot;
+		input_pass_event(dev, EV_ABS, ABS_MT_SLOT, dev->slot);
+	}
+
+	return INPUT_PASS_TO_HANDLERS;
+}
+
 static void input_handle_event(struct input_dev *dev,
 			       unsigned int type, unsigned int code, int value)
 {
@@ -215,21 +246,9 @@ static void input_handle_event(struct input_dev *dev,
 		break;
 
 	case EV_ABS:
-		if (is_event_supported(code, dev->absbit, ABS_MAX)) {
+		if (is_event_supported(code, dev->absbit, ABS_MAX))
+			disposition = input_handle_abs_event(dev, code, &value);
 
-			if (test_bit(code, input_abs_bypass)) {
-				disposition = INPUT_PASS_TO_HANDLERS;
-				break;
-			}
-
-			value = input_defuzz_abs_event(value,
-					dev->abs[code], dev->absfuzz[code]);
-
-			if (dev->abs[code] != value) {
-				dev->abs[code] = value;
-				disposition = INPUT_PASS_TO_HANDLERS;
-			}
-		}
 		break;
 
 	case EV_REL:
@@ -759,40 +778,6 @@ static int input_attach_handler(struct input_dev *dev, struct input_handler *han
 	return error;
 }
 
-#ifdef CONFIG_COMPAT
-
-static int input_bits_to_string(char *buf, int buf_size,
-				unsigned long bits, bool skip_empty)
-{
-	int len = 0;
-
-	if (INPUT_COMPAT_TEST) {
-		u32 dword = bits >> 32;
-		if (dword || !skip_empty)
-			len += snprintf(buf, buf_size, "%x ", dword);
-
-		dword = bits & 0xffffffffUL;
-		if (dword || !skip_empty || len)
-			len += snprintf(buf + len, max(buf_size - len, 0),
-					"%x", dword);
-	} else {
-		if (bits || !skip_empty)
-			len += snprintf(buf, buf_size, "%lx", bits);
-	}
-
-	return len;
-}
-
-#else /* !CONFIG_COMPAT */
-
-static int input_bits_to_string(char *buf, int buf_size,
-				unsigned long bits, bool skip_empty)
-{
-	return bits || !skip_empty ?
-		snprintf(buf, buf_size, "%lx", bits) : 0;
-}
-
-#endif
 
 #ifdef CONFIG_PROC_FS
 
@@ -861,25 +846,14 @@ static void input_seq_print_bitmap(struct seq_file *seq, const char *name,
 				   unsigned long *bitmap, int max)
 {
 	int i;
-	bool skip_empty = true;
-	char buf[18];
+
+	for (i = BITS_TO_LONGS(max) - 1; i > 0; i--)
+		if (bitmap[i])
+			break;
 
 	seq_printf(seq, "B: %s=", name);
-
-	for (i = BITS_TO_LONGS(max) - 1; i >= 0; i--) {
-		if (input_bits_to_string(buf, sizeof(buf),
-					 bitmap[i], skip_empty)) {
-			skip_empty = false;
-			seq_printf(seq, "%s%s", buf, i > 0 ? " " : "");
-		}
-	}
-
-	/*
-	 * If no output was produced print a single 0.
-	 */
-	if (skip_empty)
-		seq_puts(seq, "0");
-
+	for (; i >= 0; i--)
+		seq_printf(seq, "%lx%s", bitmap[i], i > 0 ? " " : "");
 	seq_putc(seq, '\n');
 }
 
@@ -1168,23 +1142,14 @@ static int input_print_bitmap(char *buf, int buf_size, unsigned long *bitmap,
 {
 	int i;
 	int len = 0;
-	bool skip_empty = true;
 
-	for (i = BITS_TO_LONGS(max) - 1; i >= 0; i--) {
-		len += input_bits_to_string(buf + len, max(buf_size - len, 0),
-					    bitmap[i], skip_empty);
-		if (len) {
-			skip_empty = false;
-			if (i > 0)
-				len += snprintf(buf + len, max(buf_size - len, 0), " ");
-		}
-	}
+	for (i = BITS_TO_LONGS(max) - 1; i > 0; i--)
+		if (bitmap[i])
+			break;
 
-	/*
-	 * If no output was produced print a single 0.
-	 */
-	if (len == 0)
-		len = snprintf(buf, buf_size, "%d", 0);
+	for (; i >= 0; i--)
+		len += snprintf(buf + len, max(buf_size - len, 0),
+				"%lx%s", bitmap[i], i > 0 ? " " : "");
 
 	if (add_cr)
 		len += snprintf(buf + len, max(buf_size - len, 0), "\n");
@@ -1199,8 +1164,7 @@ static ssize_t input_dev_show_cap_##bm(struct device *dev,		\
 {									\
 	struct input_dev *input_dev = to_input_dev(dev);		\
 	int len = input_print_bitmap(buf, PAGE_SIZE,			\
-				     input_dev->bm##bit, ev##_MAX,	\
-				     true);				\
+				     input_dev->bm##bit, ev##_MAX, 1);	\
 	return min_t(int, len, PAGE_SIZE);				\
 }									\
 static DEVICE_ATTR(bm, S_IRUGO, input_dev_show_cap_##bm, NULL)
@@ -1245,6 +1209,7 @@ static void input_dev_release(struct device *device)
 	struct input_dev *dev = to_input_dev(device);
 
 	input_ff_destroy(dev);
+	input_mt_destroy_slots(dev);
 	kfree(dev);
 
 	module_put(THIS_MODULE);
@@ -1264,7 +1229,7 @@ static int input_add_uevent_bm_var(struct kobj_uevent_env *env,
 
 	len = input_print_bitmap(&env->buf[env->buflen - 1],
 				 sizeof(env->buf) - env->buflen,
-				 bitmap, max, false);
+				 bitmap, max, 0);
 	if (len >= (sizeof(env->buf) - env->buflen))
 		return -ENOMEM;
 
@@ -1824,19 +1789,9 @@ static const struct file_operations input_fops = {
 	.open = input_open_file,
 };
 
-static void __init input_init_abs_bypass(void)
-{
-	const unsigned int *p;
-
-	for (p = input_abs_bypass_init_data; *p; p++)
-		input_abs_bypass[BIT_WORD(*p)] |= BIT_MASK(*p);
-}
-
 static int __init input_init(void)
 {
 	int err;
-
-	input_init_abs_bypass();
 
 	err = class_register(&input_class);
 	if (err) {

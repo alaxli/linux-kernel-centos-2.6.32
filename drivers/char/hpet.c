@@ -349,11 +349,16 @@ static unsigned int hpet_poll(struct file *file, poll_table * wait)
 	return 0;
 }
 
+static int hpet_mmap_enable = 0; /* disabled by default */
+
 static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
 {
 #ifdef	CONFIG_HPET_MMAP
 	struct hpet_dev *devp;
 	unsigned long addr;
+
+	if (!hpet_mmap_enable)
+		return -ENOSYS;
 
 	if (((vma->vm_end - vma->vm_start) != PAGE_SIZE) || vma->vm_pgoff)
 		return -EINVAL;
@@ -379,6 +384,21 @@ static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
 	return -ENOSYS;
 #endif
 }
+
+/*
+ * RHEL only -- Mapping the HPET registers into application space is not
+ * a problem, however, it is possible on some systems that other information
+ * is in the page that gets mapped.  To avoid any possible security issues,
+ * make this HPET_MMAP user configurable as a kernel parameter and keep it
+ * off by default.
+ */
+static int __init hpet_mmap_enabled(char *str)
+{
+	hpet_mmap_enable = 1;
+	printk(KERN_INFO "Enabling HPET userspace mmap capability\n");
+	return 1;
+}
+__setup("hpet_mmap", hpet_mmap_enabled);
 
 static int hpet_fasync(int fd, struct file *file, int on)
 {
@@ -475,21 +495,6 @@ static int hpet_ioctl_ieon(struct hpet_dev *devp)
 
 	if (irq) {
 		unsigned long irq_flags;
-
-		if (devp->hd_flags & HPET_SHARED_IRQ) {
-			/*
-			 * To prevent the interrupt handler from seeing an
-			 * unwanted interrupt status bit, program the timer
-			 * so that it will not fire in the near future ...
-			 */
-			writel(readl(&timer->hpet_config) & ~Tn_TYPE_CNF_MASK,
-			       &timer->hpet_config);
-			write_counter(read_counter(&hpet->hpet_mc),
-				      &timer->hpet_compare);
-			/* ... and clear any left-over status. */
-			isr = 1 << (devp - devp->hd_hpets->hp_dev);
-			writel(isr, &hpet->hpet_isr);
-		}
 
 		sprintf(devp->hd_name, "hpet%d", (int)(devp - hpetp->hp_dev));
 		irq_flags = devp->hd_flags & HPET_SHARED_IRQ
@@ -985,8 +990,6 @@ static int hpet_acpi_add(struct acpi_device *device)
 		return -ENODEV;
 
 	if (!data.hd_address || !data.hd_nirqs) {
-		if (data.hd_address)
-			iounmap(data.hd_address);
 		printk("%s: no address or irqs in _CRS\n", __func__);
 		return -ENODEV;
 	}

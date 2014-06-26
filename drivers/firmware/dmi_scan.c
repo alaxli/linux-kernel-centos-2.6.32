@@ -2,11 +2,11 @@
 #include <linux/string.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/ctype.h>
 #include <linux/dmi.h>
 #include <linux/efi.h>
 #include <linux/bootmem.h>
 #include <linux/slab.h>
-#include <linux/random.h>
 #include <asm/dmi.h>
 
 /*
@@ -16,6 +16,7 @@
  */
 static char dmi_empty_string[] = "        ";
 
+static u16 __initdata dmi_ver;
 /*
  * Catch too early calls to dmi_check_system():
  */
@@ -112,8 +113,6 @@ static int __init dmi_walk_early(void (*decode)(const struct dmi_header *,
 
 	dmi_table(buf, dmi_len, dmi_num, decode, NULL);
 
-	add_device_randomness(buf, dmi_len);
-
 	dmi_iounmap(buf, dmi_len);
 	return 0;
 }
@@ -151,6 +150,23 @@ static void __init dmi_save_ident(const struct dmi_header *dm, int slot, int str
 	dmi_ident[slot] = p;
 }
 
+/*
+ * As of version 2.6 of the SMBIOS specification, the first 3 fields of
+ * the UUID are supposed to be little-endian encoded.  The specification
+ * says that this is the defacto standard.
+ *
+ * RHEL6, however, has API restrictions on /proc.  This means that users
+ * will have to select a kernel parameter option to get the 2.6 UUID decoding
+ * to avoid userspace breakage.
+ */
+static int smbios_26_uuid;
+static int __init setup_smbios_26_uuid(char *str)
+{
+	smbios_26_uuid = 1;
+	return 1;
+}
+__setup("smbios_26_uuid", setup_smbios_26_uuid);
+
 static void __init dmi_save_uuid(const struct dmi_header *dm, int slot, int index)
 {
 	const u8 *d = (u8*) dm + index;
@@ -161,8 +177,10 @@ static void __init dmi_save_uuid(const struct dmi_header *dm, int slot, int inde
 		return;
 
 	for (i = 0; i < 16 && (is_ff || is_00); i++) {
-		if(d[i] != 0x00) is_ff = 0;
-		if(d[i] != 0xFF) is_00 = 0;
+		if (d[i] != 0x00)
+			is_00 = 0;
+		if (d[i] != 0xFF)
+			is_ff = 0;
 	}
 
 	if (is_ff || is_00)
@@ -172,10 +190,15 @@ static void __init dmi_save_uuid(const struct dmi_header *dm, int slot, int inde
 	if (!s)
 		return;
 
-	sprintf(s,
-		"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-		d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-		d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+	/*
+	 * As of version 2.6 of the SMBIOS specification, the first 3 fields of
+	 * the UUID are supposed to be little-endian encoded.  The specification
+	 * says that this is the defacto standard.
+	 */
+	if (smbios_26_uuid && dmi_ver >= 0x0206)
+		sprintf(s, "%pUL", d);
+	else
+		sprintf(s, "%pUB", d);
 
         dmi_ident[slot] = s;
 }
@@ -194,6 +217,66 @@ static void __init dmi_save_type(const struct dmi_header *dm, int slot, int inde
 
 	sprintf(s, "%u", *d & 0x7F);
 	dmi_ident[slot] = s;
+}
+
+static void __init dmi_save_smbios_ver(int slot)
+{
+	u8 *buf = NULL;
+	int fp, smbios_present = 0;
+	unsigned long smbios_addr;
+	char *s = NULL;
+
+	if (dmi_ident[slot])
+		return;
+
+	/*
+	 * The SMBIOS version is not in the DMI region.  We're just
+	 * abusing the DMI code for now.
+	 */
+
+	if (efi_enabled) {
+		if (efi.smbios == EFI_INVALID_TABLE_ADDR)
+			goto error;
+		smbios_addr = efi.smbios;
+	} else {
+		/* "Legacy" SMBIOS is mapped @ 0xF0000 */
+		smbios_addr = 0xF0000;
+	}
+	buf = early_ioremap(smbios_addr, 0x10000);
+	if (!buf)
+		goto error;
+
+	/* Find the entry point */
+	for (fp = 0; fp <= 0xFFF0; fp += 0x10)
+		if (!memcmp(buf + fp, "_SM_", 4)) {
+			printk("SMBIOS version %u.%u @ 0x%lX\n",
+			       buf[fp + 0x6], buf[fp + 0x7], smbios_addr + fp);
+			smbios_present = 1;
+			break;
+		}
+
+	if (!smbios_present) {
+		early_iounmap(buf, 0x10000);
+		goto error;
+	}
+
+	/* Continue DMI abuse ... */
+	s = dmi_alloc(8);
+	if (!s) {
+		early_iounmap(buf, 0x10000);
+		printk("dmi_alloc failure.\n");
+		return;
+	}
+	sprintf(s, "%u.%u", buf[fp + 0x6], buf[fp + 0x7]);
+	dmi_ident[slot] = s;
+
+	early_iounmap(buf, 0x10000);
+	return;
+
+error:
+	printk("SMBIOS not found.\n");
+
+	return;
 }
 
 static void __init dmi_save_one_device(int type, const char *name)
@@ -284,6 +367,29 @@ static void __init dmi_save_ipmi_device(const struct dmi_header *dm)
 	list_add_tail(&dev->list, &dmi_devices);
 }
 
+static void __init dmi_save_dev_onboard(int instance, int segment, int bus,
+					int devfn, const char *name)
+{
+	struct dmi_dev_onboard *onboard_dev;
+
+	onboard_dev = dmi_alloc(sizeof(*onboard_dev) + strlen(name) + 1);
+	if (!onboard_dev) {
+		printk(KERN_ERR "dmi_save_dev_onboard: out of memory.\n");
+		return;
+	}
+	onboard_dev->instance = instance;
+	onboard_dev->segment = segment;
+	onboard_dev->bus = bus;
+	onboard_dev->devfn = devfn;
+
+	strcpy((char *)&onboard_dev[1], name);
+	onboard_dev->dev.type = DMI_DEV_TYPE_DEV_ONBOARD;
+	onboard_dev->dev.name = (char *)&onboard_dev[1];
+	onboard_dev->dev.device_data = onboard_dev;
+
+	list_add(&onboard_dev->dev.list, &dmi_devices);
+}
+
 static void __init dmi_save_extended_devices(const struct dmi_header *dm)
 {
 	const u8 *d = (u8*) dm + 5;
@@ -292,6 +398,8 @@ static void __init dmi_save_extended_devices(const struct dmi_header *dm)
 	if ((*d & 0x80) == 0)
 		return;
 
+	dmi_save_dev_onboard(*(d+1), *(u16 *)(d+2), *(d+4), *(d+5),
+			     dmi_string_nosave(dm, *(d-1)));
 	dmi_save_one_device(*d & 0x7f, dmi_string_nosave(dm, *(d - 1)));
 }
 
@@ -306,6 +414,11 @@ static void __init dmi_decode(const struct dmi_header *dm, void *dummy)
 	case 0:		/* BIOS Information */
 		dmi_save_ident(dm, DMI_BIOS_VENDOR, 4);
 		dmi_save_ident(dm, DMI_BIOS_VERSION, 5);
+		/*
+		 * This is grotesque hack for RHEL6 to make biosdevname
+		 * happy.  My apologies to anyone who has to see this.
+		 */
+		dmi_save_smbios_ver(DMI_SMBIOS_VERSION);
 		dmi_save_ident(dm, DMI_BIOS_DATE, 8);
 		break;
 	case 1:		/* System Information */
@@ -343,6 +456,40 @@ static void __init dmi_decode(const struct dmi_header *dm, void *dummy)
 	}
 }
 
+static void __init print_filtered(const char *info)
+{
+	const char *p;
+
+	if (!info)
+		return;
+
+	for (p = info; *p; p++)
+		if (isprint(*p))
+			printk(KERN_CONT "%c", *p);
+		else
+			printk(KERN_CONT "\\x%02x", *p & 0xff);
+}
+
+static void __init dmi_dump_ids(void)
+{
+	const char *board;	/* Board Name is optional */
+
+	printk(KERN_DEBUG "DMI: ");
+	print_filtered(dmi_get_system_info(DMI_SYS_VENDOR));
+	printk(KERN_CONT " ");
+	print_filtered(dmi_get_system_info(DMI_PRODUCT_NAME));
+	board = dmi_get_system_info(DMI_BOARD_NAME);
+	if (board) {
+		printk(KERN_CONT "/");
+		print_filtered(board);
+	}
+	printk(KERN_CONT ", BIOS ");
+	print_filtered(dmi_get_system_info(DMI_BIOS_VERSION));
+	printk(KERN_CONT " ");
+	print_filtered(dmi_get_system_info(DMI_BIOS_DATE));
+	printk(KERN_CONT "\n");
+}
+
 static int __init dmi_present(const char __iomem *p)
 {
 	u8 buf[15];
@@ -358,13 +505,16 @@ static int __init dmi_present(const char __iomem *p)
 		 * DMI version 0.0 means that the real version is taken from
 		 * the SMBIOS version, which we don't know at this point.
 		 */
+		dmi_ver = (buf[14] & 0xf0) << 4 | (buf[14] & 0x0f);
 		if (buf[14] != 0)
 			printk(KERN_INFO "DMI %d.%d present.\n",
 			       buf[14] >> 4, buf[14] & 0xF);
 		else
 			printk(KERN_INFO "DMI present.\n");
-		if (dmi_walk_early(dmi_decode) == 0)
+		if (dmi_walk_early(dmi_decode) == 0) {
+			dmi_dump_ids();
 			return 0;
+		}
 	}
 	return 1;
 }

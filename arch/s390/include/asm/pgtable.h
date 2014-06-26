@@ -105,35 +105,18 @@ extern char empty_zero_page[PAGE_SIZE];
 #ifndef __ASSEMBLY__
 /*
  * The vmalloc area will always be on the topmost area of the kernel
- * mapping. We reserve 96MB (31bit) / 1GB (64bit) for vmalloc,
+ * mapping. We reserve 96MB (31bit) / 128GB (64bit) for vmalloc,
  * which should be enough for any sane case.
  * By putting vmalloc at the top, we maximise the gap between physical
  * memory and vmalloc to catch misplaced memory accesses. As a side
  * effect, this also makes sure that 64 bit module code cannot be used
  * as system call address.
  */
-
 extern unsigned long VMALLOC_START;
+extern unsigned long VMALLOC_END;
+extern struct page *vmemmap;
 
-#ifndef __s390x__
-#define VMALLOC_SIZE	(96UL << 20)
-#define VMALLOC_END	0x7e000000UL
-#define VMEM_MAP_END	0x80000000UL
-#else /* __s390x__ */
-#define VMALLOC_SIZE	(1UL << 30)
-#define VMALLOC_END	0x3e040000000UL
-#define VMEM_MAP_END	0x40000000000UL
-#endif /* __s390x__ */
-
-/*
- * VMEM_MAX_PHYS is the highest physical address that can be added to the 1:1
- * mapping. This needs to be calculated at compile time since the size of the
- * VMEM_MAP is static but the size of struct page can change.
- */
-#define VMEM_MAX_PAGES	((VMEM_MAP_END - VMALLOC_END) / sizeof(struct page))
-#define VMEM_MAX_PFN	min(VMALLOC_START >> PAGE_SHIFT, VMEM_MAX_PAGES)
-#define VMEM_MAX_PHYS	((VMEM_MAX_PFN << PAGE_SHIFT) & ~((16 << 20) - 1))
-#define vmemmap		((struct page *) VMALLOC_END)
+#define VMEM_MAX_PHYS ((unsigned long) vmemmap)
 
 /*
  * A 31 bit pagetable entry of S390 has following format:
@@ -878,7 +861,8 @@ static inline void ptep_invalidate(struct mm_struct *mm,
 #define ptep_get_and_clear(__mm, __address, __ptep)			\
 ({									\
 	pte_t __pte = *(__ptep);					\
-	if (atomic_read(&(__mm)->mm_users) > 1 ||			\
+	(__mm)->context.flush_mm = 1;					\
+	if (atomic_read(&(__mm)->context.attach_count) > 1 ||		\
 	    (__mm) != current->active_mm)				\
 		ptep_invalidate(__mm, __address, __ptep);		\
 	else								\
@@ -921,7 +905,8 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 ({									\
 	pte_t __pte = *(__ptep);					\
 	if (pte_write(__pte)) {						\
-		if (atomic_read(&(__mm)->mm_users) > 1 ||		\
+		(__mm)->context.flush_mm = 1;				\
+		if (atomic_read(&(__mm)->context.attach_count) > 1 ||	\
 		    (__mm) != current->active_mm)			\
 			ptep_invalidate(__mm, __addr, __ptep);		\
 		set_pte_at(__mm, __addr, __ptep, pte_wrprotect(__pte));	\

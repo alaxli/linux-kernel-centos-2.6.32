@@ -234,6 +234,18 @@ config MFD_WM8352_CONFIG_MODE_3
 config MFD_WM8350_I2C
 	tristate "Support Wolfson Microelectronics WM8350 with I2C"
 	select MFD_WM8350
+	select MFD_WM8350_CONFIG_MODE_0
+	select MFD_WM8350_CONFIG_MODE_1
+	select MFD_WM8350_CONFIG_MODE_2
+	select MFD_WM8350_CONFIG_MODE_3
+	select MFD_WM8351_CONFIG_MODE_0
+	select MFD_WM8351_CONFIG_MODE_1
+	select MFD_WM8351_CONFIG_MODE_2
+	select MFD_WM8351_CONFIG_MODE_3
+	select MFD_WM8352_CONFIG_MODE_0
+	select MFD_WM8352_CONFIG_MODE_1
+	select MFD_WM8352_CONFIG_MODE_2
+	select MFD_WM8352_CONFIG_MODE_3
 	depends on I2C
 	help
 	  The WM8350 is an integrated audio and power management
@@ -304,6 +316,24 @@ config EZX_PCAP
 	help
 	  This enables the PCAP ASIC present on EZX Phones. This is
 	  needed for MMC, TouchScreen, Sound, USB, etc..
+
+config LPC_SCH
+	tristate "Intel SCH LPC"
+	depends on PCI
+	select MFD_CORE
+	help
+	  LPC bridge function of the Intel SCH provides support for
+	  System Management Bus and General Purpose I/O.
+
+config LPC_ICH
+	tristate "Intel ICH LPC"
+	depends on PCI
+	select MFD_CORE
+	help
+	  The LPC bridge function of the Intel ICH provides support for
+	  many functional units. This driver provides needed support for
+	  other drivers to control these functions, currently GPIO and
+	  watchdog.
 
 endmenu
 

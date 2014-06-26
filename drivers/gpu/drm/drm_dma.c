@@ -33,7 +33,8 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "drmP.h"
+#include <linux/export.h>
+#include <drm/drmP.h>
 
 /**
  * Initialize the DMA data.
@@ -47,11 +48,9 @@ int drm_dma_setup(struct drm_device *dev)
 {
 	int i;
 
-	dev->dma = kmalloc(sizeof(*dev->dma), GFP_KERNEL);
+	dev->dma = kzalloc(sizeof(*dev->dma), GFP_KERNEL);
 	if (!dev->dma)
 		return -ENOMEM;
-
-	memset(dev->dma, 0, sizeof(*dev->dma));
 
 	for (i = 0; i <= DRM_MAX_ORDER; i++)
 		memset(&dev->dma->bufs[i], 0, sizeof(dev->dma->bufs[0]));
@@ -121,11 +120,6 @@ void drm_free_buffer(struct drm_device *dev, struct drm_buf * buf)
 	buf->pending = 0;
 	buf->file_priv = NULL;
 	buf->used = 0;
-
-	if (drm_core_check_feature(dev, DRIVER_DMA_QUEUE)
-	    && waitqueue_active(&buf->dma_wait)) {
-		wake_up_interruptible(&buf->dma_wait);
-	}
 }
 
 /**

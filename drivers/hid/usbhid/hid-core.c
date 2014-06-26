@@ -309,8 +309,12 @@ static int hid_submit_out(struct hid_device *hid)
 	if (!test_bit(HID_REPORTED_IDLE, &usbhid->iofl)) {
 		usbhid->urbout->transfer_buffer_length = ((report->size - 1) >> 3) + 1 + (report->id > 0);
 		usbhid->urbout->dev = hid_to_usb_dev(hid);
-		memcpy(usbhid->outbuf, raw_report, usbhid->urbout->transfer_buffer_length);
-		kfree(raw_report);
+		if (raw_report) {
+			memcpy(usbhid->outbuf, raw_report,
+				usbhid->urbout->transfer_buffer_length);
+			kfree(raw_report);
+			usbhid->out[usbhid->outtail].raw_report = NULL;
+		}
 
 		dbg_hid("submitting out urb\n");
 
@@ -348,8 +352,11 @@ static int hid_submit_ctrl(struct hid_device *hid)
 		if (dir == USB_DIR_OUT) {
 			usbhid->urbctrl->pipe = usb_sndctrlpipe(hid_to_usb_dev(hid), 0);
 			usbhid->urbctrl->transfer_buffer_length = len;
-			memcpy(usbhid->ctrlbuf, raw_report, len);
-			kfree(raw_report);
+			if (raw_report) {
+				memcpy(usbhid->ctrlbuf, raw_report, len);
+				kfree(raw_report);
+				usbhid->ctrl[usbhid->ctrltail].raw_report = NULL;
+			}
 		} else {
 			int maxpacket, padlen;
 
@@ -800,7 +807,8 @@ static int hid_alloc_buffers(struct usb_device *dev, struct hid_device *hid)
 	return 0;
 }
 
-static int usbhid_output_raw_report(struct hid_device *hid, __u8 *buf, size_t count)
+static int usbhid_output_raw_report(struct hid_device *hid, __u8 *buf, size_t count,
+		unsigned char report_type)
 {
 	struct usbhid_device *usbhid = hid->driver_data;
 	struct usb_device *dev = hid_to_usb_dev(hid);
@@ -811,7 +819,7 @@ static int usbhid_output_raw_report(struct hid_device *hid, __u8 *buf, size_t co
 	ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
 		HID_REQ_SET_REPORT,
 		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-		((HID_OUTPUT_REPORT + 1) << 8) | *buf,
+		((report_type + 1) << 8) | *buf,
 		interface->desc.bInterfaceNumber, buf + 1, count - 1,
 		USB_CTRL_SET_TIMEOUT);
 

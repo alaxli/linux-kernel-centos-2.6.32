@@ -21,6 +21,15 @@
 extern int smp_num_siblings;
 extern unsigned int num_processors;
 
+static inline bool cpu_has_ht_siblings(void)
+{
+	bool has_siblings = false;
+#ifdef CONFIG_SMP
+	has_siblings = cpu_has_ht && smp_num_siblings > 1;
+#endif
+	return has_siblings;
+}
+
 DECLARE_PER_CPU(cpumask_var_t, cpu_sibling_map);
 DECLARE_PER_CPU(cpumask_var_t, cpu_core_map);
 DECLARE_PER_CPU(u16, cpu_llc_id);
@@ -155,8 +164,8 @@ static inline int num_booting_cpus(void)
 	return cpumask_weight(cpu_callout_mask);
 }
 #else /* !CONFIG_SMP */
-#define wbinvd_on_cpu(cpu)     wbinvd()
-static inline int wbinvd_on_all_cpus(void)
+#define wbinvd_on_cpu(cpu)	wbinvd()
+static inline int wbinvd_on_all_cpus (void)
 {
 	wbinvd();
 	return 0;

@@ -370,7 +370,7 @@ static void warn_no_thread(unsigned int irq, struct irqaction *action)
 irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
 {
 	irqreturn_t ret, retval = IRQ_NONE;
-	unsigned int flags = 0;
+	unsigned int status = 0;
 
 	if (!(action->flags & IRQF_DISABLED))
 		local_irq_enable_in_hardirq();
@@ -413,7 +413,7 @@ irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
 
 			/* Fall through to add to randomness */
 		case IRQ_HANDLED:
-			flags |= action->flags;
+			status |= action->flags;
 			break;
 
 		default:
@@ -424,7 +424,8 @@ irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
 		action = action->next;
 	} while (action);
 
-	add_interrupt_randomness(irq, flags);
+	if (status & IRQF_SAMPLE_RANDOM)
+		add_interrupt_randomness(irq);
 	local_irq_disable();
 
 	return retval;
@@ -558,3 +559,19 @@ unsigned int kstat_irqs_cpu(unsigned int irq, int cpu)
 }
 EXPORT_SYMBOL(kstat_irqs_cpu);
 
+
+#ifdef CONFIG_GENERIC_HARDIRQS
+unsigned int kstat_irqs(unsigned int irq)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	int cpu;
+	int sum = 0;
+
+	if (!desc)
+		return 0;
+	for_each_possible_cpu(cpu)
+		sum += desc->kstat_irqs[cpu];
+	return sum;
+}
+EXPORT_SYMBOL(kstat_irqs);
+#endif /* CONFIG_GENERIC_HARDIRQS */

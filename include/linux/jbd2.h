@@ -69,15 +69,8 @@ extern u8 jbd2_journal_enable_debug;
 #define jbd_debug(f, a...)	/**/
 #endif
 
-static inline void *jbd2_alloc(size_t size, gfp_t flags)
-{
-	return (void *)__get_free_pages(flags, get_order(size));
-}
-
-static inline void jbd2_free(void *ptr, size_t size)
-{
-	free_pages((unsigned long)ptr, get_order(size));
-};
+extern void *jbd2_alloc(size_t size, gfp_t flags);
+extern void jbd2_free(void *ptr, size_t size);
 
 #define JBD2_MIN_JOURNAL_BLOCKS 1024
 
@@ -330,6 +323,7 @@ enum jbd_state_bits {
 	BH_State,		/* Pins most journal_head state */
 	BH_JournalHead,		/* Pins bh->b_private and jh->b_bh */
 	BH_Unshadow,		/* Dummy bit, for BJ_Shadow wakeup filtering */
+	BH_Verified,		/* Metadata block has been verified ok */
 	BH_JBDPrivateStart,	/* First bit available for private use by FS */
 };
 
@@ -342,6 +336,7 @@ TAS_BUFFER_FNS(Revoked, revoked)
 BUFFER_FNS(RevokeValid, revokevalid)
 TAS_BUFFER_FNS(RevokeValid, revokevalid)
 BUFFER_FNS(Freed, freed)
+BUFFER_FNS(Verified, verified)
 
 static inline struct buffer_head *jh2bh(struct journal_head *jh)
 {
@@ -412,7 +407,7 @@ struct jbd2_inode {
 	struct inode *i_vfs_inode;
 
 	/* Flags of inode [j_list_lock] */
-	unsigned int i_flags;
+	unsigned long i_flags;
 };
 
 struct jbd2_revoke_table_s;
@@ -524,9 +519,10 @@ struct transaction_s
 	enum {
 		T_RUNNING,
 		T_LOCKED,
-		T_RUNDOWN,
 		T_FLUSH,
 		T_COMMIT,
+		T_COMMIT_DFLUSH,
+		T_COMMIT_JFLUSH,
 		T_FINISHED
 	}			t_state;
 
@@ -653,7 +649,9 @@ struct transaction_s
 	 * waiting for it to finish.
 	 */
 	unsigned int t_synchronous_commit:1;
-	unsigned int t_flushed_data_blocks:1;
+
+	/* Disk flush needs to be sent to fs partition [no locking] */
+	int			t_need_data_flush;
 
 	/*
 	 * For use by the filesystem to store fs-specific data
@@ -1043,11 +1041,12 @@ void __jbd2_journal_insert_checkpoint(struct journal_head *, transaction_t *);
 
 struct jbd2_buffer_trigger_type {
 	/*
-	 * Fired just before a buffer is written to the journal.
-	 * mapped_data is a mapped buffer that is the frozen data for
-	 * commit.
+	 * Fired a the moment data to write to the journal are known to be
+	 * stable - so either at the moment b_frozen_data is created or just
+	 * before a buffer is written to the journal.  mapped_data is a mapped
+	 * buffer that is the frozen data for commit.
 	 */
-	void (*t_commit)(struct jbd2_buffer_trigger_type *type,
+	void (*t_frozen)(struct jbd2_buffer_trigger_type *type,
 			 struct buffer_head *bh, void *mapped_data,
 			 size_t size);
 
@@ -1059,7 +1058,7 @@ struct jbd2_buffer_trigger_type {
 			struct buffer_head *bh);
 };
 
-extern void jbd2_buffer_commit_trigger(struct journal_head *jh,
+extern void jbd2_buffer_frozen_trigger(struct journal_head *jh,
 				       void *mapped_data,
 				       struct jbd2_buffer_trigger_type *triggers);
 extern void jbd2_buffer_abort_trigger(struct journal_head *jh,
@@ -1203,7 +1202,9 @@ int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
 int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
 int jbd2_journal_force_commit_nested(journal_t *journal);
 int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
+int jbd2_complete_transaction(journal_t *journal, tid_t tid);
 int jbd2_log_do_checkpoint(journal_t *journal);
+int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid);
 
 void __jbd2_log_wait_for_space(journal_t *journal);
 extern void __jbd2_journal_drop_transaction(journal_t *, transaction_t *);

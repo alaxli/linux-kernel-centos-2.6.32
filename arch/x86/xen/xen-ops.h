@@ -30,6 +30,7 @@ void xen_setup_machphys_mapping(void);
 pgd_t *xen_setup_kernel_pagetable(pgd_t *pgd, unsigned long max_pfn);
 void xen_ident_map_ISA(void);
 void xen_reserve_top(void);
+extern unsigned long xen_max_p2m_pfn;
 
 char * __init xen_memory_setup(void);
 void __init xen_arch_setup(void);
@@ -37,6 +38,10 @@ void __init xen_init_IRQ(void);
 void xen_enable_sysenter(void);
 void xen_enable_syscall(void);
 void xen_vcpu_restore(void);
+
+void xen_callback_vector(void);
+void xen_hvm_init_shared_info(void);
+void xen_unplug_emulated_devices(void);
 
 void __init xen_build_dynamic_phys_to_machine(void);
 
@@ -100,5 +105,7 @@ void xen_sysexit(void);
 void xen_sysret32(void);
 void xen_sysret64(void);
 void xen_adjust_exception_frame(void);
+
+extern int xen_panic_handler_init(void);
 
 #endif /* XEN_OPS_H */

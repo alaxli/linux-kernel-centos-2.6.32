@@ -300,7 +300,8 @@ InitWait:
 			ret = xenbus_printf(XBT_NIL, info->xbdev->nodename,
 					    "request-abs-pointer", "1");
 			if (ret)
-				pr_warning("can't request abs-pointer\n");
+				printk(KERN_WARNING
+				       "xenkbd: can't request abs-pointer");
 		}
 		xenbus_switch_state(dev, XenbusStateConnected);
 		break;
@@ -348,7 +349,7 @@ static struct xenbus_driver xenkbd_driver = {
 
 static int __init xenkbd_init(void)
 {
-	if (!xen_domain())
+	if (!xen_domain() || xen_hvm_domain())
 		return -ENODEV;
 
 	/* Nothing to do if running in dom0. */

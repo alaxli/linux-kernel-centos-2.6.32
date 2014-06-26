@@ -23,6 +23,7 @@
 
 #include <asm/page.h>
 #include <asm/ptrace.h>
+#include <asm-generic/kexec.h>
 
 /*
  * KEXEC_SOURCE_MEMORY_LIMIT maximum page get_free_page can return.
@@ -162,6 +163,9 @@ struct kimage_arch {
 	pte_t *pte;
 };
 #endif
+
+typedef void crash_vmclear_fn(void);
+extern crash_vmclear_fn __rcu *crash_vmclear_loaded_vmcss;
 
 #endif /* __ASSEMBLY__ */
 

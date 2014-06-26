@@ -45,7 +45,6 @@
 
 static DEFINE_SPINLOCK(tty_ldisc_lock);
 static DECLARE_WAIT_QUEUE_HEAD(tty_ldisc_wait);
-static DECLARE_WAIT_QUEUE_HEAD(tty_ldisc_idle);
 /* Line disc dispatch table */
 static struct tty_ldisc_ops *tty_ldiscs[NR_LDISCS];
 
@@ -82,7 +81,6 @@ static void put_ldisc(struct tty_ldisc *ld)
 		return;
 	}
 	local_irq_restore(flags);
-	wake_up(&tty_ldisc_idle);
 }
 
 /**
@@ -444,15 +442,9 @@ static void tty_set_termios_ldisc(struct tty_struct *tty, int num)
 
 static int tty_ldisc_open(struct tty_struct *tty, struct tty_ldisc *ld)
 {
-	int ret;
-
 	WARN_ON(test_and_set_bit(TTY_LDISC_OPEN, &tty->flags));
-	if (ld->ops->open) {
-		ret = ld->ops->open(tty);
-		if (ret)
-			clear_bit(TTY_LDISC_OPEN, &tty->flags);
-		return ret;
-	}
+	if (ld->ops->open)
+		return ld->ops->open(tty);
 	return 0;
 }
 
@@ -527,23 +519,6 @@ static int tty_ldisc_halt(struct tty_struct *tty)
 {
 	clear_bit(TTY_LDISC, &tty->flags);
 	return cancel_delayed_work_sync(&tty->buf.work);
-}
-
-/**
- *	tty_ldisc_wait_idle	-	wait for the ldisc to become idle
- *	@tty: tty to wait for
- *
- *	Wait for the line discipline to become idle. The discipline must
- *	have been halted for this to guarantee it remains idle.
- */
-static int tty_ldisc_wait_idle(struct tty_struct *tty)
-{
-	int ret;
-	ret = wait_event_timeout(tty_ldisc_idle,
-			atomic_read(&tty->ldisc->users) == 1, 5 * HZ);
-	if (ret < 0)
-		return ret;
-	return ret > 0 ? 0 : -EBUSY;
 }
 
 /**
@@ -641,16 +616,7 @@ int tty_set_ldisc(struct tty_struct *tty, int ldisc)
 
 	flush_scheduled_work();
 
-	retval = tty_ldisc_wait_idle(tty);
-
 	mutex_lock(&tty->ldisc_mutex);
-
-	/* handle wait idle failure locked */
-	if (retval) {
-		tty_ldisc_put(new_ldisc);
-		goto enable;
-	}
-
 	if (test_bit(TTY_HUPPED, &tty->flags)) {
 		/* We were raced by the hangup method. It will have stomped
 		   the ldisc data and closed the ldisc down */
@@ -683,7 +649,6 @@ int tty_set_ldisc(struct tty_struct *tty, int ldisc)
 
 	tty_ldisc_put(o_ldisc);
 
-enable:
 	/*
 	 *	Allow ldisc referencing to occur again
 	 */
@@ -734,8 +699,6 @@ static int tty_ldisc_reinit(struct tty_struct *tty, int ldisc)
 
 	if (IS_ERR(ld))
 		return -1;
-
-	WARN_ON_ONCE(tty_ldisc_wait_idle(tty));
 
 	tty_ldisc_close(tty, tty->ldisc);
 	tty_ldisc_put(tty->ldisc);

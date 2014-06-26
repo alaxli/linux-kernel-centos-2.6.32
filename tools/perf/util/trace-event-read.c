@@ -18,7 +18,7 @@
  *
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
-#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
 
 #include <dirent.h>
 #include <stdio.h>
@@ -33,7 +33,6 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <ctype.h>
 #include <errno.h>
 
 #include "../perf.h"
@@ -48,33 +47,85 @@ int file_bigendian;
 int host_bigendian;
 static int long_size;
 
-static unsigned long	page_size;
+static ssize_t calc_data_size;
+static bool repipe;
+
+static void *malloc_or_die(int size)
+{
+	void *ret;
+
+	ret = malloc(size);
+	if (!ret)
+		die("malloc");
+	return ret;
+}
+
+static int do_read(int fd, void *buf, int size)
+{
+	int rsize = size;
+
+	while (size) {
+		int ret = read(fd, buf, size);
+
+		if (ret <= 0)
+			return -1;
+
+		if (repipe) {
+			int retw = write(STDOUT_FILENO, buf, ret);
+
+			if (retw <= 0 || retw != ret)
+				die("repiping input file");
+		}
+
+		size -= ret;
+		buf += ret;
+	}
+
+	return rsize;
+}
 
 static int read_or_die(void *data, int size)
 {
 	int r;
 
-	r = read(input_fd, data, size);
-	if (r != size)
+	r = do_read(input_fd, data, size);
+	if (r <= 0)
 		die("reading input file (size expected=%d received=%d)",
 		    size, r);
+
+	if (calc_data_size)
+		calc_data_size += r;
+
 	return r;
 }
 
-static unsigned int read4(void)
+/* If it fails, the next read will report it */
+static void skip(int size)
+{
+	char buf[BUFSIZ];
+	int r;
+
+	while (size) {
+		r = size > BUFSIZ ? BUFSIZ : size;
+		read_or_die(buf, r);
+		size -= r;
+	};
+}
+
+static unsigned int read4(struct pevent *pevent)
 {
 	unsigned int data;
 
 	read_or_die(&data, 4);
-	return __data2host4(data);
+	return __data2host4(pevent, data);
 }
 
-static unsigned long long read8(void)
+static unsigned long long read8(struct pevent *pevent)
 {
 	unsigned long long data;
 
 	read_or_die(&data, 8);
-	return __data2host8(data);
+	return __data2host8(pevent, data);
 }
 
 static char *read_string(void)
@@ -82,98 +133,77 @@ static char *read_string(void)
 	char buf[BUFSIZ];
 	char *str = NULL;
 	int size = 0;
-	int i;
-	int r;
+	off_t r;
+	char c;
 
 	for (;;) {
-		r = read(input_fd, buf, BUFSIZ);
+		r = read(input_fd, &c, 1);
 		if (r < 0)
 			die("reading input file");
 
 		if (!r)
 			die("no data");
 
-		for (i = 0; i < r; i++) {
-			if (!buf[i])
-				break;
+		if (repipe) {
+			int retw = write(STDOUT_FILENO, &c, 1);
+
+			if (retw <= 0 || retw != r)
+				die("repiping input file string");
 		}
-		if (i < r)
+
+		buf[size++] = c;
+
+		if (!c)
 			break;
-
-		if (str) {
-			size += BUFSIZ;
-			str = realloc(str, size);
-			if (!str)
-				die("malloc of size %d", size);
-			memcpy(str + (size - BUFSIZ), buf, BUFSIZ);
-		} else {
-			size = BUFSIZ;
-			str = malloc_or_die(size);
-			memcpy(str, buf, size);
-		}
 	}
 
-	/* trailing \0: */
-	i++;
+	if (calc_data_size)
+		calc_data_size += size;
 
-	/* move the file descriptor to the end of the string */
-	r = lseek(input_fd, -(r - i), SEEK_CUR);
-	if (r < 0)
-		die("lseek");
-
-	if (str) {
-		size += i;
-		str = realloc(str, size);
-		if (!str)
-			die("malloc of size %d", size);
-		memcpy(str + (size - i), buf, i);
-	} else {
-		size = i;
-		str = malloc_or_die(i);
-		memcpy(str, buf, i);
-	}
+	str = malloc_or_die(size);
+	memcpy(str, buf, size);
 
 	return str;
 }
 
-static void read_proc_kallsyms(void)
+static void read_proc_kallsyms(struct pevent *pevent)
 {
 	unsigned int size;
 	char *buf;
 
-	size = read4();
+	size = read4(pevent);
+	if (!size)
+		return;
+
+	buf = malloc_or_die(size + 1);
+	read_or_die(buf, size);
+	buf[size] = '\0';
+
+	parse_proc_kallsyms(pevent, buf, size);
+
+	free(buf);
+}
+
+static void read_ftrace_printk(struct pevent *pevent)
+{
+	unsigned int size;
+	char *buf;
+
+	size = read4(pevent);
 	if (!size)
 		return;
 
 	buf = malloc_or_die(size);
 	read_or_die(buf, size);
 
-	parse_proc_kallsyms(buf, size);
+	parse_ftrace_printk(pevent, buf, size);
 
 	free(buf);
 }
 
-static void read_ftrace_printk(void)
-{
-	unsigned int size;
-	char *buf;
-
-	size = read4();
-	if (!size)
-		return;
-
-	buf = malloc_or_die(size);
-	read_or_die(buf, size);
-
-	parse_ftrace_printk(buf, size);
-
-	free(buf);
-}
-
-static void read_header_files(void)
+static void read_header_files(struct pevent *pevent)
 {
 	unsigned long long size;
-	char *header_page;
 	char *header_event;
 	char buf[BUFSIZ];
 
@@ -182,11 +212,8 @@ static void read_header_files(void)
 	if (memcmp(buf, "header_page", 12) != 0)
 		die("did not read header page");
 
-	size = read8();
-	header_page = malloc_or_die(size);
-	read_or_die(header_page, size);
-	parse_header_page(header_page, size);
-	free(header_page);
+	size = read8(pevent);
+	skip(size);
 
 	/*
 	 * The size field in the page is of type long,
@@ -198,47 +225,48 @@ static void read_header_files(void)
 	if (memcmp(buf, "header_event", 13) != 0)
 		die("did not read header event");
 
-	size = read8();
+	size = read8(pevent);
 	header_event = malloc_or_die(size);
 	read_or_die(header_event, size);
 	free(header_event);
 }
 
-static void read_ftrace_file(unsigned long long size)
+static void read_ftrace_file(struct pevent *pevent, unsigned long long size)
 {
 	char *buf;
 
 	buf = malloc_or_die(size);
 	read_or_die(buf, size);
-	parse_ftrace_file(buf, size);
+	parse_ftrace_file(pevent, buf, size);
 	free(buf);
 }
 
-static void read_event_file(char *sys, unsigned long long size)
+static void read_event_file(struct pevent *pevent, char *sys,
+			    unsigned long long size)
 {
 	char *buf;
 
 	buf = malloc_or_die(size);
 	read_or_die(buf, size);
-	parse_event_file(buf, size, sys);
+	parse_event_file(pevent, buf, size, sys);
 	free(buf);
 }
 
-static void read_ftrace_files(void)
+static void read_ftrace_files(struct pevent *pevent)
 {
 	unsigned long long size;
 	int count;
 	int i;
 
-	count = read4();
+	count = read4(pevent);
 
 	for (i = 0; i < count; i++) {
-		size = read8();
-		read_ftrace_file(size);
+		size = read8(pevent);
+		read_ftrace_file(pevent, size);
 	}
 }
 
-static void read_event_files(void)
+static void read_event_files(struct pevent *pevent)
 {
 	unsigned long long size;
 	char *sys;
@@ -246,15 +274,15 @@ static void read_event_files(void)
 	int count;
 	int i,x;
 
-	systems = read4();
+	systems = read4(pevent);
 
 	for (i = 0; i < systems; i++) {
 		sys = read_string();
 
-		count = read4();
+		count = read4(pevent);
 		for (x=0; x < count; x++) {
-			size = read8();
-			read_event_file(sys, size);
+			size = read8(pevent);
+			read_event_file(pevent, sys, size);
 		}
 	}
 }
@@ -263,7 +291,7 @@ struct cpu_data {
 	unsigned long long	offset;
 	unsigned long long	size;
 	unsigned long long	timestamp;
-	struct record		*next;
+	struct pevent_record	*next;
 	char			*page;
 	int			cpu;
 	int			index;
@@ -281,8 +309,8 @@ static void update_cpu_data_index(int cpu)
 
 static void get_next_page(int cpu)
 {
-	off64_t save_seek;
-	off64_t ret;
+	off_t save_seek;
+	off_t ret;
 
 	if (!cpu_data[cpu].page)
 		return;
@@ -297,17 +325,17 @@ static void get_next_page(int cpu)
 		update_cpu_data_index(cpu);
 
 		/* other parts of the code may expect the pointer to not move */
-		save_seek = lseek64(input_fd, 0, SEEK_CUR);
+		save_seek = lseek(input_fd, 0, SEEK_CUR);
 
-		ret = lseek64(input_fd, cpu_data[cpu].offset, SEEK_SET);
-		if (ret < 0)
+		ret = lseek(input_fd, cpu_data[cpu].offset, SEEK_SET);
+		if (ret == (off_t)-1)
 			die("failed to lseek");
 		ret = read(input_fd, cpu_data[cpu].page, page_size);
 		if (ret < 0)
 			die("failed to read page");
 
 		/* reset the file pointer back */
-		lseek64(input_fd, save_seek, SEEK_SET);
+		lseek(input_fd, save_seek, SEEK_SET);
 
 		return;
 	}
@@ -348,9 +376,9 @@ static int calc_index(void *ptr, int cpu)
 	return (unsigned long)ptr - (unsigned long)cpu_data[cpu].page;
 }
 
-struct record *trace_peek_data(int cpu)
+struct pevent_record *trace_peek_data(struct pevent *pevent, int cpu)
 {
-	struct record *data;
+	struct pevent_record *data;
 	void *page = cpu_data[cpu].page;
 	int idx = cpu_data[cpu].index;
 	void *ptr = page + idx;
@@ -370,15 +398,15 @@ struct record *trace_peek_data(int cpu)
 		/* FIXME: handle header page */
 		if (header_page_ts_size != 8)
 			die("expected a long long type for timestamp");
-		cpu_data[cpu].timestamp = data2host8(ptr);
+		cpu_data[cpu].timestamp = data2host8(pevent, ptr);
 		ptr += 8;
 		switch (header_page_size_size) {
 		case 4:
-			cpu_data[cpu].page_size = data2host4(ptr);
+			cpu_data[cpu].page_size = data2host4(pevent, ptr);
 			ptr += 4;
 			break;
 		case 8:
-			cpu_data[cpu].page_size = data2host8(ptr);
+			cpu_data[cpu].page_size = data2host8(pevent, ptr);
 			ptr += 8;
 			break;
 		default:
@@ -392,10 +420,10 @@ read_again:
 
 	if (idx >= cpu_data[cpu].page_size) {
 		get_next_page(cpu);
-		return trace_peek_data(cpu);
+		return trace_peek_data(pevent, cpu);
 	}
 
-	type_len_ts = data2host4(ptr);
+	type_len_ts = data2host4(pevent, ptr);
 	ptr += 4;
 
 	type_len = type_len4host(type_len_ts);
@@ -405,14 +433,14 @@ read_again:
 	case RINGBUF_TYPE_PADDING:
 		if (!delta)
 			die("error, hit unexpected end of page");
-		length = data2host4(ptr);
+		length = data2host4(pevent, ptr);
 		ptr += 4;
 		length *= 4;
 		ptr += length;
 		goto read_again;
 
 	case RINGBUF_TYPE_TIME_EXTEND:
-		extend = data2host4(ptr);
+		extend = data2host4(pevent, ptr);
 		ptr += 4;
 		extend <<= TS_SHIFT;
 		extend += delta;
@@ -423,7 +451,7 @@ read_again:
 		ptr += 12;
 		break;
 	case 0:
-		length = data2host4(ptr);
+		length = data2host4(pevent, ptr);
 		ptr += 4;
 		die("here! length=%d", length);
 		break;
@@ -448,37 +476,38 @@ read_again:
 	return data;
 }
 
-struct record *trace_read_data(int cpu)
+struct pevent_record *trace_read_data(struct pevent *pevent, int cpu)
 {
-	struct record *data;
+	struct pevent_record *data;
 
-	data = trace_peek_data(cpu);
+	data = trace_peek_data(pevent, cpu);
 	cpu_data[cpu].next = NULL;
 
 	return data;
 }
 
-void trace_report(void)
+ssize_t trace_report(int fd, struct pevent **ppevent, bool __repipe)
 {
-	const char *input_file = "trace.info";
 	char buf[BUFSIZ];
 	char test[] = { 23, 8, 68 };
 	char *version;
 	int show_version = 0;
 	int show_funcs = 0;
 	int show_printk = 0;
+	ssize_t size;
 
-	input_fd = open(input_file, O_RDONLY);
-	if (input_fd < 0)
-		die("opening '%s'\n", input_file);
+	calc_data_size = 1;
+	repipe = __repipe;
+
+	input_fd = fd;
 
 	read_or_die(buf, 3);
 	if (memcmp(buf, test, 3) != 0)
-		die("not an trace data file");
+		die("no trace data in the file");
 
 	read_or_die(buf, 7);
 	if (memcmp(buf, "tracing", 7) != 0)
-		die("not a trace file (missing tracing)");
+		die("not a trace file (missing 'tracing' tag)");
 
 	version = read_string();
 	if (show_version)
@@ -489,26 +518,34 @@ void trace_report(void)
 	file_bigendian = buf[0];
 	host_bigendian = bigendian();
 
+	*ppevent = read_trace_init(file_bigendian, host_bigendian);
+	if (*ppevent == NULL)
+		die("read_trace_init failed");
+
 	read_or_die(buf, 1);
 	long_size = buf[0];
 
-	page_size = read4();
+	page_size = read4(*ppevent);
 
-	read_header_files();
+	read_header_files(*ppevent);
 
-	read_ftrace_files();
-	read_event_files();
-	read_proc_kallsyms();
-	read_ftrace_printk();
+	read_ftrace_files(*ppevent);
+	read_event_files(*ppevent);
+	read_proc_kallsyms(*ppevent);
+	read_ftrace_printk(*ppevent);
+
+	size = calc_data_size - 1;
+	calc_data_size = 0;
+	repipe = false;
 
 	if (show_funcs) {
-		print_funcs();
-		return;
+		pevent_print_funcs(*ppevent);
+		return size;
 	}
 	if (show_printk) {
-		print_printk();
-		return;
+		pevent_print_printk(*ppevent);
+		return size;
 	}
 
-	return;
+	return size;
 }

@@ -22,7 +22,11 @@
 #include "pci.h"
 #include "msi.h"
 
+#ifdef CONFIG_PCI_MSI_DEFAULT_ON
 static int pci_msi_enable = 1;
+#else
+static int pci_msi_enable = 0;
+#endif /*CONFIG_PCI_MSI_DEFAULT_ON*/
 
 /* Arch hooks */
 
@@ -316,6 +320,18 @@ static void free_msi_irqs(struct pci_dev *dev)
 			if (list_is_last(&entry->list, &dev->msi_list))
 				iounmap(entry->mask_base);
 		}
+
+		/*
+		 * Its possible that we get into this path
+		 * When populate_msi_sysfs fails, which means the entries
+		 * were not registered with sysfs.  In that case don't
+		 * unregister them.
+		 */
+		if (entry->kobj.parent) {
+			kobject_del(&entry->kobj);
+			kobject_put(&entry->kobj);
+		}
+
 		list_del(&entry->list);
 		kfree(entry);
 	}
@@ -396,6 +412,104 @@ void pci_restore_msi_state(struct pci_dev *dev)
 }
 EXPORT_SYMBOL_GPL(pci_restore_msi_state);
 
+
+#define to_msi_attr(obj) container_of(obj, struct msi_attribute, attr)
+#define to_msi_desc(obj) container_of(obj, struct msi_desc, kobj)
+
+struct msi_attribute {
+	struct attribute        attr;
+	ssize_t (*show)(struct msi_desc *entry, struct msi_attribute *attr,
+			char *buf);
+	ssize_t (*store)(struct msi_desc *entry, struct msi_attribute *attr,
+			 const char *buf, size_t count);
+};
+
+static ssize_t show_msi_mode(struct msi_desc *entry, struct msi_attribute *atr,
+			     char *buf)
+{
+	return sprintf(buf, "%s\n", entry->msi_attrib.is_msix ? "msix" : "msi");
+}
+
+static ssize_t msi_irq_attr_show(struct kobject *kobj,
+				 struct attribute *attr, char *buf)
+{
+	struct msi_attribute *attribute = to_msi_attr(attr);
+	struct msi_desc *entry = to_msi_desc(kobj);
+
+	if (!attribute->show)
+		return -EIO;
+
+	return attribute->show(entry, attribute, buf);
+}
+
+static const struct sysfs_ops msi_irq_sysfs_ops = {
+	.show = msi_irq_attr_show,
+};
+
+static struct msi_attribute mode_attribute =
+	__ATTR(mode, S_IRUGO, show_msi_mode, NULL);
+
+
+struct attribute *msi_irq_default_attrs[] = {
+	&mode_attribute.attr,
+	NULL
+};
+
+void msi_kobj_release(struct kobject *kobj)
+{
+	struct msi_desc *entry = to_msi_desc(kobj);
+
+	pci_dev_put(entry->dev);
+}
+
+static struct kobj_type msi_irq_ktype = {
+	.release = msi_kobj_release,
+	.sysfs_ops = &msi_irq_sysfs_ops,
+	.default_attrs = msi_irq_default_attrs,
+};
+
+static int populate_msi_sysfs(struct pci_dev *pdev)
+{
+	struct msi_desc *entry;
+	struct kobject *kobj;
+	int ret;
+	int count = 0;
+	struct pci_dev_rh1 *pdr = pdev->rh_reserved1;
+
+	if (!pdr)
+		return -ENOSYS;
+
+	if (pdr)
+		pdr->msi_kset = kset_create_and_add("msi_irqs", NULL,
+						    &pdev->dev.kobj);
+	if (!pdr->msi_kset)
+		return -ENOMEM;
+
+	list_for_each_entry(entry, &pdev->msi_list, list) {
+		kobj = &entry->kobj;
+		kobj->kset = pdr->msi_kset;
+		pci_dev_get(pdev);
+		ret = kobject_init_and_add(kobj, &msi_irq_ktype, NULL,
+				     "%u", entry->irq);
+		if (ret)
+			goto out_unroll;
+
+		count++;
+	}
+
+	return 0;
+
+out_unroll:
+	list_for_each_entry(entry, &pdev->msi_list, list) {
+		if (!count)
+			break;
+		kobject_del(&entry->kobj);
+		kobject_put(&entry->kobj);
+		count--;
+	}
+	return ret;
+}
+
 /**
  * msi_capability_init - configure device's MSI capability structure
  * @dev: pointer to the pci_dev data structure of MSI device function
@@ -447,6 +561,13 @@ static int msi_capability_init(struct pci_dev *dev, int nvec)
 		return ret;
 	}
 
+	ret = populate_msi_sysfs(dev);
+	if (ret) {
+		msi_mask_irq(entry, mask, ~mask);
+		free_msi_irqs(dev);
+		return ret;
+	}
+
 	/* Set MSI enabled bits	 */
 	pci_intx_for_msi(dev, 0);
 	msi_set_enable(dev, pos, 1);
@@ -459,7 +580,7 @@ static int msi_capability_init(struct pci_dev *dev, int nvec)
 static void __iomem *msix_map_region(struct pci_dev *dev, unsigned pos,
 							unsigned nr_entries)
 {
-	unsigned long phys_addr;
+	resource_size_t phys_addr;
 	u32 table_offset;
 	u8 bir;
 
@@ -566,6 +687,12 @@ static int msix_capability_init(struct pci_dev *dev,
 	pci_write_config_word(dev, pos + PCI_MSIX_FLAGS, control);
 
 	msix_program_entries(dev, entries);
+
+	ret = populate_msi_sysfs(dev);
+	if (ret) {
+		ret = 0;
+		goto error;
+	}
 
 	/* Set MSI-X enabled bits and unmask the function */
 	pci_intx_for_msi(dev, 0);
@@ -720,11 +847,17 @@ void pci_msi_shutdown(struct pci_dev *dev)
 
 void pci_disable_msi(struct pci_dev *dev)
 {
+	struct pci_dev_rh1 *pdr = dev->rh_reserved1;
+
 	if (!pci_msi_enable || !dev || !dev->msi_enabled)
 		return;
 
 	pci_msi_shutdown(dev);
 	free_msi_irqs(dev);
+	if (pdr && pdr->msi_kset) {
+		kset_unregister(pdr->msi_kset);
+		pdr->msi_kset = NULL;
+	}
 }
 EXPORT_SYMBOL(pci_disable_msi);
 
@@ -818,11 +951,17 @@ void pci_msix_shutdown(struct pci_dev *dev)
 
 void pci_disable_msix(struct pci_dev *dev)
 {
+	struct pci_dev_rh1 *pdr = dev->rh_reserved1;
+
 	if (!pci_msi_enable || !dev || !dev->msix_enabled)
 		return;
 
 	pci_msix_shutdown(dev);
 	free_msi_irqs(dev);
+	if (pdr && pdr->msi_kset) {
+		kset_unregister(pdr->msi_kset);
+		pdr->msi_kset = NULL;
+	}
 }
 EXPORT_SYMBOL(pci_disable_msix);
 
@@ -861,17 +1000,12 @@ int pci_msi_enabled(void)
 }
 EXPORT_SYMBOL(pci_msi_enabled);
 
+void pci_yes_msi(void)
+{
+	pci_msi_enable = 1;
+}
+
 void pci_msi_init_pci_dev(struct pci_dev *dev)
 {
-	int pos;
 	INIT_LIST_HEAD(&dev->msi_list);
-
-	/* Disable the msi hardware to avoid screaming interrupts
-	 * during boot.  This is the power on reset default so
-	 * usually this should be a noop.
-	 */
-	pos = pci_find_capability(dev, PCI_CAP_ID_MSI);
-	if (pos)
-		msi_set_enable(dev, pos, 0);
-	msix_set_enable(dev, 0);
 }

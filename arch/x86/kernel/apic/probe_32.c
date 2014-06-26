@@ -52,7 +52,7 @@ static int __init print_ipi_mode(void)
 }
 late_initcall(print_ipi_mode);
 
-void default_setup_apic_routing(void)
+void __init default_setup_apic_routing(void)
 {
 	int version = apic_version[boot_cpu_physical_apicid];
 
@@ -77,7 +77,7 @@ void default_setup_apic_routing(void)
 		apic->setup_apic_routing();
 }
 
-void setup_apic_flat_routing(void)
+static void setup_apic_flat_routing(void)
 {
 #ifdef CONFIG_X86_IO_APIC
 	printk(KERN_INFO
@@ -163,6 +163,7 @@ struct apic apic_default = {
 
 	.read				= native_apic_mem_read,
 	.write				= native_apic_mem_write,
+	.eoi_write			= native_apic_mem_write,
 	.icr_read			= native_apic_icr_read,
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,
@@ -178,7 +179,7 @@ extern struct apic apic_es7000_cluster;
 struct apic *apic = &apic_default;
 EXPORT_SYMBOL_GPL(apic);
 
-static struct apic *apic_probe[] __initdata = {
+struct apic *apic_probe[] __initdata = {
 #ifdef CONFIG_X86_NUMAQ
 	&apic_numaq,
 #endif

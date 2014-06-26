@@ -75,6 +75,8 @@ static unsigned int max_cstate __read_mostly = ACPI_PROCESSOR_MAX_POWER;
 module_param(max_cstate, uint, 0000);
 static unsigned int nocst __read_mostly;
 module_param(nocst, uint, 0000);
+static int bm_check_disable __read_mostly;
+module_param(bm_check_disable, uint, 0000);
 
 static unsigned int latency_factor __read_mostly = 2;
 module_param(latency_factor, uint, 0644);
@@ -252,7 +254,7 @@ int acpi_processor_resume(struct acpi_device * device)
 	return 0;
 }
 
-#if defined (CONFIG_GENERIC_TIME) && defined (CONFIG_X86)
+#if defined(CONFIG_X86)
 static void tsc_check_state(int state)
 {
 	switch (boot_cpu_data.x86_vendor) {
@@ -316,6 +318,17 @@ static int acpi_processor_get_power_info_fadt(struct acpi_processor *pr)
 			"C2 latency too large [%d]\n", acpi_gbl_FADT.C2latency));
 		/* invalidate C2 */
 		pr->power.states[ACPI_STATE_C2].address = 0;
+	}
+
+	/*
+	 * FADT supplied C3 latency must be less than or equal to
+	 * 1000 microseconds.
+	 */
+	if (acpi_gbl_FADT.C3latency > ACPI_PROCESSOR_MAX_C3_LATENCY) {
+		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+			"C3 latency too large [%d]\n", acpi_gbl_FADT.C3latency));
+		/* invalidate C3 */
+		pr->power.states[ACPI_STATE_C3].address = 0;
 	}
 
 	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
@@ -533,16 +546,6 @@ static void acpi_processor_power_verify_c3(struct acpi_processor *pr,
 
 	if (!cx->address)
 		return;
-
-	/*
-	 * C3 latency must be less than or equal to 1000
-	 * microseconds.
-	 */
-	else if (cx->latency > ACPI_PROCESSOR_MAX_C3_LATENCY) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-				  "latency too large [%d]\n", cx->latency));
-		return;
-	}
 
 	/*
 	 * PIIX4 Erratum #18: We don't support C3 when Type-F (fast)
@@ -779,6 +782,9 @@ static const struct file_operations acpi_processor_power_fops = {
 static int acpi_idle_bm_check(void)
 {
 	u32 bm_status = 0;
+
+	if (bm_check_disable)
+		return 0;
 
 	acpi_read_bit_register(ACPI_BITREG_BUS_MASTER_STATUS, &bm_status);
 	if (bm_status)
@@ -1070,9 +1076,6 @@ static int acpi_processor_setup_cpuidle(struct acpi_processor *pr)
 	if (pr->flags.power == 0) {
 		return -EINVAL;
 	}
-
-	if (!dev)
-		return -EINVAL;
 
 	dev->cpu = pr->id;
 	for (i = 0; i < CPUIDLE_STATE_MAX; i++) {

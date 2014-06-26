@@ -125,14 +125,27 @@ static ssize_t firmware_loading_show(struct device *dev,
 	return sprintf(buf, "%d\n", loading);
 }
 
+/* global list of firmware pages */
+static LIST_HEAD(firmware_pages_list);
 static void firmware_free_data(const struct firmware *fw)
 {
+	struct list_head *entry, *next;
+	struct firmware_pages *fw_pages;
 	int i;
+
 	vunmap(fw->data);
-	if (fw->pages) {
-		for (i = 0; i < PFN_UP(fw->size); i++)
-			__free_page(fw->pages[i]);
-		kfree(fw->pages);
+	list_for_each_safe(entry, next, &firmware_pages_list) {
+		fw_pages = list_entry(entry, struct firmware_pages, list);
+		if (fw_pages->firmware != fw)
+			continue;
+		if (fw_pages->pages) {
+			for (i = 0; i < PFN_UP(fw->size); i++)
+				__free_page(fw_pages->pages[i]);
+			kfree(fw_pages->pages);
+		}
+		list_del(&fw_pages->list);
+		kfree(fw_pages);
+		break;
 	}
 }
 
@@ -159,6 +172,7 @@ static ssize_t firmware_loading_store(struct device *dev,
 {
 	struct firmware_priv *fw_priv = dev_get_drvdata(dev);
 	int loading = simple_strtol(buf, NULL, 10);
+	struct firmware_pages *fw_pages;
 	int i;
 
 	mutex_lock(&fw_lock);
@@ -170,7 +184,14 @@ static ssize_t firmware_loading_store(struct device *dev,
 	case 1:
 		firmware_free_data(fw_priv->fw);
 		memset(fw_priv->fw, 0, sizeof(struct firmware));
-		/* If the pages are not owned by 'struct firmware' */
+		fw_pages = kzalloc(sizeof(struct firmware_pages), GFP_KERNEL);
+		if (!fw_pages) {
+			fw_load_abort(fw_priv);
+			break;
+		}
+		fw_pages->firmware = fw_priv->fw;
+		list_add(&fw_pages->list, &firmware_pages_list);
+		/* If the pages are not owned by 'struct firmware_pages' */
 		for (i = 0; i < fw_priv->nr_pages; i++)
 			__free_page(fw_priv->pages[i]);
 		kfree(fw_priv->pages);
@@ -189,8 +210,14 @@ static ssize_t firmware_loading_store(struct device *dev,
 				dev_err(dev, "%s: vmap() failed\n", __func__);
 				goto err;
 			}
-			/* Pages are now owned by 'struct firmware' */
-			fw_priv->fw->pages = fw_priv->pages;
+			/* Pages are now owned by 'struct firmware_pages' */
+			fw_pages = kzalloc(sizeof(struct firmware_pages),
+					   GFP_KERNEL);
+			if (!fw_pages)
+				goto err;
+			fw_pages->firmware = fw_priv->fw;
+			fw_pages->pages = fw_priv->pages;
+			list_add(&fw_pages->list, &firmware_pages_list);
 			fw_priv->pages = NULL;
 
 			fw_priv->page_array_size = 0;
@@ -208,6 +235,7 @@ static ssize_t firmware_loading_store(struct device *dev,
 		fw_load_abort(fw_priv);
 		break;
 	}
+
 out:
 	mutex_unlock(&fw_lock);
 	return count;
@@ -216,8 +244,9 @@ out:
 static DEVICE_ATTR(loading, 0644, firmware_loading_show, firmware_loading_store);
 
 static ssize_t
-firmware_data_read(struct kobject *kobj, struct bin_attribute *bin_attr,
-		   char *buffer, loff_t offset, size_t count)
+firmware_data_read(struct file *filp, struct kobject *kobj,
+		   struct bin_attribute *bin_attr, char *buffer, loff_t offset,
+		   size_t count)
 {
 	struct device *dev = to_dev(kobj);
 	struct firmware_priv *fw_priv = dev_get_drvdata(dev);
@@ -300,6 +329,7 @@ fw_realloc_buffer(struct firmware_priv *fw_priv, int min_size)
 
 /**
  * firmware_data_write - write method for firmware
+ * @filp: open sysfs file
  * @kobj: kobject for the device
  * @bin_attr: bin_attr structure
  * @buffer: buffer being written
@@ -310,8 +340,9 @@ fw_realloc_buffer(struct firmware_priv *fw_priv, int min_size)
  *	the driver as a firmware image.
  **/
 static ssize_t
-firmware_data_write(struct kobject *kobj, struct bin_attribute *bin_attr,
-		    char *buffer, loff_t offset, size_t count)
+firmware_data_write(struct file* filp, struct kobject *kobj,
+		    struct bin_attribute *bin_attr, char *buffer,
+		    loff_t offset, size_t count)
 {
 	struct device *dev = to_dev(kobj);
 	struct firmware_priv *fw_priv = dev_get_drvdata(dev);
@@ -493,7 +524,8 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 	if (!firmware) {
 		dev_err(device, "%s: kmalloc(struct firmware) failed\n",
 			__func__);
-		return -ENOMEM;
+		retval = -ENOMEM;
+		goto out;
 	}
 
 	for (builtin = __start_builtin_fw; builtin != __end_builtin_fw;
@@ -505,14 +537,6 @@ _request_firmware(const struct firmware **firmware_p, const char *name,
 		firmware->size = builtin->size;
 		firmware->data = builtin->data;
 		return 0;
-	}
-
-	read_lock_usermodehelper();
-
-	if (WARN_ON(usermodehelper_is_disabled())) {
-		dev_err(device, "firmware: %s will not be loaded\n", name);
-		retval = -EBUSY;
-		goto out;
 	}
 
 	if (uevent)
@@ -552,7 +576,6 @@ error_kfree_fw:
 	kfree(firmware);
 	*firmware_p = NULL;
 out:
-	read_unlock_usermodehelper();
 	return retval;
 }
 
@@ -623,12 +646,9 @@ request_firmware_work_func(void *arg)
 	}
 	ret = _request_firmware(&fw, fw_work->name, fw_work->device,
 		fw_work->uevent);
-	if (ret < 0)
-		fw_work->cont(NULL, fw_work->context);
-	else {
-		fw_work->cont(fw, fw_work->context);
-		release_firmware(fw);
-	}
+
+	fw_work->cont(fw, fw_work->context);
+
 	module_put(fw_work->module);
 	kfree(fw_work);
 	return ret;
@@ -641,6 +661,7 @@ request_firmware_work_func(void *arg)
  *	is non-zero else the firmware copy must be done manually.
  * @name: name of firmware file
  * @device: device for which firmware is being loaded
+ * @gfp: allocation flags
  * @context: will be passed over to @cont, and
  *	@fw may be %NULL if firmware request fails.
  * @cont: function will be called asynchronously when the firmware
@@ -653,12 +674,12 @@ request_firmware_work_func(void *arg)
 int
 request_firmware_nowait(
 	struct module *module, int uevent,
-	const char *name, struct device *device, void *context,
+	const char *name, struct device *device, gfp_t gfp, void *context,
 	void (*cont)(const struct firmware *fw, void *context))
 {
 	struct task_struct *task;
 	struct firmware_work *fw_work = kmalloc(sizeof (struct firmware_work),
-						GFP_ATOMIC);
+						gfp);
 
 	if (!fw_work)
 		return -ENOMEM;

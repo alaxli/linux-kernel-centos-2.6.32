@@ -72,7 +72,7 @@ static struct notifier_block __cpuinitdata hotplug_cfd_notifier = {
 	.notifier_call		= hotplug_cfd,
 };
 
-static int __cpuinit init_call_single_data(void)
+void __init call_function_init(void)
 {
 	void *cpu = (void *)(long)smp_processor_id();
 	int i;
@@ -86,10 +86,7 @@ static int __cpuinit init_call_single_data(void)
 
 	hotplug_cfd(&hotplug_cfd_notifier, CPU_UP_PREPARE, cpu);
 	register_cpu_notifier(&hotplug_cfd_notifier);
-
-	return 0;
 }
-early_initcall(init_call_single_data);
 
 /*
  * csd_lock/csd_unlock used to serialize access to per-cpu csd resources
@@ -192,6 +189,7 @@ void generic_smp_call_function_interrupt(void)
 	 */
 	list_for_each_entry_rcu(data, &call_function.queue, csd.list) {
 		int refs;
+		void (*func) (void *info);
 
 		/*
 		 * Since we walk the list without any locks, we might
@@ -211,23 +209,31 @@ void generic_smp_call_function_interrupt(void)
 		if (atomic_read(&data->refs) == 0)
 			continue;
 
-		if (!cpumask_test_and_clear_cpu(cpu, data->cpumask))
-			continue;
-
+		func = data->csd.func;			/* for later warn */
 		data->csd.func(data->csd.info);
+
+		/*
+		 * If the cpu mask is not still set then it enabled interrupts,
+		 * we took another smp interrupt, and executed the function
+		 * twice on this cpu.  In theory that copy decremented refs.
+		 */
+		if (!cpumask_test_and_clear_cpu(cpu, data->cpumask)) {
+			WARN(1, "%pS enabled interrupts and double executed\n",
+			     func);
+			continue;
+		}
 
 		refs = atomic_dec_return(&data->refs);
 		WARN_ON(refs < 0);
-		if (!refs) {
-			WARN_ON(!cpumask_empty(data->cpumask));
-
-			spin_lock(&call_function.lock);
-			list_del_rcu(&data->csd.list);
-			spin_unlock(&call_function.lock);
-		}
 
 		if (refs)
 			continue;
+
+		WARN_ON(!cpumask_empty(data->cpumask));
+
+		spin_lock(&call_function.lock);
+		list_del_rcu(&data->csd.list);
+		spin_unlock(&call_function.lock);
 
 		csd_unlock(&data->csd);
 	}
@@ -342,9 +348,10 @@ int smp_call_function_single(int cpu, void (*func) (void *info), void *info,
 EXPORT_SYMBOL(smp_call_function_single);
 
 /**
- * __smp_call_function_single(): Run a function on another CPU
+ * __smp_call_function_single(): Run a function on a specific CPU
  * @cpu: The CPU to run on.
  * @data: Pre-allocated and setup data structure
+ * @wait: If true, wait until function has completed on specified CPU.
  *
  * Like smp_call_function_single(), but allow caller to pass in a
  * pre-allocated data structure. Useful for embedding @data inside
@@ -353,8 +360,10 @@ EXPORT_SYMBOL(smp_call_function_single);
 void __smp_call_function_single(int cpu, struct call_single_data *data,
 				int wait)
 {
-	csd_lock(data);
+	unsigned int this_cpu;
+	unsigned long flags;
 
+	this_cpu = get_cpu();
 	/*
 	 * Can deadlock when called with interrupts disabled.
 	 * We allow cpu's that are not yet online though, as no one else can
@@ -364,7 +373,15 @@ void __smp_call_function_single(int cpu, struct call_single_data *data,
 	WARN_ON_ONCE(cpu_online(smp_processor_id()) && wait && irqs_disabled()
 		     && !oops_in_progress);
 
-	generic_exec_single(cpu, data, wait);
+	if (cpu == this_cpu) {
+		local_irq_save(flags);
+		data->func(data->info);
+		local_irq_restore(flags);
+	} else {
+		csd_lock(data);
+		generic_exec_single(cpu, data, wait);
+	}
+	put_cpu();
 }
 
 /**

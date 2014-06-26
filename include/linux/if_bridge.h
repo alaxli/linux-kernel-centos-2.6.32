@@ -14,6 +14,9 @@
 #define _LINUX_IF_BRIDGE_H
 
 #include <linux/types.h>
+#ifdef __KERNEL__
+#include <linux/in6.h>
+#endif
 
 #define SYSFS_BRIDGE_ATTR	"bridge"
 #define SYSFS_BRIDGE_FDB	"brforward"
@@ -100,6 +103,64 @@ struct __fdb_entry
 	__u16 unused;
 };
 
+/* Bridge multicast database attributes
+ * [MDBA_MDB] = {
+ *     [MDBA_MDB_ENTRY] = {
+ *         [MDBA_MDB_ENTRY_INFO]
+ *     }
+ * }
+ * [MDBA_ROUTER] = {
+ *    [MDBA_ROUTER_PORT]
+ * }
+ */
+enum {
+	MDBA_UNSPEC,
+	MDBA_MDB,
+	MDBA_ROUTER,
+	__MDBA_MAX,
+};
+#define MDBA_MAX (__MDBA_MAX - 1)
+
+enum {
+	MDBA_MDB_UNSPEC,
+	MDBA_MDB_ENTRY,
+	__MDBA_MDB_MAX,
+};
+#define MDBA_MDB_MAX (__MDBA_MDB_MAX - 1)
+
+enum {
+	MDBA_MDB_ENTRY_UNSPEC,
+	MDBA_MDB_ENTRY_INFO,
+	__MDBA_MDB_ENTRY_MAX,
+};
+#define MDBA_MDB_ENTRY_MAX (__MDBA_MDB_ENTRY_MAX - 1)
+
+enum {
+	MDBA_ROUTER_UNSPEC,
+	MDBA_ROUTER_PORT,
+	__MDBA_ROUTER_MAX,
+};
+#define MDBA_ROUTER_MAX (__MDBA_ROUTER_MAX - 1)
+
+struct br_port_msg {
+	__u8  family;
+	__u32 ifindex;
+};
+
+struct br_mdb_entry {
+	__u32 ifindex;
+#define MDB_TEMPORARY 0
+#define MDB_PERMANENT 1
+	__u8 state;
+	struct {
+		union {
+			__be32	ip4;
+			struct in6_addr ip6;
+		} u;
+		__be16		proto;
+	} addr;
+};
+
 #ifdef __KERNEL__
 
 #include <linux/netdevice.h>
@@ -108,6 +169,12 @@ extern void brioctl_set(int (*ioctl_hook)(struct net *, unsigned int, void __use
 extern struct sk_buff *(*br_handle_frame_hook)(struct net_bridge_port *p,
 					       struct sk_buff *skb);
 extern int (*br_should_route_hook)(struct sk_buff *skb);
+
+/*
+ * RHEL speciality. Upstream stores pointer to bridge device which
+ * cointains the port in dev->master. We handle that using following hook.
+ */
+extern struct net_device *(*br_get_br_dev_for_port_hook)(struct net_device *);
 
 #endif
 

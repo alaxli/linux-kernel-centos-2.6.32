@@ -120,7 +120,7 @@ static struct device_attribute w1_slave_attr_id =
 
 /* Default family */
 
-static ssize_t w1_default_write(struct kobject *kobj,
+static ssize_t w1_default_write(struct file *filp, struct kobject *kobj,
 				struct bin_attribute *bin_attr,
 				char *buf, loff_t off, size_t count)
 {
@@ -139,7 +139,7 @@ out_up:
 	return count;
 }
 
-static ssize_t w1_default_read(struct kobject *kobj,
+static ssize_t w1_default_read(struct file *filp, struct kobject *kobj,
 			       struct bin_attribute *bin_attr,
 			       char *buf, loff_t off, size_t count)
 {
@@ -918,8 +918,7 @@ void w1_search(struct w1_master *dev, u8 search_type, w1_slave_found_callback cb
 			tmp64 = (triplet_ret >> 2);
 			rn |= (tmp64 << i);
 
-			/* ensure we're called from kthread and not by netlink callback */
-			if (!dev->priv && kthread_should_stop()) {
+			if (kthread_should_stop()) {
 				dev_dbg(&dev->dev, "Abort w1_search\n");
 				return;
 			}

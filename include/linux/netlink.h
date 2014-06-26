@@ -24,6 +24,7 @@
 /* leave room for NETLINK_DM (DM Events) */
 #define NETLINK_SCSITRANSPORT	18	/* SCSI Transports */
 #define NETLINK_ECRYPTFS	19
+#define NETLINK_RDMA		20
 
 #define MAX_LINKS 32		
 
@@ -52,6 +53,7 @@ struct nlmsghdr
 #define NLM_F_MULTI		2	/* Multipart message, terminated by NLMSG_DONE */
 #define NLM_F_ACK		4	/* Reply with ack, with zero or error code */
 #define NLM_F_ECHO		8	/* Echo this request 		*/
+#define NLM_F_DUMP_INTR		16	/* Dump was inconsistent due to sequence change */
 
 /* Modifiers to GET request */
 #define NLM_F_ROOT	0x100	/* specify tree	root	*/
@@ -231,6 +233,27 @@ struct netlink_callback
 	long			args[6];
 };
 
+struct netlink_callback_extended
+{
+	/* the module that dump function belong to */
+	struct module		*module;
+	u16			min_dump_alloc;
+	unsigned int		prev_seq, seq;
+};
+
+#define NETLINK_CALLBACK_SIZE (sizeof(struct netlink_callback))
+#define NETLINK_CALLBACK_EXTENDED_SIZE \
+	(sizeof(struct netlink_callback_extended))
+#define NETLINK_CALLBACK_TOTAL_SIZE (NETLINK_CALLBACK_SIZE +\
+	NETLINK_CALLBACK_EXTENDED_SIZE)
+
+static inline struct netlink_callback_extended *
+nl_callback_extended(const struct netlink_callback *cb)
+{
+	return (struct netlink_callback_extended *) (((char *) cb)
+		+ NETLINK_CALLBACK_SIZE);
+}
+
 struct netlink_notify
 {
 	struct net *net;
@@ -263,11 +286,26 @@ __nlmsg_put(struct sk_buff *skb, u32 pid, u32 seq, int type, int len, int flags)
 #define NLMSG_PUT(skb, pid, seq, type, len) \
 	NLMSG_NEW(skb, pid, seq, type, len, 0)
 
-extern int netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
-			      const struct nlmsghdr *nlh,
-			      int (*dump)(struct sk_buff *skb, struct netlink_callback*),
-			      int (*done)(struct netlink_callback*));
+struct netlink_dump_control {
+	int (*dump)(struct sk_buff *skb, struct netlink_callback *);
+	int (*done)(struct netlink_callback*);
+	u16 min_dump_alloc;
+	struct module *module;
+};
 
+extern int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
+			      const struct nlmsghdr *nlh,
+			      struct netlink_dump_control *control);
+
+static inline int netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
+				     const struct nlmsghdr *nlh,
+				     struct netlink_dump_control *control)
+{
+	if (!control->module)
+		control->module = THIS_MODULE;
+
+	return __netlink_dump_start(ssk, skb, nlh, control);
+}
 
 #define NL_NONROOT_RECV 0x1
 #define NL_NONROOT_SEND 0x2

@@ -32,6 +32,9 @@
 #include <linux/kernel_stat.h>
 #include <linux/syscalls.h>
 #include <linux/compat.h>
+#include <linux/personality.h>
+#include <linux/random.h>
+#include <asm/compat.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
 #include <asm/system.h>
@@ -40,6 +43,7 @@
 #include <asm/irq.h>
 #include <asm/timer.h>
 #include <asm/nmi.h>
+#include <asm/runtime_instr.h>
 #include "entry.h"
 
 asmlinkage void ret_from_fork(void) asm ("ret_from_fork");
@@ -148,6 +152,7 @@ EXPORT_SYMBOL(kernel_thread);
  */
 void exit_thread(void)
 {
+	exit_thread_runtime_instr();
 }
 
 void flush_thread(void)
@@ -187,6 +192,11 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 
 	/* Save access registers to new thread structure. */
 	save_access_regs(&p->thread.acrs[0]);
+
+	/* Don't copy runtime instrumentation info */
+	p->thread.ri_cb = NULL;
+	p->thread.ri_signum = 0;
+	frame->childregs.psw.mask &= ~PSW_MASK_RI;
 
 #ifndef CONFIG_64BIT
 	/*
@@ -271,14 +281,14 @@ SYSCALL_DEFINE3(execve, char __user *, name, char __user * __user *, argv,
 		char __user * __user *, envp)
 {
 	struct pt_regs *regs = task_pt_regs(current);
-	char *filename;
+	struct filename *filename;
 	long rc;
 
 	filename = getname(name);
 	rc = PTR_ERR(filename);
 	if (IS_ERR(filename))
 		return rc;
-	rc = do_execve(filename, argv, envp, regs);
+	rc = do_execve(filename->name, argv, envp, regs);
 	if (rc)
 		goto out;
 	execve_tail();
@@ -329,4 +339,33 @@ unsigned long get_wchan(struct task_struct *p)
 			return return_address;
 	}
 	return 0;
+}
+
+static inline unsigned long brk_rnd(void)
+{
+	/* 8MB for 32bit, 1GB for 64bit */
+	if (is_32bit_task())
+		return (get_random_int() & 0x7ffUL) << PAGE_SHIFT;
+	else
+		return (get_random_int() & 0x3ffffUL) << PAGE_SHIFT;
+}
+
+unsigned long arch_randomize_brk(struct mm_struct *mm)
+{
+	unsigned long ret = PAGE_ALIGN(mm->brk + brk_rnd());
+
+	if (ret < mm->brk)
+		return mm->brk;
+	return ret;
+}
+
+unsigned long randomize_et_dyn(unsigned long base)
+{
+	unsigned long ret = PAGE_ALIGN(base + brk_rnd());
+
+	if (!(current->flags & PF_RANDOMIZE))
+		return base;
+	if (ret < base)
+		return base;
+	return ret;
 }

@@ -185,6 +185,8 @@ void acpi_os_fixed_event_count(u32 fixed_event_number);
 /*
  * Threads and Scheduling
  */
+extern struct workqueue_struct *kacpi_hotplug_wq;
+
 acpi_thread_id acpi_os_get_thread_id(void);
 
 acpi_status
@@ -211,10 +213,10 @@ acpi_status acpi_os_write_port(acpi_io_address address, u32 value, u32 width);
  * Platform and hardware-independent physical memory interfaces
  */
 acpi_status
-acpi_os_read_memory(acpi_physical_address address, u32 * value, u32 width);
+acpi_os_read_memory(acpi_physical_address address, u64 *value, u32 width);
 
 acpi_status
-acpi_os_write_memory(acpi_physical_address address, u32 value, u32 width);
+acpi_os_write_memory(acpi_physical_address address, u64 value, u32 width);
 
 /*
  * Platform and hardware-independent PCI configuration space access

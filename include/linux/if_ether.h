@@ -80,8 +80,13 @@
 #define ETH_P_TIPC	0x88CA		/* TIPC 			*/
 #define ETH_P_1588	0x88F7		/* IEEE 1588 Timesync */
 #define ETH_P_FCOE	0x8906		/* Fibre Channel over Ethernet  */
+#define ETH_P_TDLS	0x890D		/* TDLS */
 #define ETH_P_FIP	0x8914		/* FCoE Initialization Protocol */
 #define ETH_P_EDSA	0xDADA		/* Ethertype DSA [ NOT AN OFFICIALLY REGISTERED ID ] */
+#define ETH_P_AF_IUCV   0xFBFB		/* IBM af_iucv [ NOT AN OFFICIALLY REGISTERED ID ] */
+
+#define ETH_P_802_3_MIN	0x0600		/* If the value in the ethernet type is less than this value
+					 * then the frame is Ethernet II. Else it is 802.3 */
 
 /*
  *	Non DIX types. Won't clash for 1500 types.
@@ -134,6 +139,7 @@ int eth_header_parse(const struct sk_buff *skb, unsigned char *haddr);
 extern struct ctl_table ether_table[];
 #endif
 
+int mac_pton(const char *s, u8 *mac);
 extern ssize_t sysfs_format_mac(char *buf, const unsigned char *addr, int len);
 
 /*

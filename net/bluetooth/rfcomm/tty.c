@@ -472,7 +472,8 @@ static int rfcomm_get_dev_list(void __user *arg)
 
 	size = sizeof(*dl) + dev_num * sizeof(*di);
 
-	if (!(dl = kmalloc(size, GFP_KERNEL)))
+	dl = kzalloc(size, GFP_KERNEL);
+	if (!dl)
 		return -ENOMEM;
 
 	di = dl->dev_info;
@@ -842,6 +843,10 @@ static int rfcomm_tty_ioctl(struct tty_struct *tty, struct file *filp, unsigned 
 
 	case TIOCMIWAIT:
 		BT_DBG("TIOCMIWAIT");
+		break;
+
+	case TIOCGICOUNT:
+		BT_DBG("TIOCGICOUNT");
 		break;
 
 	case TIOCGSERIAL:

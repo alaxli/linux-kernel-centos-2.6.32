@@ -377,7 +377,7 @@ rpcrdma_create_id(struct rpcrdma_xprt *xprt,
 
 	init_completion(&ia->ri_done);
 
-	id = rdma_create_id(rpcrdma_conn_upcall, xprt, RDMA_PS_TCP);
+	id = rdma_create_id(rpcrdma_conn_upcall, xprt, RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(id)) {
 		rc = PTR_ERR(id);
 		dprintk("RPC:       %s: rdma_create_id() failed %i\n",
@@ -649,10 +649,22 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
 	ep->rep_attr.cap.max_send_wr = cdata->max_requests;
 	switch (ia->ri_memreg_strategy) {
 	case RPCRDMA_FRMR:
-		/* Add room for frmr register and invalidate WRs */
-		ep->rep_attr.cap.max_send_wr *= 3;
-		if (ep->rep_attr.cap.max_send_wr > devattr.max_qp_wr)
-			return -EINVAL;
+		/* Add room for frmr register and invalidate WRs.
+		 * 1. FRMR reg WR for head
+		 * 2. FRMR invalidate WR for head
+		 * 3. FRMR reg WR for pagelist
+		 * 4. FRMR invalidate WR for pagelist
+		 * 5. FRMR reg WR for tail
+		 * 6. FRMR invalidate WR for tail
+		 * 7. The RDMA_SEND WR
+		 */
+		ep->rep_attr.cap.max_send_wr *= 7;
+		if (ep->rep_attr.cap.max_send_wr > devattr.max_qp_wr) {
+			cdata->max_requests = devattr.max_qp_wr / 7;
+			if (!cdata->max_requests)
+				return -EINVAL;
+			ep->rep_attr.cap.max_send_wr = cdata->max_requests * 7;
+		}
 		break;
 	case RPCRDMA_MEMWINDOWS_ASYNC:
 	case RPCRDMA_MEMWINDOWS:
@@ -1063,7 +1075,7 @@ rpcrdma_buffer_create(struct rpcrdma_buffer *buf, struct rpcrdma_ep *ep,
 	case RPCRDMA_MEMWINDOWS:
 		/* Allocate one extra request's worth, for full cycling */
 		for (i = (buf->rb_max_requests+1) * RPCRDMA_MAX_SEGS; i; i--) {
-			r->r.mw = ib_alloc_mw(ia->ri_pd);
+			r->r.mw = ib_alloc_mw(ia->ri_pd, IB_MW_TYPE_1);
 			if (IS_ERR(r->r.mw)) {
 				rc = PTR_ERR(r->r.mw);
 				dprintk("RPC:       %s: ib_alloc_mw"
@@ -1489,7 +1501,7 @@ rpcrdma_register_frmr_external(struct rpcrdma_mr_seg *seg,
 	memset(&frmr_wr, 0, sizeof frmr_wr);
 	frmr_wr.opcode = IB_WR_FAST_REG_MR;
 	frmr_wr.send_flags = 0;			/* unsignaled */
-	frmr_wr.wr.fast_reg.iova_start = (unsigned long)seg1->mr_dma;
+	frmr_wr.wr.fast_reg.iova_start = seg1->mr_dma;
 	frmr_wr.wr.fast_reg.page_list = seg1->mr_chunk.rl_mw->r.frmr.fr_pgl;
 	frmr_wr.wr.fast_reg.page_list_len = i;
 	frmr_wr.wr.fast_reg.page_shift = PAGE_SHIFT;
@@ -1615,12 +1627,12 @@ rpcrdma_register_memwin_external(struct rpcrdma_mr_seg *seg,
 
 	*nsegs = 1;
 	rpcrdma_map_one(ia, seg, writing);
-	param.mr = ia->ri_bind_mem;
+	param.bind_info.mr = ia->ri_bind_mem;
 	param.wr_id = 0ULL;	/* no send cookie */
-	param.addr = seg->mr_dma;
-	param.length = seg->mr_len;
+	param.bind_info.addr = seg->mr_dma;
+	param.bind_info.length = seg->mr_len;
 	param.send_flags = 0;
-	param.mw_access_flags = mem_priv;
+	param.bind_info.mw_access_flags = mem_priv;
 
 	DECR_CQCOUNT(&r_xprt->rx_ep);
 	rc = ib_bind_mw(ia->ri_id->qp, seg->mr_chunk.rl_mw->r.mw, &param);
@@ -1632,7 +1644,7 @@ rpcrdma_register_memwin_external(struct rpcrdma_mr_seg *seg,
 		rpcrdma_unmap_one(ia, seg);
 	} else {
 		seg->mr_rkey = seg->mr_chunk.rl_mw->r.mw->rkey;
-		seg->mr_base = param.addr;
+		seg->mr_base = param.bind_info.addr;
 		seg->mr_nsegs = 1;
 	}
 	return rc;
@@ -1648,10 +1660,10 @@ rpcrdma_deregister_memwin_external(struct rpcrdma_mr_seg *seg,
 	int rc;
 
 	BUG_ON(seg->mr_nsegs != 1);
-	param.mr = ia->ri_bind_mem;
-	param.addr = 0ULL;	/* unbind */
-	param.length = 0;
-	param.mw_access_flags = 0;
+	param.bind_info.mr = ia->ri_bind_mem;
+	param.bind_info.addr = 0ULL;	/* unbind */
+	param.bind_info.length = 0;
+	param.bind_info.mw_access_flags = 0;
 	if (*r) {
 		param.wr_id = (u64) (unsigned long) *r;
 		param.send_flags = IB_SEND_SIGNALED;

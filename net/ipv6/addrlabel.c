@@ -396,6 +396,11 @@ int __init ipv6_addr_label_init(void)
 	return register_pernet_subsys(&ipv6_addr_label_ops);
 }
 
+void ipv6_addr_label_cleanup(void)
+{
+	unregister_pernet_subsys(&ipv6_addr_label_ops);
+}
+
 static const struct nla_policy ifal_policy[IFAL_MAX+1] = {
 	[IFAL_ADDRESS]		= { .len = sizeof(struct in6_addr), },
 	[IFAL_LABEL]		= { .len = sizeof(u32), },
@@ -591,8 +596,11 @@ out:
 
 void __init ipv6_addr_label_rtnl_register(void)
 {
-	__rtnl_register(PF_INET6, RTM_NEWADDRLABEL, ip6addrlbl_newdel, NULL);
-	__rtnl_register(PF_INET6, RTM_DELADDRLABEL, ip6addrlbl_newdel, NULL);
-	__rtnl_register(PF_INET6, RTM_GETADDRLABEL, ip6addrlbl_get, ip6addrlbl_dump);
+	__rtnl_register(PF_INET6, RTM_NEWADDRLABEL, ip6addrlbl_newdel,
+			NULL, NULL);
+	__rtnl_register(PF_INET6, RTM_DELADDRLABEL, ip6addrlbl_newdel,
+			NULL, NULL);
+	__rtnl_register(PF_INET6, RTM_GETADDRLABEL, ip6addrlbl_get,
+			ip6addrlbl_dump, NULL);
 }
 

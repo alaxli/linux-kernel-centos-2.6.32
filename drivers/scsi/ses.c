@@ -157,10 +157,6 @@ static unsigned char *ses_get_page2_descriptor(struct enclosure_device *edev,
 	return NULL;
 }
 
-/* For device slot and array device slot elements, byte 3 bit 6
- * is "fault sensed" while byte 3 bit 5 is "fault reqstd". As this
- * code stands these bits are shifted 4 positions right so in
- * sysfs they will appear as bits 2 and 1 respectively. Strange. */
 static void ses_get_fault(struct enclosure_device *edev,
 			  struct enclosure_component *ecomp)
 {
@@ -182,7 +178,7 @@ static int ses_set_fault(struct enclosure_device *edev,
 		/* zero is disabled */
 		break;
 	case ENCLOSURE_SETTING_ENABLED:
-		desc[3] = 0x20;
+		desc[2] = 0x02;
 		break;
 	default:
 		/* SES doesn't do the SGPIO blink settings */
@@ -393,9 +389,9 @@ static void ses_enclosure_data_process(struct enclosure_device *edev,
 		len = (desc_ptr[2] << 8) + desc_ptr[3];
 		/* skip past overall descriptor */
 		desc_ptr += len + 4;
+		if (ses_dev->page10)
+			addl_desc_ptr = ses_dev->page10 + 8;
 	}
-	if (ses_dev->page10)
-		addl_desc_ptr = ses_dev->page10 + 8;
 	type_ptr = ses_dev->page1 + 12 + ses_dev->page1[11];
 	components = 0;
 	for (i = 0; i < types; i++, type_ptr += 4) {
@@ -452,13 +448,17 @@ static void ses_match_to_enclosure(struct enclosure_device *edev,
 		.addr = 0,
 	};
 
-	buf = scsi_get_vpd_page(sdev, 0x83);
-	if (!buf)
-		return;
+	buf = kmalloc(INIT_ALLOC_SIZE, GFP_KERNEL);
+	if (!buf || scsi_get_vpd_page(sdev, 0x83, buf, INIT_ALLOC_SIZE))
+		goto free;
 
 	ses_enclosure_data_process(edev, to_scsi_device(edev->edev.parent), 0);
 
 	vpd_len = ((buf[2] << 8) | buf[3]) + 4;
+	kfree(buf);
+	buf = kmalloc(vpd_len, GFP_KERNEL);
+	if (!buf ||scsi_get_vpd_page(sdev, 0x83, buf, vpd_len))
+		goto free;
 
 	desc = buf + 4;
 	while (desc < buf + vpd_len) {

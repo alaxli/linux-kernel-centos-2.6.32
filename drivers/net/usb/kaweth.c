@@ -178,6 +178,7 @@ static struct usb_driver kaweth_driver = {
 	.resume =	kaweth_resume,
 	.id_table =     usb_klsi_table,
 	.supports_autosuspend =	1,
+	.disable_hub_initiated_lpm = 1,
 };
 
 typedef __u8 eth_addr_t[6];
@@ -1325,7 +1326,7 @@ static int kaweth_internal_control_msg(struct usb_device *usb_dev,
         int retv;
         int length = 0; /* shut up GCC */
 
-	urb = usb_alloc_urb(0, GFP_ATOMIC);
+        urb = usb_alloc_urb(0, GFP_NOIO);
         if (!urb)
                 return -ENOMEM;
 

@@ -675,7 +675,8 @@ char *dn_addr2asc(__u16 addr, char *buf)
 
 
 
-static int dn_create(struct net *net, struct socket *sock, int protocol)
+static int dn_create(struct net *net, struct socket *sock, int protocol,
+		     int kern)
 {
 	struct sock *sk;
 
@@ -1555,8 +1556,6 @@ static int __dn_getsockopt(struct socket *sock, int level,int optname, char __us
 			if (r_len > sizeof(struct linkinfo_dn))
 				r_len = sizeof(struct linkinfo_dn);
 
-			memset(&link, 0, sizeof(link));
-
 			switch(sock->state) {
 				case SS_CONNECTING:
 					link.idn_linkstate = LL_CONNECTING;
@@ -1690,6 +1689,8 @@ static int dn_recvmsg(struct kiocb *iocb, struct socket *sock,
 		rv = -EADDRNOTAVAIL;
 		goto out;
 	}
+
+	msg->msg_namelen = 0;
 
 	if (sk->sk_shutdown & RCV_SHUTDOWN) {
 		rv = 0;

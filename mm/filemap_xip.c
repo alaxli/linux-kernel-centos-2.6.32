@@ -262,10 +262,8 @@ found:
 							xip_pfn);
 		if (err == -ENOMEM)
 			return VM_FAULT_OOM;
-		/*
-		 * err == -EBUSY is fine, we've raced against another thread
-		 * that faulted-in the same page
-		 */
+		/* err == -EBUSY is fine, we've raced against another thread
+		   that faulted-in the same page */
 		if (err != -EBUSY)
 			BUG_ON(err);
 		return VM_FAULT_NOPAGE;
@@ -303,6 +301,7 @@ out:
 
 static const struct vm_operations_struct xip_file_vm_ops = {
 	.fault	= xip_file_fault,
+	.page_mkwrite	= filemap_page_mkwrite,
 };
 
 int xip_file_mmap(struct file * file, struct vm_area_struct * vma)
@@ -400,6 +399,8 @@ xip_file_write(struct file *filp, const char __user *buf, size_t len,
 	loff_t pos;
 	ssize_t ret;
 
+	sb_start_write(inode->i_sb);
+
 	mutex_lock(&inode->i_mutex);
 
 	if (!access_ok(VERIFY_READ, buf, len)) {
@@ -410,7 +411,8 @@ xip_file_write(struct file *filp, const char __user *buf, size_t len,
 	pos = *ppos;
 	count = len;
 
-	vfs_check_frozen(inode->i_sb, SB_FREEZE_WRITE);
+	if (!sb_has_new_freeze(inode->i_sb))
+		vfs_check_frozen(inode->i_sb, SB_FREEZE_WRITE);
 
 	/* We can write back this queue in page reclaim */
 	current->backing_dev_info = mapping->backing_dev_info;
@@ -433,6 +435,7 @@ xip_file_write(struct file *filp, const char __user *buf, size_t len,
 	current->backing_dev_info = NULL;
  out_up:
 	mutex_unlock(&inode->i_mutex);
+	sb_end_write(inode->i_sb);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(xip_file_write);

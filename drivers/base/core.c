@@ -100,7 +100,7 @@ static ssize_t dev_attr_store(struct kobject *kobj, struct attribute *attr,
 	return ret;
 }
 
-static struct sysfs_ops dev_sysfs_ops = {
+static const struct sysfs_ops dev_sysfs_ops = {
 	.show	= dev_attr_show,
 	.store	= dev_attr_store,
 };
@@ -919,6 +919,11 @@ int device_add(struct device *dev)
 
 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
 
+	/* Allocate PM struct if required */
+	error = device_pm_pre_add(dev);
+	if (error)
+		goto pm_pre;
+
 	parent = get_device(dev->parent);
 	setup_parent(dev, parent);
 
@@ -1016,6 +1021,8 @@ done:
 	cleanup_device_parent(dev);
 	if (parent)
 		put_device(parent);
+pm_pre:
+	device_pm_pre_add_cleanup(dev);
 name_error:
 	kfree(dev->p);
 	dev->p = NULL;
@@ -1542,7 +1549,7 @@ EXPORT_SYMBOL_GPL(device_destroy);
  * on the same device to ensure that new_name is valid and
  * won't conflict with other devices.
  */
-int device_rename(struct device *dev, char *new_name)
+int device_rename(struct device *dev, const char *new_name)
 {
 	char *old_class_name = NULL;
 	char *new_class_name = NULL;
@@ -1744,8 +1751,5 @@ void device_shutdown(void)
 			dev->driver->shutdown(dev);
 		}
 	}
-	kobject_put(sysfs_dev_char_kobj);
-	kobject_put(sysfs_dev_block_kobj);
-	kobject_put(dev_kobj);
 	async_synchronize_full();
 }

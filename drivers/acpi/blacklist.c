@@ -84,18 +84,18 @@ static int __init blacklist_by_year(void)
 
 	/* Doesn't exist? Likely an old system */
 	if (!dmi_get_date(DMI_BIOS_DATE, &year, NULL, NULL)) {
-		printk(KERN_ERR PREFIX "no DMI BIOS year, "
+		printk(KERN_INFO PREFIX "no DMI BIOS year, "
 			"acpi=force is required to enable ACPI\n" );
 		return 1;
 	}
 	/* 0? Likely a buggy new BIOS */
 	if (year == 0) {
-		printk(KERN_ERR PREFIX "DMI BIOS year==0, "
+		printk(KERN_INFO PREFIX "DMI BIOS year==0, "
 			"assuming ACPI-capable machine\n" );
 		return 0;
 	}
 	if (year < CONFIG_ACPI_BLACKLIST_YEAR) {
-		printk(KERN_ERR PREFIX "BIOS age (%d) fails cutoff (%d), "
+		printk(KERN_INFO PREFIX "BIOS age (%d) fails cutoff (%d), "
 		       "acpi=force is required to enable ACPI\n",
 		       year, CONFIG_ACPI_BLACKLIST_YEAR);
 		return 1;
@@ -185,12 +185,6 @@ static int __init dmi_disable_osi_vista(const struct dmi_system_id *d)
 	acpi_osi_setup("!Windows 2006");
 	return 0;
 }
-static int __init dmi_disable_osi_win7(const struct dmi_system_id *d)
-{
-	printk(KERN_NOTICE PREFIX "DMI detected: %s\n", d->ident);
-	acpi_osi_setup("!Windows 2009");
-	return 0;
-}
 
 static struct dmi_system_id acpi_osi_dmi_table[] __initdata = {
 	{
@@ -215,38 +209,6 @@ static struct dmi_system_id acpi_osi_dmi_table[] __initdata = {
 	.matches = {
 		     DMI_MATCH(DMI_SYS_VENDOR, "Sony Corporation"),
 		     DMI_MATCH(DMI_PRODUCT_NAME, "Sony VGN-SR290J"),
-		},
-	},
-	{
-	.callback = dmi_disable_osi_vista,
-	.ident = "Toshiba Satellite L355",
-	.matches = {
-		     DMI_MATCH(DMI_SYS_VENDOR, "TOSHIBA"),
-		     DMI_MATCH(DMI_PRODUCT_VERSION, "Satellite L355"),
-		},
-	},
-	{
-	.callback = dmi_disable_osi_vista,
-	.ident = "Toshiba Satellite L355",
-	.matches = {
-		     DMI_MATCH(DMI_SYS_VENDOR, "TOSHIBA"),
-		     DMI_MATCH(DMI_PRODUCT_VERSION, "Satellite L355"),
-		},
-	},
-	{
-	.callback = dmi_disable_osi_win7,
-	.ident = "ASUS K50IJ",
-	.matches = {
-		     DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK Computer Inc."),
-		     DMI_MATCH(DMI_PRODUCT_NAME, "K50IJ"),
-		},
-	},
-	{
-	.callback = dmi_disable_osi_vista,
-	.ident = "Toshiba P305D",
-	.matches = {
-		     DMI_MATCH(DMI_SYS_VENDOR, "TOSHIBA"),
-		     DMI_MATCH(DMI_PRODUCT_NAME, "Satellite P305D"),
 		},
 	},
 

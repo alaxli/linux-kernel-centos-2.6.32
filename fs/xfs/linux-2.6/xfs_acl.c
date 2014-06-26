@@ -21,6 +21,8 @@
 #include "xfs_bmap_btree.h"
 #include "xfs_inode.h"
 #include "xfs_vnodeops.h"
+#include "xfs_trace.h"
+#include <linux/slab.h>
 #include <linux/xattr.h>
 #include <linux/posix_acl_xattr.h>
 
@@ -107,7 +109,7 @@ xfs_get_acl(struct inode *inode, int type)
 	struct posix_acl *acl;
 	struct xfs_acl *xfs_acl;
 	int len = sizeof(struct xfs_acl);
-	char *ea_name;
+	unsigned char *ea_name;
 	int error;
 
 	acl = get_cached_acl(inode, type);
@@ -134,7 +136,8 @@ xfs_get_acl(struct inode *inode, int type)
 	if (!xfs_acl)
 		return ERR_PTR(-ENOMEM);
 
-	error = -xfs_attr_get(ip, ea_name, (char *)xfs_acl, &len, ATTR_ROOT);
+	error = -xfs_attr_get(ip, ea_name, (unsigned char *)xfs_acl,
+							&len, ATTR_ROOT);
 	if (error) {
 		/*
 		 * If the attribute doesn't exist make sure we have a negative
@@ -163,7 +166,7 @@ STATIC int
 xfs_set_acl(struct inode *inode, int type, struct posix_acl *acl)
 {
 	struct xfs_inode *ip = XFS_I(inode);
-	char *ea_name;
+	unsigned char *ea_name;
 	int error;
 
 	if (S_ISLNK(inode->i_mode))
@@ -195,7 +198,7 @@ xfs_set_acl(struct inode *inode, int type, struct posix_acl *acl)
 			(sizeof(struct xfs_acl_entry) *
 			 (XFS_ACL_MAX_ENTRIES - acl->a_count));
 
-		error = -xfs_attr_set(ip, ea_name, (char *)xfs_acl,
+		error = -xfs_attr_set(ip, ea_name, (unsigned char *)xfs_acl,
 				len, ATTR_ROOT);
 
 		kfree(xfs_acl);
@@ -224,7 +227,7 @@ xfs_check_acl(struct inode *inode, int mask)
 	struct posix_acl *acl;
 	int error = -EAGAIN;
 
-	xfs_itrace_entry(ip);
+	trace_xfs_check_acl(ip);
 
 	/*
 	 * If there is no attribute fork no ACL exists on this inode and
@@ -263,7 +266,7 @@ xfs_set_mode(struct inode *inode, mode_t mode)
 }
 
 static int
-xfs_acl_exists(struct inode *inode, char *name)
+xfs_acl_exists(struct inode *inode, unsigned char *name)
 {
 	int len = sizeof(struct xfs_acl);
 
@@ -372,7 +375,7 @@ xfs_decode_acl(const char *name)
 		return ACL_TYPE_ACCESS;
 	else if (strcmp(name, "posix_acl_default") == 0)
 		return ACL_TYPE_DEFAULT;
-	return -EINVAL;
+	return -EOPNOTSUPP;
 }
 
 static int

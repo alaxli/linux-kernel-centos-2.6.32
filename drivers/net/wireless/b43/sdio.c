@@ -4,7 +4,7 @@
  * SDIO over Sonics Silicon Backplane bus glue for b43.
  *
  * Copyright (C) 2009 Albert Herranz
- * Copyright (C) 2009 Michael Buesch <mb@bu3sch.de>
+ * Copyright (C) 2009 Michael Buesch <m@bues.ch>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,6 +16,7 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/sdio_func.h>
 #include <linux/mmc/sdio_ids.h>
+#include <linux/slab.h>
 #include <linux/ssb/ssb.h>
 
 #include "sdio.h"
@@ -65,7 +66,7 @@ static void b43_sdio_interrupt_dispatcher(struct sdio_func *func)
 int b43_sdio_request_irq(struct b43_wldev *dev,
 			 void (*handler)(struct b43_wldev *dev))
 {
-	struct ssb_bus *bus = dev->dev->bus;
+	struct ssb_bus *bus = dev->dev->sdev->bus;
 	struct sdio_func *func = bus->host_sdio;
 	struct b43_sdio *sdio = sdio_get_drvdata(func);
 	int err;
@@ -81,7 +82,7 @@ int b43_sdio_request_irq(struct b43_wldev *dev,
 
 void b43_sdio_free_irq(struct b43_wldev *dev)
 {
-	struct ssb_bus *bus = dev->dev->bus;
+	struct ssb_bus *bus = dev->dev->sdev->bus;
 	struct sdio_func *func = bus->host_sdio;
 	struct b43_sdio *sdio = sdio_get_drvdata(func);
 
@@ -93,7 +94,7 @@ void b43_sdio_free_irq(struct b43_wldev *dev)
 }
 
 static int b43_sdio_probe(struct sdio_func *func,
-			  const struct sdio_device_id *id)
+				    const struct sdio_device_id *id)
 {
 	struct b43_sdio *sdio;
 	struct sdio_func_tuple *tuple;
@@ -184,6 +185,7 @@ static void b43_sdio_remove(struct sdio_func *func)
 
 static const struct sdio_device_id b43_sdio_ids[] = {
 	{ SDIO_DEVICE(0x02d0, 0x044b) }, /* Nintendo Wii WLAN daughter card */
+	{ SDIO_DEVICE(0x0092, 0x0004) }, /* C-guys, Inc. EW-CG1102GC */
 	{ },
 };
 

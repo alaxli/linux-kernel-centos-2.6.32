@@ -30,6 +30,13 @@
 #define IF_PREFIX_ONLINK	0x01
 #define IF_PREFIX_AUTOCONF	0x02
 
+enum {
+	INET6_IFADDR_STATE_DAD,
+	INET6_IFADDR_STATE_POSTDAD,
+	INET6_IFADDR_STATE_UP,
+	INET6_IFADDR_STATE_DEAD,
+};
+
 #ifdef __KERNEL__
 
 struct inet6_ifaddr 
@@ -65,6 +72,9 @@ struct inet6_ifaddr
 #endif
 
 	int			dead;
+#ifndef __GENKSYMS__
+	bool			tokenized;
+#endif
 };
 
 struct ip6_sf_socklist
@@ -192,6 +202,10 @@ struct inet6_dev
 	struct ipv6_devstat	stats;
 	unsigned long		tstamp; /* ipv6InterfaceTable update timestamp */
 	struct rcu_head		rcu;
+
+#ifndef __GENKSYMS__
+	struct in6_addr		token;
+#endif
 };
 
 static inline void ipv6_eth_mc_map(struct in6_addr *addr, char *buf)

@@ -1186,8 +1186,12 @@ static int check_for_audio_disc(struct cdrom_device_info * cdi,
 
 void cdrom_release(struct cdrom_device_info *cdi, fmode_t mode)
 {
-	struct cdrom_device_ops *cdo = cdi->ops;
+	struct cdrom_device_ops *cdo;
 	int opened_for_data;
+
+	if (cdi == NULL)	/* device is gone */
+		return;
+	cdo = cdi->ops;
 
 	cdinfo(CD_CLOSE, "entering cdrom_release\n");
 
@@ -2057,6 +2061,11 @@ static int cdrom_read_cdda_old(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 	if (!nr)
 		return -ENOMEM;
 
+	if (!access_ok(VERIFY_WRITE, ubuf, nframes * CD_FRAMESIZE_RAW)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
 	cgc.data_direction = CGC_DATA_READ;
 	while (nframes > 0) {
 		if (nr > nframes)
@@ -2065,7 +2074,7 @@ static int cdrom_read_cdda_old(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 		ret = cdrom_read_block(cdi, &cgc, lba, nr, 1, CD_FRAMESIZE_RAW);
 		if (ret)
 			break;
-		if (copy_to_user(ubuf, cgc.buffer, CD_FRAMESIZE_RAW * nr)) {
+		if (__copy_to_user(ubuf, cgc.buffer, CD_FRAMESIZE_RAW * nr)) {
 			ret = -EFAULT;
 			break;
 		}
@@ -2073,6 +2082,7 @@ static int cdrom_read_cdda_old(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 		nframes -= nr;
 		lba += nr;
 	}
+out:
 	kfree(cgc.buffer);
 	return ret;
 }
@@ -2102,7 +2112,7 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 
 		rq = blk_get_request(q, READ, GFP_KERNEL);
 		if (!rq) {
-			ret = -ENOMEM;
+			ret = -ENODEV;
 			break;
 		}
 
@@ -2822,7 +2832,7 @@ static noinline int mmc_ioctl_cdrom_read_data(struct cdrom_device_info *cdi,
 	if (lba < 0)
 		return -EINVAL;
 
-	cgc->buffer = kmalloc(blocksize, GFP_KERNEL);
+	cgc->buffer = kzalloc(blocksize, GFP_KERNEL);
 	if (cgc->buffer == NULL)
 		return -ENOMEM;
 

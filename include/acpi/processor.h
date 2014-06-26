@@ -208,6 +208,7 @@ struct acpi_processor_flags {
 	u8 has_cst:1;
 	u8 power_setup_done:1;
 	u8 bm_rld_set:1;
+	u8 need_hotplug_init:1;
 };
 
 struct acpi_processor {
@@ -324,6 +325,12 @@ int acpi_processor_tstate_has_changed(struct acpi_processor *pr);
 int acpi_processor_get_throttling_info(struct acpi_processor *pr);
 extern int acpi_processor_set_throttling(struct acpi_processor *pr,
 					 int state, bool force);
+/*
+ * Reevaluate whether the T-state is invalid after one cpu is
+ * onlined/offlined. In such case the flags.throttling will be updated.
+ */
+extern void acpi_processor_reevaluate_tstate(struct acpi_processor *pr,
+			unsigned long action);
 extern const struct file_operations acpi_processor_throttling_fops;
 extern void acpi_processor_throttling_init(void);
 /* in processor_idle.c */

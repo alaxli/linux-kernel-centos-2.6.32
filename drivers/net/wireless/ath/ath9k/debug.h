@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2009 Atheros Communications Inc.
+ * Copyright (c) 2008-2011 Atheros Communications Inc.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,41 +17,43 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
-enum ATH_DEBUG {
-	ATH_DBG_RESET		= 0x00000001,
-	ATH_DBG_QUEUE		= 0x00000002,
-	ATH_DBG_EEPROM		= 0x00000004,
-	ATH_DBG_CALIBRATE	= 0x00000008,
-	ATH_DBG_INTERRUPT	= 0x00000010,
-	ATH_DBG_REGULATORY	= 0x00000020,
-	ATH_DBG_ANI		= 0x00000040,
-	ATH_DBG_XMIT		= 0x00000080,
-	ATH_DBG_BEACON		= 0x00000100,
-	ATH_DBG_CONFIG		= 0x00000200,
-	ATH_DBG_FATAL		= 0x00000400,
-	ATH_DBG_PS		= 0x00000800,
-	ATH_DBG_HWTIMER		= 0x00001000,
-	ATH_DBG_BTCOEX		= 0x00002000,
-	ATH_DBG_ANY		= 0xffffffff
-};
-
-#define DBG_DEFAULT (ATH_DBG_FATAL)
+#include "hw.h"
+#include "rc.h"
+#include "dfs_debug.h"
 
 struct ath_txq;
 struct ath_buf;
+struct fft_sample_tlv;
 
-#ifdef CONFIG_ATH9K_DEBUG
+#ifdef CONFIG_ATH9K_DEBUGFS
 #define TX_STAT_INC(q, c) sc->debug.stats.txstats[q].c++
+#define RESET_STAT_INC(sc, type) sc->debug.stats.reset[type]++
 #else
 #define TX_STAT_INC(q, c) do { } while (0)
+#define RESET_STAT_INC(sc, type) do { } while (0)
 #endif
 
-#ifdef CONFIG_ATH9K_DEBUG
+enum ath_reset_type {
+	RESET_TYPE_BB_HANG,
+	RESET_TYPE_BB_WATCHDOG,
+	RESET_TYPE_FATAL_INT,
+	RESET_TYPE_TX_ERROR,
+	RESET_TYPE_TX_HANG,
+	RESET_TYPE_PLL_HANG,
+	RESET_TYPE_MAC_HANG,
+	RESET_TYPE_BEACON_STUCK,
+	RESET_TYPE_MCI,
+	__RESET_TYPE_MAX
+};
+
+#ifdef CONFIG_ATH9K_DEBUGFS
 
 /**
  * struct ath_interrupt_stats - Contains statistics about interrupts
  * @total: Total no. of interrupts generated so far
  * @rxok: RX with no errors
+ * @rxlp: RX with low priority RX
+ * @rxhp: RX with high priority, uapsd only
  * @rxeol: RX with no more RXDESC available
  * @rxorn: RX FIFO overrun
  * @txok: TX completed at the requested rate
@@ -68,10 +70,19 @@ struct ath_buf;
  * @cabend: RX End of CAB traffic
  * @dtimsync: DTIM sync lossage
  * @dtim: RX Beacon with DTIM
+ * @bb_watchdog: Baseband watchdog
+ * @tsfoor: TSF out of range, indicates that the corrected TSF received
+ * from a beacon differs from the PCU's internal TSF by more than a
+ * (programmable) threshold
+ * @local_timeout: Internal bus timeout.
+ * @mci: MCI interrupt, specific to MCI based BTCOEX chipsets
+ * @gen_timer: Generic hardware timer interrupt
  */
 struct ath_interrupt_stats {
 	u32 total;
 	u32 rxok;
+	u32 rxlp;
+	u32 rxhp;
 	u32 rxeol;
 	u32 rxorn;
 	u32 txok;
@@ -89,24 +100,49 @@ struct ath_interrupt_stats {
 	u32 cabend;
 	u32 dtimsync;
 	u32 dtim;
+	u32 bb_watchdog;
+	u32 tsfoor;
+	u32 mci;
+	u32 gen_timer;
+
+	/* Sync-cause stats */
+	u32 sync_cause_all;
+	u32 sync_rtc_irq;
+	u32 sync_mac_irq;
+	u32 eeprom_illegal_access;
+	u32 apb_timeout;
+	u32 pci_mode_conflict;
+	u32 host1_fatal;
+	u32 host1_perr;
+	u32 trcv_fifo_perr;
+	u32 radm_cpl_ep;
+	u32 radm_cpl_dllp_abort;
+	u32 radm_cpl_tlp_abort;
+	u32 radm_cpl_ecrc_err;
+	u32 radm_cpl_timeout;
+	u32 local_timeout;
+	u32 pm_access;
+	u32 mac_awake;
+	u32 mac_asleep;
+	u32 mac_sleep_access;
 };
 
-struct ath_rc_stats {
-	u32 success;
-	u32 retries;
-	u32 xretries;
-	u8 per;
-};
 
 /**
  * struct ath_tx_stats - Statistics about TX
+ * @tx_pkts_all:  No. of total frames transmitted, including ones that
+	may have had errors.
+ * @tx_bytes_all:  No. of total bytes transmitted, including ones that
+	may have had errors.
  * @queued: Total MPDUs (non-aggr) queued
  * @completed: Total MPDUs (non-aggr) completed
  * @a_aggr: Total no. of aggregates queued
- * @a_queued: Total AMPDUs queued
+ * @a_queued_hw: Total AMPDUs queued to hardware
+ * @a_queued_sw: Total AMPDUs queued to software queues
  * @a_completed: Total AMPDUs completed
  * @a_retries: No. of AMPDUs retried (SW)
  * @a_xretries: No. of AMPDUs dropped due to xretries
+ * @txerr_filtered: No. of frames with TXERR_FILT flag set.
  * @fifo_underrun: FIFO underrun occurrences
 	Valid only for:
 		- non-aggregate condition.
@@ -116,75 +152,195 @@ struct ath_rc_stats {
  * @desc_cfg_err: Descriptor configuration errors
  * @data_urn: TX data underrun errors
  * @delim_urn: TX delimiter underrun errors
+ * @puttxbuf: Number of times hardware was given txbuf to write.
+ * @txstart:  Number of times hardware was told to start tx.
+ * @txprocdesc:  Number of times tx descriptor was processed
+ * @txfailed:  Out-of-memory or other errors in xmit path.
  */
 struct ath_tx_stats {
+	u32 tx_pkts_all;
+	u32 tx_bytes_all;
 	u32 queued;
 	u32 completed;
+	u32 xretries;
 	u32 a_aggr;
-	u32 a_queued;
+	u32 a_queued_hw;
+	u32 a_queued_sw;
 	u32 a_completed;
 	u32 a_retries;
 	u32 a_xretries;
+	u32 txerr_filtered;
 	u32 fifo_underrun;
 	u32 xtxop;
 	u32 timer_exp;
 	u32 desc_cfg_err;
 	u32 data_underrun;
 	u32 delim_underrun;
+	u32 puttxbuf;
+	u32 txstart;
+	u32 txprocdesc;
+	u32 txfailed;
+};
+
+/*
+ * Various utility macros to print TX/Queue counters.
+ */
+#define PR_QNUM(_n) sc->tx.txq_map[_n]->axq_qnum
+#define TXSTATS sc->debug.stats.txstats
+#define PR(str, elem)							\
+	do {								\
+		len += snprintf(buf + len, size - len,			\
+				"%s%13u%11u%10u%10u\n", str,		\
+				TXSTATS[PR_QNUM(IEEE80211_AC_BE)].elem,	\
+				TXSTATS[PR_QNUM(IEEE80211_AC_BK)].elem,	\
+				TXSTATS[PR_QNUM(IEEE80211_AC_VI)].elem,	\
+				TXSTATS[PR_QNUM(IEEE80211_AC_VO)].elem); \
+	} while(0)
+
+#define RX_STAT_INC(c) (sc->debug.stats.rxstats.c++)
+
+/**
+ * struct ath_rx_stats - RX Statistics
+ * @rx_pkts_all:  No. of total frames received, including ones that
+	may have had errors.
+ * @rx_bytes_all:  No. of total bytes received, including ones that
+	may have had errors.
+ * @crc_err: No. of frames with incorrect CRC value
+ * @decrypt_crc_err: No. of frames whose CRC check failed after
+	decryption process completed
+ * @phy_err: No. of frames whose reception failed because the PHY
+	encountered an error
+ * @mic_err: No. of frames with incorrect TKIP MIC verification failure
+ * @pre_delim_crc_err: Pre-Frame delimiter CRC error detections
+ * @post_delim_crc_err: Post-Frame delimiter CRC error detections
+ * @decrypt_busy_err: Decryption interruptions counter
+ * @phy_err_stats: Individual PHY error statistics
+ * @rx_len_err:  No. of frames discarded due to bad length.
+ * @rx_oom_err:  No. of frames dropped due to OOM issues.
+ * @rx_rate_err:  No. of frames dropped due to rate errors.
+ * @rx_too_many_frags_err:  Frames dropped due to too-many-frags received.
+ * @rx_beacons:  No. of beacons received.
+ * @rx_frags:  No. of rx-fragements received.
+ * @rx_spectral: No of spectral packets received.
+ */
+struct ath_rx_stats {
+	u32 rx_pkts_all;
+	u32 rx_bytes_all;
+	u32 crc_err;
+	u32 decrypt_crc_err;
+	u32 phy_err;
+	u32 mic_err;
+	u32 pre_delim_crc_err;
+	u32 post_delim_crc_err;
+	u32 decrypt_busy_err;
+	u32 phy_err_stats[ATH9K_PHYERR_MAX];
+	u32 rx_len_err;
+	u32 rx_oom_err;
+	u32 rx_rate_err;
+	u32 rx_too_many_frags_err;
+	u32 rx_beacons;
+	u32 rx_frags;
+	u32 rx_spectral;
 };
 
 struct ath_stats {
 	struct ath_interrupt_stats istats;
-	struct ath_rc_stats rcstats[RATE_TABLE_SIZE];
 	struct ath_tx_stats txstats[ATH9K_NUM_TX_QUEUES];
+	struct ath_rx_stats rxstats;
+	struct ath_dfs_stats dfs_stats;
+	u32 reset[__RESET_TYPE_MAX];
+};
+
+#define ATH_DBG_MAX_SAMPLES	10
+struct ath_dbg_bb_mac_samp {
+	u32 dma_dbg_reg_vals[ATH9K_NUM_DMA_DEBUG_REGS];
+	u32 pcu_obs, pcu_cr, noise;
+	struct {
+		u64 jiffies;
+		int8_t rssi_ctl0;
+		int8_t rssi_ctl1;
+		int8_t rssi_ctl2;
+		int8_t rssi_ext0;
+		int8_t rssi_ext1;
+		int8_t rssi_ext2;
+		int8_t rssi;
+		bool isok;
+		u8 rts_fail_cnt;
+		u8 data_fail_cnt;
+		u8 rateindex;
+		u8 qid;
+		u8 tid;
+		u32 ba_low;
+		u32 ba_high;
+	} ts[ATH_DBG_MAX_SAMPLES];
+	struct {
+		u64 jiffies;
+		int8_t rssi_ctl0;
+		int8_t rssi_ctl1;
+		int8_t rssi_ctl2;
+		int8_t rssi_ext0;
+		int8_t rssi_ext1;
+		int8_t rssi_ext2;
+		int8_t rssi;
+		bool is_mybeacon;
+		u8 antenna;
+		u8 rate;
+	} rs[ATH_DBG_MAX_SAMPLES];
+	struct ath_cycle_counters cc;
+	struct ath9k_nfcal_hist nfCalHist[NUM_NF_READINGS];
 };
 
 struct ath9k_debug {
-	int debug_mask;
 	struct dentry *debugfs_phy;
-	struct dentry *debugfs_debug;
-	struct dentry *debugfs_dma;
-	struct dentry *debugfs_interrupt;
-	struct dentry *debugfs_rcstat;
-	struct dentry *debugfs_wiphy;
-	struct dentry *debugfs_xmit;
+	u32 regidx;
 	struct ath_stats stats;
+#ifdef CONFIG_ATH9K_MAC_DEBUG
+	spinlock_t samp_lock;
+	struct ath_dbg_bb_mac_samp bb_mac_samp[ATH_DBG_MAX_SAMPLES];
+	u8 sampidx;
+	u8 tsidx;
+	u8 rsidx;
+#endif
 };
 
-void DPRINTF(struct ath_softc *sc, int dbg_mask, const char *fmt, ...);
-int ath9k_init_debug(struct ath_softc *sc);
-void ath9k_exit_debug(struct ath_softc *sc);
-int ath9k_debug_create_root(void);
-void ath9k_debug_remove_root(void);
+int ath9k_init_debug(struct ath_hw *ah);
+void ath9k_deinit_debug(struct ath_softc *sc);
+
 void ath_debug_stat_interrupt(struct ath_softc *sc, enum ath9k_int status);
-void ath_debug_stat_rc(struct ath_softc *sc, struct sk_buff *skb);
-void ath_debug_stat_tx(struct ath_softc *sc, struct ath_txq *txq,
-		       struct ath_buf *bf);
-void ath_debug_stat_retries(struct ath_softc *sc, int rix,
-			    int xretries, int retries, u8 per);
+void ath_debug_stat_tx(struct ath_softc *sc, struct ath_buf *bf,
+		       struct ath_tx_status *ts, struct ath_txq *txq,
+		       unsigned int flags);
+void ath_debug_stat_rx(struct ath_softc *sc, struct ath_rx_status *rs);
+int ath9k_get_et_sset_count(struct ieee80211_hw *hw,
+			    struct ieee80211_vif *vif, int sset);
+void ath9k_get_et_stats(struct ieee80211_hw *hw,
+			struct ieee80211_vif *vif,
+			struct ethtool_stats *stats, u64 *data);
+void ath9k_get_et_strings(struct ieee80211_hw *hw,
+			  struct ieee80211_vif *vif,
+			  u32 sset, u8 *data);
+void ath9k_sta_add_debugfs(struct ieee80211_hw *hw,
+			   struct ieee80211_vif *vif,
+			   struct ieee80211_sta *sta,
+			   struct dentry *dir);
+void ath9k_sta_remove_debugfs(struct ieee80211_hw *hw,
+			      struct ieee80211_vif *vif,
+			      struct ieee80211_sta *sta,
+			      struct dentry *dir);
+
+void ath_debug_send_fft_sample(struct ath_softc *sc,
+			       struct fft_sample_tlv *fft_sample);
 
 #else
 
-static inline void DPRINTF(struct ath_softc *sc, int dbg_mask,
-			   const char *fmt, ...)
-{
-}
+#define RX_STAT_INC(c) /* NOP */
 
-static inline int ath9k_init_debug(struct ath_softc *sc)
+static inline int ath9k_init_debug(struct ath_hw *ah)
 {
 	return 0;
 }
 
-static inline void ath9k_exit_debug(struct ath_softc *sc)
-{
-}
-
-static inline int ath9k_debug_create_root(void)
-{
-	return 0;
-}
-
-static inline void ath9k_debug_remove_root(void)
+static inline void ath9k_deinit_debug(struct ath_softc *sc)
 {
 }
 
@@ -193,22 +349,32 @@ static inline void ath_debug_stat_interrupt(struct ath_softc *sc,
 {
 }
 
-static inline void ath_debug_stat_rc(struct ath_softc *sc,
-				     struct sk_buff *skb)
-{
-}
-
 static inline void ath_debug_stat_tx(struct ath_softc *sc,
+				     struct ath_buf *bf,
+				     struct ath_tx_status *ts,
 				     struct ath_txq *txq,
-				     struct ath_buf *bf)
+				     unsigned int flags)
 {
 }
 
-static inline void ath_debug_stat_retries(struct ath_softc *sc, int rix,
-					  int xretries, int retries, u8 per)
+static inline void ath_debug_stat_rx(struct ath_softc *sc,
+				     struct ath_rx_status *rs)
 {
 }
 
-#endif /* CONFIG_ATH9K_DEBUG */
+#endif /* CONFIG_ATH9K_DEBUGFS */
+
+#ifdef CONFIG_ATH9K_MAC_DEBUG
+
+void ath9k_debug_samp_bb_mac(struct ath_softc *sc);
+
+#else
+
+static inline void ath9k_debug_samp_bb_mac(struct ath_softc *sc)
+{
+}
+
+#endif
+
 
 #endif /* DEBUG_H */

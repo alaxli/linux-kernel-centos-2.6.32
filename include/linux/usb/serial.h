@@ -50,7 +50,7 @@ enum port_dev_state {
  * @interrupt_out_size: the size of the interrupt_out_buffer, in bytes.
  * @interrupt_out_urb: pointer to the interrupt out struct urb for this port.
  * @interrupt_out_endpointAddress: endpoint address for the interrupt out pipe
- * 	for this port.
+ *	for this port.
  * @bulk_in_buffer: pointer to the bulk in buffer for this port.
  * @bulk_in_size: the size of the bulk_in_buffer, in bytes.
  * @read_urb: pointer to the bulk in struct urb for this port.
@@ -259,8 +259,6 @@ struct usb_serial_driver {
 	int  (*tiocmget)(struct tty_struct *tty, struct file *file);
 	int  (*tiocmset)(struct tty_struct *tty, struct file *file,
 			 unsigned int set, unsigned int clear);
-	int  (*get_icount)(struct tty_struct *tty,
-			struct serial_icounter_struct *icount);
 	/* Called by the tty layer for port level work. There may or may not
 	   be an attached tty at this point */
 	void (*dtr_rts)(struct usb_serial_port *port, int on);
@@ -328,9 +326,6 @@ extern int usb_serial_handle_sysrq_char(struct tty_struct *tty,
 					struct usb_serial_port *port,
 					unsigned int ch);
 extern int usb_serial_handle_break(struct usb_serial_port *port);
-extern void usb_serial_handle_dcd_change(struct usb_serial_port *usb_port,
-					 struct tty_struct *tty,
-					 unsigned int status);
 
 
 extern int usb_serial_bus_register(struct usb_serial_driver *device);

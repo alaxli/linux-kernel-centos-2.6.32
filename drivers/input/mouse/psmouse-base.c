@@ -611,8 +611,15 @@ static int psmouse_extensions(struct psmouse *psmouse,
 		synaptics_hardware = true;
 
 		if (max_proto > PSMOUSE_IMEX) {
-			if (!set_properties || synaptics_init(psmouse) == 0)
+/*
+ * Try activating protocol, but check if support is enabled first, since
+ * we try detecting Synaptics even when protocol is disabled.
+ */
+			if (synaptics_supported() &&
+			    (!set_properties || synaptics_init(psmouse) == 0)) {
 				return PSMOUSE_SYNAPTICS;
+			}
+
 /*
  * Some Synaptics touchpads can emulate extended protocols (like IMPS/2).
  * Unfortunately Logitech/Genius probes confuse some firmware versions so
@@ -1349,7 +1356,6 @@ static int psmouse_reconnect(struct serio *serio)
 	struct psmouse *psmouse = serio_get_drvdata(serio);
 	struct psmouse *parent = NULL;
 	struct serio_driver *drv = serio->drv;
-	unsigned char type;
 	int rc = -1;
 
 	if (!drv || !psmouse) {
@@ -1369,15 +1375,10 @@ static int psmouse_reconnect(struct serio *serio)
 	if (psmouse->reconnect) {
 		if (psmouse->reconnect(psmouse))
 			goto out;
-	} else {
-		psmouse_reset(psmouse);
-
-		if (psmouse_probe(psmouse) < 0)
-			goto out;
-
-		type = psmouse_extensions(psmouse, psmouse_max_proto, false);
-		if (psmouse->type != type)
-			goto out;
+	} else if (psmouse_probe(psmouse) < 0 ||
+		   psmouse->type != psmouse_extensions(psmouse,
+						psmouse_max_proto, false)) {
+		goto out;
 	}
 
 	/* ok, the device type (and capabilities) match the old one,
